@@ -5,13 +5,15 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .models import Candle, MarketObservation, as_utc
+from .models import Candle, Instrument, MarketObservation, as_utc
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS instruments (instrument_id TEXT PRIMARY KEY, epic TEXT NOT NULL UNIQUE, market_name TEXT NOT NULL, instrument_type TEXT, market_status TEXT, metadata_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS observations (instrument_id TEXT NOT NULL, observed_at TEXT NOT NULL, epic TEXT NOT NULL, market_name TEXT NOT NULL, bid TEXT, offer TEXT, mid TEXT, market_state TEXT, source TEXT NOT NULL, PRIMARY KEY (instrument_id, observed_at));
 CREATE TABLE IF NOT EXISTS candles (instrument_id TEXT NOT NULL, timeframe TEXT NOT NULL, start_at TEXT NOT NULL, end_at TEXT NOT NULL, epic TEXT NOT NULL, open TEXT NOT NULL, high TEXT NOT NULL, low TEXT NOT NULL, close TEXT NOT NULL, volume TEXT, is_closed INTEGER NOT NULL, PRIMARY KEY (instrument_id, timeframe, start_at));
+CREATE INDEX IF NOT EXISTS observations_instrument_time ON observations (instrument_id, observed_at);
+CREATE INDEX IF NOT EXISTS candles_instrument_time ON candles (instrument_id, timeframe, start_at);
 """
 
 
@@ -52,6 +54,18 @@ class Database:
             ),
         )
         self.connection.commit()
+
+    def save_instrument_model(self, instrument: Instrument) -> None:
+        self.save_instrument(
+            instrument.instrument_id, instrument.epic, instrument.market_name,
+            instrument_type=instrument.instrument_type, market_status=instrument.market_status,
+            metadata=instrument.metadata,
+        )
+
+    def list_instruments(self) -> list[tuple]:
+        return self.connection.execute(
+            "SELECT instrument_id, epic, market_name, instrument_type, market_status, metadata_json FROM instruments ORDER BY market_name"
+        ).fetchall()
 
     def save_observation(self, observation: MarketObservation) -> None:
         timestamp = as_utc(observation.timestamp).isoformat()

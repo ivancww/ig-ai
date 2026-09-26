@@ -19,5 +19,9 @@ class AuthenticationError(IGHTTPError):
     """IG rejected authentication or session credentials."""
 
 
+class RateLimitError(IGHTTPError):
+    """IG throttled a request."""
+
+
 class MalformedResponseError(IGError):
     """IG returned a response that could not be interpreted."""

@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .config import Settings
-from .exceptions import AuthenticationError, IGHTTPError, MalformedResponseError
+from .exceptions import AuthenticationError, IGHTTPError, MalformedResponseError, RateLimitError
 
 log = logging.getLogger(__name__)
 
@@ -84,7 +84,10 @@ class IGRestClient:
                     request, timeout=self.settings.request_timeout_seconds
                 ) as response:
                     raw = response.read()
-                    decoded = json.loads(raw) if raw else {}
+                    try:
+                        decoded = json.loads(raw) if raw else {}
+                    except json.JSONDecodeError as exc:
+                        raise MalformedResponseError("IG response was not valid JSON") from exc
                     if not isinstance(decoded, dict):
                         raise MalformedResponseError("IG response was not a JSON object")
                     return decoded, dict(response.headers)
@@ -92,6 +95,11 @@ class IGRestClient:
                 if exc.code == 401:
                     self.session = None
                     raise AuthenticationError(exc.code, "authentication rejected") from exc
+                if exc.code == 429:
+                    if attempt + 1 < attempts:
+                        time.sleep(min(2**attempt, 4))
+                        continue
+                    raise RateLimitError(exc.code, "rate limit exceeded", retryable=True) from exc
                 retryable = exc.code == 429 or exc.code >= 500
                 if retryable and attempt + 1 < attempts:
                     time.sleep(min(2**attempt, 4))
@@ -109,6 +117,11 @@ class IGRestClient:
             self.authenticate()
         assert self.session is not None
         return self.session
+
+    def refresh_session(self) -> IGSession:
+        """Explicitly replace an expired session without exposing its tokens."""
+        self.session = None
+        return self.ensure_session()
 
     def search_markets(self, search_term: str) -> list[dict[str, Any]]:
         self.ensure_session()

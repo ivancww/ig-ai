@@ -44,3 +44,11 @@ def test_daily_market_timezone_and_dst_safe_timestamp():
     agg.update(observation("2026-03-08T05:59:00", "1"))
     closed = agg.update(observation("2026-03-09T04:00:00", "2"))
     assert closed[0].start.isoformat() == "2026-03-08T05:00:00+00:00"
+
+
+def test_late_tick_does_not_mutate_current_candle():
+    agg = CandleAggregator("15M")
+    agg.update(observation("2026-01-01T00:10:00", "100"))
+    agg.update(observation("2026-01-01T00:12:00", "102"))
+    agg.update(observation("2026-01-01T00:11:00", "1"))
+    assert agg.forming(observation("2026-01-01T00:12:00", "102")).low == Decimal("100")

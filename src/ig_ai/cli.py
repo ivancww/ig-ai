@@ -32,5 +32,8 @@ def main() -> int:
         print("IG authentication succeeded (read-only verification)")
     elif args.command == "discover":
         for candidate in discover_markets(client):
-            print(candidate)
+            print(
+                f"{candidate.market_name}\t{candidate.epic}\t"
+                f"{candidate.market_status or ''}\t{candidate.instrument_type or ''}"
+            )
     return 0

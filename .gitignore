@@ -1,12 +1,18 @@
 .env
 .env.*
 !.env.example
+CST
+X-SECURITY-TOKEN
+session-token*
+*.token
+*.session
 *.db
 *.sqlite
 *.sqlite3
 data/
 logs/
 raw-data/
+market-data/
 *.log
 __pycache__/
 *.py[cod]
@@ -19,4 +25,3 @@ build/
 *.egg-info/
 .coverage
 htmlcov/
-

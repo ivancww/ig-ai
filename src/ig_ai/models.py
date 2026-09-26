@@ -49,3 +49,13 @@ class Candle:
     def __post_init__(self) -> None:
         object.__setattr__(self, "start", as_utc(self.start))
         object.__setattr__(self, "end", as_utc(self.end))
+
+
+@dataclass(frozen=True)
+class Instrument:
+    instrument_id: str
+    epic: str
+    market_name: str
+    instrument_type: str | None = None
+    market_status: str | None = None
+    metadata: dict | None = None

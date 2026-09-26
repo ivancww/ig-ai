@@ -17,6 +17,8 @@ def decimal_or_none(value: Any) -> Decimal | None:
 
 
 def parse_timestamp(value: Any) -> datetime:
+    if value in (None, ""):
+        raise ValueError("timestamp is required")
     result = (
         value
         if isinstance(value, datetime)

@@ -18,6 +18,7 @@ class _Working:
     high: Decimal
     low: Decimal
     close: Decimal
+    last_timestamp: datetime
 
 
 class CandleAggregator:
@@ -51,21 +52,40 @@ class CandleAggregator:
         start, end = self._bounds(observation.timestamp)
         current = self._working.get(key)
         closed: list[Candle] = []
+        timestamp = as_utc(observation.timestamp)
+        if current and (start < current.start or timestamp < current.last_timestamp):
+            # Ignore late/out-of-order ticks so historical data cannot mutate a
+            # candle that has already advanced in time.
+            return closed
         if current and start > current.start:
             closed.append(self._to_candle(observation, current, True))
             current = None
         if current is None:
-            current = _Working(start, end, price, price, price, price)
+            current = _Working(start, end, price, price, price, price, timestamp)
             self._working[key] = current
         else:
             current.high = max(current.high, price)
             current.low = min(current.low, price)
             current.close = price
+            current.last_timestamp = timestamp
         return closed
 
     def forming(self, observation: MarketObservation) -> Candle | None:
         working = self._working.get(observation.instrument_id)
         return self._to_candle(observation, working, False) if working else None
+
+    def flush(self, *, instrument_id: str | None = None) -> list[Candle]:
+        """Close currently forming candles during a controlled shutdown."""
+        keys = [instrument_id] if instrument_id else list(self._working)
+        result = []
+        for key in keys:
+            working = self._working.pop(key, None)
+            if working:
+                result.append(
+                    Candle(key, "", self.timeframe, working.start, working.end,
+                           working.open, working.high, working.low, working.close, is_closed=True)
+                )
+        return result
 
     def _to_candle(
         self, observation: MarketObservation, working: _Working, is_closed: bool

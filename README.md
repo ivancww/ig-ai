@@ -55,6 +55,8 @@ Tests are unit/mock tests and never need IG credentials. Timestamps are timezone
 
 Never put API keys, passwords, CST, X-SECURITY-TOKEN, session tokens, raw market data, databases, or logs in source, tests, documentation, or commits. Logging includes a sensitive-field redaction filter.
 
+Real IG Demo verification status: **NOT VERIFIED** unless the user runs the read-only commands with secure environment credentials. The `Runtime` boundary installs SIGINT/SIGTERM handlers and delegates reconnect behavior to the streaming service; schedule and timezone remain configurable rather than hardcoded.
+
 ## Phase 1 limitations and next phase
 
 This phase does not implement technical indicators, direction scores, probabilities, alerts, news/macro regimes, backtesting, model calibration, automatic trading, or a production daemon supervisor. Real Lightstreamer field decoding and real IG connectivity still require Demo verification. The recommended Phase 2 is to verify Demo discovery/streaming, persist configured instruments, harden provider-specific streaming parsing, and add feature computation over only closed candles before introducing signal/outcome records.

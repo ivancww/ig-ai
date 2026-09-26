@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from .exceptions import ConfigurationError
 
@@ -39,14 +41,26 @@ class Settings:
             if account_type == "DEMO"
             else "https://api.ig.com/gateway/deal"
         )
+        try:
+            timeout = float(env.get("IG_REQUEST_TIMEOUT_SECONDS", "15"))
+            reconnect = float(env.get("IG_STREAM_RECONNECT_SECONDS", "5"))
+            timezone = env.get("IG_MARKET_TIMEZONE", "Asia/Hong_Kong")
+            ZoneInfo(timezone)
+        except (ValueError, TypeError) as exc:
+            raise ConfigurationError("IG numeric settings or market timezone are invalid") from exc
+        if timeout <= 0 or reconnect < 0:
+            raise ConfigurationError("IG timeout must be positive and reconnect delay non-negative")
+        database_path = env.get("IG_DATABASE_PATH", "data/ig_ai.sqlite3").strip()
+        if not database_path:
+            raise ConfigurationError("IG_DATABASE_PATH must not be empty")
         return cls(
             api_key=values["IG_API_KEY"],
             username=values["IG_USERNAME"],
             password=values["IG_PASSWORD"],
             account_type=account_type,
             api_base_url=env.get("IG_API_BASE_URL", default_url).rstrip("/"),
-            database_path=env.get("IG_DATABASE_PATH", "data/ig_ai.sqlite3"),
-            request_timeout_seconds=float(env.get("IG_REQUEST_TIMEOUT_SECONDS", "15")),
-            stream_reconnect_seconds=float(env.get("IG_STREAM_RECONNECT_SECONDS", "5")),
-            market_timezone=env.get("IG_MARKET_TIMEZONE", "Asia/Hong_Kong"),
+            database_path=Path(database_path),
+            request_timeout_seconds=timeout,
+            stream_reconnect_seconds=reconnect,
+            market_timezone=timezone,
         )
