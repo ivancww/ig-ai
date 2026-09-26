@@ -25,6 +25,8 @@ class IGSession:
 class IGRestClient:
     """Dependency-free, read-only-capable IG REST client."""
 
+    _READ_ONLY_GET_PREFIXES = ("/markets", "/prices/")
+
     def __init__(self, settings: Settings, opener=urlopen):
         self.settings = settings
         self._opener = opener
@@ -68,6 +70,15 @@ class IGRestClient:
         version: str = "1",
         retry: bool = True,
     ) -> tuple[dict[str, Any], dict[str, str]]:
+        read_only_get = method == "GET" and any(
+            path == prefix or path.startswith(prefix)
+            for prefix in self._READ_ONLY_GET_PREFIXES
+        )
+        authentication_post = method == "POST" and path == "/session"
+        if not (read_only_get or authentication_post):
+            raise ValueError(
+                "IG client permits only market-data GET requests and POST /session authentication"
+            )
         url = f"{self.settings.api_base_url}{path}"
         if params:
             url += "?" + urlencode(params)

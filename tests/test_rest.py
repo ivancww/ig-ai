@@ -60,3 +60,18 @@ def test_rate_limit_is_typed_and_does_not_leak_response_body():
     with pytest.raises(RateLimitError) as error:
         client._request("GET", "/markets", retry=False)
     assert "token" not in str(error.value).lower()
+
+
+@pytest.mark.parametrize("method,path", [("POST", "/positions"), ("PUT", "/markets/EPIC")])
+def test_non_read_only_requests_are_rejected_before_network(method, path):
+    called = False
+
+    def opener(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("network must not be called")
+
+    client = IGRestClient(settings(), opener=opener)
+    with pytest.raises(ValueError, match="only market-data GET requests"):
+        client._request(method, path)
+    assert not called
