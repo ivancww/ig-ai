@@ -162,7 +162,46 @@ def main() -> int:
                         for instrument in instruments.values()
                     )
                     + f"; observations={sink.observations_written}; 15M candles={sink.candles_written['15M']}; "
-                    + f"1H candles={sink.candles_written['1H']}; reconnects={stream.stats.reconnect_count}"
+                    + f"1H candles={sink.candles_written['1H']}; reconnects={stream.stats.reconnect_count}; "
+                    + "lifecycle="
+                    + ", ".join(
+                        [
+                            f"handshake={'VERIFIED' if stream.stats.diagnostics.websocket_handshake_accepted else 'NOT OBSERVED'}",
+                            f"wsok={'VERIFIED' if stream.stats.diagnostics.wsok_received else 'NOT OBSERVED'}",
+                            f"create_session={'SENT' if stream.stats.diagnostics.create_session_sent else 'NOT OBSERVED'}",
+                            f"conok={'VERIFIED' if stream.stats.diagnostics.conok_received else 'NOT OBSERVED'}",
+                            f"session={'VERIFIED' if stream.stats.diagnostics.session_id_established else 'NOT OBSERVED'}",
+                            f"control_requests={len(stream.stats.diagnostics.subscription_requests_sent)}",
+                            f"subok={len(stream.stats.diagnostics.subscriptions_accepted)}",
+                            f"first_u={len(stream.stats.diagnostics.first_updates_received)}",
+                            f"server_messages={','.join(stream.stats.diagnostics.server_messages) or 'NONE'}",
+                            f"protocol_errors={','.join(stream.stats.diagnostics.protocol_errors) or 'NONE'}",
+                            f"close_code={stream.stats.diagnostics.socket_close_code or 'NONE'}",
+                            f"close_reason={stream.stats.diagnostics.socket_close_reason or 'NONE'}",
+                        ]
+                    )
+                ),
+                runtime_outcome="COMPLETED",
+                connection_established=(
+                    "VERIFIED" if stream.stats.diagnostics.websocket_handshake_accepted else "NOT VERIFIED"
+                ),
+                session_established=(
+                    "VERIFIED" if stream.stats.diagnostics.session_id_established else "NOT VERIFIED"
+                ),
+                subscriptions_accepted=(
+                    f"VERIFIED ({len(stream.stats.diagnostics.subscriptions_accepted)}/{len(instruments)})"
+                    if len(stream.stats.diagnostics.subscriptions_accepted) == len(instruments)
+                    else f"NOT VERIFIED ({len(stream.stats.diagnostics.subscriptions_accepted)}/{len(instruments)})"
+                ),
+                real_price_updates=(
+                    "VERIFIED" if any(stream.stats.updates_received.values()) else "NOT OBSERVED"
+                ),
+                final_state=(
+                    "DISCONNECTED (EXPECTED AFTER DURATION)"
+                    if stream.stats.diagnostics.duration_expired
+                    else "DISCONNECTED (UNEXPECTED)"
+                    if stream.stats.diagnostics.unexpected_disconnect
+                    else "DISCONNECTED"
                 ),
                 checks="read-only Lightstreamer runtime completed",
                 warnings="; ".join(stream.stats.warnings) if stream.stats.warnings else "NONE",

@@ -20,3 +20,22 @@ def test_unified_report_preserves_codex_and_terminal_sections(tmp_path, monkeypa
 
 def test_safe_text_redacts_secret_field_names():
     assert "[REDACTED SENSITIVE OUTPUT]" in reporting._safe_text("X-SECURITY-TOKEN=secret")
+
+
+def test_runtime_report_separates_lifecycle_outcomes(tmp_path, monkeypatch):
+    monkeypatch.setattr(reporting, "STATE_DIR", tmp_path / ".igai")
+    monkeypatch.setattr(reporting, "TERMINAL_REPORT", tmp_path / ".igai" / "terminal-report.txt")
+    reporting.update_terminal_report(
+        command="ig-ai stream --duration 60",
+        streaming="DISCONNECTED; updates=0",
+        runtime_outcome="COMPLETED",
+        connection_established="VERIFIED",
+        session_established="VERIFIED",
+        subscriptions_accepted="VERIFIED (3/3)",
+        real_price_updates="NOT OBSERVED",
+        final_state="DISCONNECTED (EXPECTED AFTER DURATION)",
+    )
+    text = reporting.TERMINAL_REPORT.read_text()
+    assert "Runtime outcome: COMPLETED" in text
+    assert "Real price updates received: NOT OBSERVED" in text
+    assert "Final state: DISCONNECTED (EXPECTED AFTER DURATION)" in text

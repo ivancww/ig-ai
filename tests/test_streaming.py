@@ -5,6 +5,7 @@ import pytest
 from ig_ai.streaming import (
     IGStreamService,
     LightstreamerError,
+    StreamDiagnostics,
     Subscription,
     WebSocketLightstreamerTransport,
     lightstreamer_password,
@@ -131,6 +132,13 @@ def test_websocket_session_flow_uses_protocol_and_subscribes_after_conok():
     assert "LS_session=session-id" in socket.sent[2]
     assert transport.receive() == {"type": "SUB", "subscription_id": "1"}
     assert transport.receive()["BIDPRICE1"] == "100"
+    assert transport.diagnostics.websocket_handshake_accepted
+    assert transport.diagnostics.wsok_received
+    assert transport.diagnostics.create_session_sent
+    assert transport.diagnostics.conok_received
+    assert transport.diagnostics.session_id_established
+    assert transport.diagnostics.subscriptions_accepted == {"1"}
+    assert transport.diagnostics.first_updates_received == {"1"}
 
 
 def test_control_request_ids_are_sequential_and_reset_for_new_session():
@@ -247,6 +255,21 @@ def test_lightstreamer_parser_carries_forward_partial_fields():
     second = transport._parse("U,1,PRICE:EPIC,100|^1|124|$")
     assert first["BIDPRICE1"] == "100" and first["ASKPRICE1"] == "102"
     assert second["BIDPRICE1"] == "100" and second["TIMESTAMP"] == "124"
+
+
+def test_lightstreamer_parser_tracks_keepalives_and_rejects_protocol_errors_safely():
+    transport = object.__new__(WebSocketLightstreamerTransport)
+    transport._field_names = ["BIDPRICE1"]
+    transport._secrets = ("CST-secret|XST-token",)
+    transport.diagnostics = StreamDiagnostics()
+    assert transport._parse("LOOP,123") == {"type": "LOOP"}
+    assert transport._parse("PROG,456") == {"type": "PROG"}
+    assert transport.diagnostics.server_messages == ["LOOP", "PROG"]
+    with pytest.raises(LightstreamerError) as error:
+        transport._parse("REQERR,1,LS_reqId,invalid CST-secret|XST-token")
+    assert error.value.provider_error == "LS_reqId"
+    assert "CST-secret" not in error.value.safe_diagnostic()
+    assert transport.diagnostics.protocol_errors == ["REQERR"]
 
 
 def test_stale_detection_uses_last_update():

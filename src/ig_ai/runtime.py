@@ -90,7 +90,11 @@ class PersistedStream:
         deadline = time.monotonic() + duration
         while worker.is_alive() and time.monotonic() < deadline:
             time.sleep(min(0.25, max(0.01, deadline - time.monotonic())))
-        stream.stop()
+        if worker.is_alive():
+            stream.mark_duration_expired()
+            stream.stop(reason="duration")
+        else:
+            stream.stop(reason="runtime")
         worker.join(timeout=5)
         # Flush stores a forming candle as open. It deliberately does not
         # overwrite a completed candle as closed.

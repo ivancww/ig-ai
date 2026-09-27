@@ -20,7 +20,10 @@ def _safe_text(value: object, secrets: tuple[str, ...] = ()) -> str:
         if secret:
             text = text.replace(secret, "[REDACTED]")
     lines = []
-    sensitive_names = ("ig_api_key", "ig_username", "ig_password", "cst", "x-security-token", "session", "token", "authorization")
+    sensitive_names = (
+        "ig_api_key", "ig_username", "ig_password", "cst", "x-security-token",
+        "ls_password", "access_token", "refresh_token", "authorization", "session_id",
+    )
     for line in text.splitlines():
         lower = line.lower()
         if any(name in lower for name in sensitive_names):
@@ -42,6 +45,12 @@ def update_terminal_report(
     authentication: str = "NOT VERIFIED",
     market_discovery: str = "NOT RUN",
     streaming: str = "NOT RUN",
+    runtime_outcome: str = "NOT RUN",
+    connection_established: str = "NOT VERIFIED",
+    session_established: str = "NOT VERIFIED",
+    subscriptions_accepted: str = "NOT VERIFIED",
+    real_price_updates: str = "NOT VERIFIED",
+    final_state: str = "NOT VERIFIED",
     checks: str = "NOT RUN",
     warnings: str = "NONE",
     not_verified: str = "None stated",
@@ -57,6 +66,12 @@ def update_terminal_report(
             "Authentication: " + _safe_text(authentication, secrets),
             "Market discovery: " + _safe_text(market_discovery, secrets),
             "Streaming: " + _safe_text(streaming, secrets),
+            "Runtime outcome: " + _safe_text(runtime_outcome, secrets),
+            "Connection established: " + _safe_text(connection_established, secrets),
+            "Session established: " + _safe_text(session_established, secrets),
+            "Subscriptions accepted: " + _safe_text(subscriptions_accepted, secrets),
+            "Real price updates received: " + _safe_text(real_price_updates, secrets),
+            "Final state: " + _safe_text(final_state, secrets),
             "Tests/runtime checks: " + _safe_text(checks, secrets),
             "Warnings/errors: " + _safe_text(warnings, secrets),
             "Anything not verified: " + _safe_text(not_verified, secrets),

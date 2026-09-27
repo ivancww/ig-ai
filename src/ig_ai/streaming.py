@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -82,6 +83,28 @@ class StreamStats:
     updates_received: dict[str, int] = field(default_factory=dict)
     last_update: dict[str, float] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    diagnostics: StreamDiagnostics = field(default_factory=lambda: StreamDiagnostics())
+
+
+@dataclass
+class StreamDiagnostics:
+    """Safe lifecycle evidence; values never contain authenticated frame data."""
+
+    websocket_handshake_accepted: bool = False
+    wsok_received: bool = False
+    create_session_sent: bool = False
+    conok_received: bool = False
+    session_id_established: bool = False
+    subscription_requests_sent: dict[str, str] = field(default_factory=dict)
+    subscriptions_accepted: set[str] = field(default_factory=set)
+    first_updates_received: set[str] = field(default_factory=set)
+    server_messages: list[str] = field(default_factory=list)
+    protocol_errors: list[str] = field(default_factory=list)
+    socket_close_code: int | None = None
+    socket_close_reason: str | None = None
+    intentional_shutdown: bool = False
+    duration_expired: bool = False
+    unexpected_disconnect: bool = False
 
 
 def lightstreamer_password(cst: str, security_token: str) -> str:
@@ -106,10 +129,15 @@ class IGStreamService:
             self.subscriptions.append(subscription)
             self.stats.updates_received.setdefault(subscription.instrument_id, 0)
 
-    def stop(self) -> None:
+    def stop(self, *, reason: str = "requested") -> None:
         self._stop.set()
+        self.stats.diagnostics.intentional_shutdown = reason in {"duration", "signal", "requested"}
         self.stats.connection_state = "DISCONNECTED"
         self.transport.close()
+        self._sync_transport_diagnostics()
+
+    def mark_duration_expired(self) -> None:
+        self.stats.diagnostics.duration_expired = True
 
     def is_stale(self, instrument_id: str, *, now: float | None = None, threshold: float = 90.0) -> bool:
         last = self.stats.last_update.get(instrument_id)
@@ -121,6 +149,8 @@ class IGStreamService:
             try:
                 self.stats.connection_state = "CONNECTING"
                 self.transport.connect(self.endpoint, self.username, self.password)
+                self.stats.diagnostics.websocket_handshake_accepted = True
+                self._sync_transport_diagnostics()
                 for index, subscription in enumerate(self.subscriptions, 1):
                     self.transport.send(
                         "subscribe",
@@ -131,14 +161,18 @@ class IGStreamService:
                             "LS_subId": str(index),
                         },
                     )
+                    self.stats.diagnostics.subscription_requests_sent[str(index)] = subscription.item
+                    self._sync_transport_diagnostics()
                 self.stats.connection_state = "CONNECTED"
                 delay = self.reconnect_seconds
                 while not self._stop.is_set():
                     update = self.transport.receive()
                     if update is None:
                         raise ConnectionError("stream disconnected")
-                    if update.get("type") in {"PROBE", "SUB", "UNSUB"}:
-                        on_update(update)
+                    self._sync_transport_diagnostics()
+                    if update.get("type") in {
+                        "PROBE", "SUB", "UNSUB", "LOOP", "PROG", "SYNC", "CONF", "CONS", "REQOK",
+                    }:
                         continue
                     item = str(update.get("item") or update.get("epic") or "")
                     for index, subscription in enumerate(self.subscriptions, 1):
@@ -150,13 +184,16 @@ class IGStreamService:
                             update = dict(merged)
                             update["item"] = item
                             self.stats.updates_received[subscription.instrument_id] += 1
+                            self.stats.diagnostics.first_updates_received.add(str(index))
                             self.stats.last_update[subscription.instrument_id] = time.monotonic()
                             update.setdefault("instrument_id", subscription.instrument_id)
                             update.setdefault("epic", subscription.item.split(":")[-1])
                             break
                     on_update(update)
             except Exception as exc:
+                self._sync_transport_diagnostics()
                 if not self._stop.is_set():
+                    self.stats.diagnostics.unexpected_disconnect = True
                     diagnostic = exc.safe_diagnostic() if isinstance(exc, LightstreamerError) else type(exc).__name__
                     self.stats.warnings.append(diagnostic)
                     if isinstance(exc, LightstreamerError) and not exc.retryable:
@@ -174,7 +211,30 @@ class IGStreamService:
                     self.transport.close()
                 except Exception:
                     pass
+                self._sync_transport_diagnostics()
         self.stats.connection_state = "DISCONNECTED"
+
+    def _sync_transport_diagnostics(self) -> None:
+        diagnostics = getattr(self.transport, "diagnostics", None)
+        if diagnostics is None:
+            return
+        current = self.stats.diagnostics
+        for name in (
+            "websocket_handshake_accepted", "wsok_received", "create_session_sent",
+            "conok_received", "session_id_established", "intentional_shutdown",
+            "duration_expired", "unexpected_disconnect", "socket_close_code",
+            "socket_close_reason",
+        ):
+            value = getattr(diagnostics, name, None)
+            if value is not None and (value is True or value is not False):
+                setattr(current, name, value)
+        current.subscription_requests_sent.update(diagnostics.subscription_requests_sent)
+        current.subscriptions_accepted.update(diagnostics.subscriptions_accepted)
+        current.first_updates_received.update(diagnostics.first_updates_received)
+        for target, source in ((current.server_messages, diagnostics.server_messages), (current.protocol_errors, diagnostics.protocol_errors)):
+            for value in source:
+                if value not in target:
+                    target.append(value)
 
 
 class WebSocketLightstreamerTransport:
@@ -191,6 +251,8 @@ class WebSocketLightstreamerTransport:
         self._endpoint = ""
         self._session_id: str | None = None
         self._next_request_id = 1
+        self.diagnostics = StreamDiagnostics()
+        self._secrets: tuple[str, ...] = ()
 
     def connect(self, endpoint: str, username: str, password: str) -> None:
         self._endpoint = lightstreamer_ws_endpoint(endpoint)
@@ -198,12 +260,15 @@ class WebSocketLightstreamerTransport:
         # connection creates a fresh TLCP session and starts at one.
         self._session_id = None
         self._next_request_id = 1
+        self.diagnostics = StreamDiagnostics()
+        self._secrets = (username, password)
         try:
             self._socket = self._websocket.create_connection(
                 self._endpoint,
                 timeout=30,
                 subprotocols=[LIGHTSTREAMER_SUBPROTOCOL],
             )
+            self.diagnostics.websocket_handshake_accepted = True
         except Exception as exc:
             status = getattr(exc, "status_code", None)
             retryable = status is None or status >= 500
@@ -216,6 +281,8 @@ class WebSocketLightstreamerTransport:
             ) from exc
         self._send_request("wsok")
         self._expect("WSOK", "websocket_check")
+        self.diagnostics.wsok_received = True
+        self.diagnostics.create_session_sent = True
         self._send_request(
             "create_session",
             {
@@ -236,6 +303,8 @@ class WebSocketLightstreamerTransport:
             tag, args = self._response(str(message))
             if tag == "CONOK":
                 self._session_id = args[0] if args else None
+                self.diagnostics.conok_received = True
+                self.diagnostics.session_id_established = bool(self._session_id)
                 return
             if tag in {"CONERR", "ERROR", "REQERR"}:
                 self._raise_protocol(tag, args, "session_creation")
@@ -257,6 +326,7 @@ class WebSocketLightstreamerTransport:
                 "LS_mode": "MERGE",
             }
             params["LS_session"] = self._session_id
+            self.diagnostics.subscription_requests_sent[params["LS_subId"]] = params["LS_group"]
             self._send_request("control", params)
             return
         raise ValueError(f"unsupported Lightstreamer command: {command}")
@@ -273,16 +343,27 @@ class WebSocketLightstreamerTransport:
         return self._parse(str(raw)) if raw else None
 
     def _parse(self, raw: str) -> dict[str, Any]:
+        self._ensure_diagnostics()
         line = raw.strip("\r\n")
         if line.startswith("PROBE"):
+            self._record_server_message("PROBE")
             return {"type": "PROBE"}
         tag, args = self._response(line)
         if tag in {"ERROR", "END", "CONERR", "REQERR"}:
             self._raise_protocol(tag, args, "stream")
         if tag == "SUBOK":
+            if args:
+                self.diagnostics.subscriptions_accepted.add(args[0])
             return {"type": "SUB", "subscription_id": args[0] if args else ""}
         if tag == "UNSUBOK":
             return {"type": "UNSUB"}
+        if tag == "U":
+            if len(args) < 3:
+                return {"type": "U"}
+            self.diagnostics.first_updates_received.add(args[0])
+        elif tag in {"LOOP", "PROG", "SYNC", "CONF", "CONS", "REQOK"}:
+            self._record_server_message(tag)
+            return {"type": tag}
         if tag != "U" or len(args) < 3:
             return {"type": tag or "UNKNOWN"}
         subscription_id, item, values = args[0], args[1], args[2]
@@ -319,17 +400,44 @@ class WebSocketLightstreamerTransport:
         return parts[0], parts[1].split(",") if len(parts) == 2 else []
 
     def _raise_protocol(self, tag: str, args: list[str], phase: str) -> None:
+        self._ensure_diagnostics()
         # Keep only the provider error code. Messages can echo request values.
-        provider_error = args[-2][:160] if len(args) >= 2 else tag
+        provider_error = self._safe_protocol_text(args[-2][:160] if len(args) >= 2 else tag)
+        self.diagnostics.protocol_errors.append(tag)
         raise LightstreamerError(
             f"Lightstreamer protocol response {tag}",
-            endpoint=self._endpoint,
+            endpoint=getattr(self, "_endpoint", ""),
             phase=phase,
             provider_error=provider_error,
         )
 
+    def _record_server_message(self, tag: str) -> None:
+        if tag not in self.diagnostics.server_messages:
+            self.diagnostics.server_messages.append(tag)
+
+    def _safe_protocol_text(self, value: str) -> str:
+        safe = value
+        for secret in self._secrets:
+            if secret:
+                safe = safe.replace(secret, "[REDACTED]")
+        safe = re.sub(r"(?i)(CST|XST)-[^|,\s]+", r"\1-[REDACTED]", safe)
+        safe = re.sub(r"(?i)(authorization|access[_-]?token|refresh[_-]?token|LS_password)=[^&,\s]+", r"\1=[REDACTED]", safe)
+        return safe
+
+    def _ensure_diagnostics(self) -> None:
+        if not hasattr(self, "diagnostics"):
+            self.diagnostics = StreamDiagnostics()
+        if not hasattr(self, "_secrets"):
+            self._secrets = ()
+
     def close(self) -> None:
         if self._socket is not None:
+            code = getattr(self._socket, "close_status_code", None)
+            reason = getattr(self._socket, "close_reason", None)
+            if code is not None:
+                self.diagnostics.socket_close_code = code
+            if reason:
+                self.diagnostics.socket_close_reason = self._safe_protocol_text(str(reason)[:160])
             self._socket.close()
             self._socket = None
         self._session_id = None
