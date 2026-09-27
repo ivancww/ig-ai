@@ -41,7 +41,7 @@ igai-report --run ruff check .
 
 The unified report is also saved as `igai-report.txt` for Cloud Shell Editor copy/paste. Runtime commands update only the Terminal section; Codex updates update only the Codex section. Report state is local and ignored by Git.
 
-Discovery searches provider-name variants, cheaply filters and ranks search metadata, then fetches details only for a small configurable shortlist (`IG_DISCOVERY_DETAIL_BUDGET`, default 3) and classifies candidates as `CASH/ROLLING CFD`, `FUTURES/FORWARD`, `OTHER`, or `UNKNOWN`. Options, shares, rate-limited, and ambiguous primary candidates are never silently selected; a candidate is verified only when provider details identify one eligible, tradeable rolling/index instrument. IG CFD labels do not represent official Nasdaq-100, Nikkei, or Hang Seng cash indexes. The streaming extra is optional:
+Discovery searches provider-name variants, cheaply filters and ranks search metadata, then fetches details only for a small configurable shortlist (`IG_DISCOVERY_DETAIL_BUDGET`, default 3) and classifies candidates as `CASH/ROLLING CFD`, `FUTURES/FORWARD`, `OTHER`, or `UNKNOWN`. Structural verification requires provider metadata to identify the requested normal weekday cash/rolling index; it does not require the current market status to be `TRADEABLE`. Weekend instruments, futures, options, ETFs, shares, knockouts, leveraged products, HSTECH, and China H-shares are excluded from primary verification. Hong Kong HS50 preserves distinct legitimate cash denominations as `VERIFIED_VARIANTS`. IG CFD labels do not represent official Nasdaq-100, Nikkei, or Hang Seng cash indexes. The streaming extra is optional:
 
 ```bash
 uv pip install -e '.[streaming]'

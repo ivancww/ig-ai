@@ -54,16 +54,30 @@ def main() -> int:
             for group in groups:
                 print(f"{group.requested_market}: {group.status}")
                 safe_results.append(f"{group.requested_market}: {group.status}")
-                for candidate in group.candidates:
+                detail_line = f"  detail calls: {group.detail_calls}/{group.detail_budget}"
+                safe_results.append(detail_line)
+                print(detail_line)
+                report_candidates = [
+                    candidate
+                    for candidate in group.candidates
+                    if candidate.verified
+                    or candidate.instrument_type in {"INDICES", "INDEX"}
+                ]
+                for candidate in report_candidates:
                     line = (
                         f"  {candidate.market_name}\t{candidate.epic}\t"
                         f"{candidate.market_status or ''}\t{candidate.instrument_type or ''}\t"
                         f"{candidate.expiry or ''}\t{candidate.classification}\t"
-                        f"eligible_primary={candidate.eligible_primary}\tverified={candidate.verified}\t"
-                        f"metadata={candidate.metadata}"
+                        f"eligible_primary={candidate.eligible_primary}\tverified={candidate.verified}"
                     )
+                    if candidate.exclusion_reason:
+                        line += f"\texcluded={candidate.exclusion_reason}"
                     safe_results.append(line)
                     print(line)
+                if group.ambiguity_reason:
+                    ambiguity_line = f"  ambiguity: {group.ambiguity_reason}"
+                    safe_results.append(ambiguity_line)
+                    print(ambiguity_line)
             update_terminal_report(
                 command="ig-ai discover",
                 account_type=client.settings.account_type,

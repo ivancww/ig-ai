@@ -56,7 +56,7 @@ def test_multiple_plausible_candidates_are_ambiguous_and_hong_kong_variants_are_
     }
     details = {
         "HK1": {"instrument": {"name": "Hong Kong 50", "instrumentType": "INDICES", "expiry": "DFB", "marketStatus": "TRADEABLE"}},
-        "HK2": {"instrument": {"name": "Hang Seng", "instrumentType": "INDICES", "expiry": "DFB", "marketStatus": "TRADEABLE"}},
+        "HK2": {"instrument": {"name": "Hong Kong 50 HK$10", "instrumentType": "INDICES", "expiry": "DFB", "marketStatus": "TRADEABLE"}},
     }
     client = FakeClient(results, details)
     group = discover_market_groups(client)[2]
@@ -184,3 +184,64 @@ def test_provider_allowance_stops_requests_and_reports_rate_limited():
     assert group.status == "RATE_LIMITED"
     assert client.detail_epics == ["INDEX1"]
     assert {candidate.epic for candidate in group.candidates} == {"INDEX1", "INDEX2"}
+
+
+def test_live_us_tech_weekday_cash_beats_weekend_cash_and_status_is_structural():
+    results = {"US Tech 100": [
+        {"epic": "WEEKEND", "instrumentName": "週末美國科技股100指數 現貨 ($1)", "instrumentType": "INDICES", "expiry": "-"},
+        {"epic": "CASH", "instrumentName": "美國科技股100指數 現貨 ($1)", "instrumentType": "INDICES", "expiry": "-"},
+    ]}
+    details = {
+        "WEEKEND": {"instrument": {"instrumentName": "週末美國科技股100指數 現貨 ($1)", "instrumentType": "INDICES", "expiry": "-", "marketStatus": "TRADEABLE"}},
+        "CASH": {"instrument": {"instrumentName": "美國科技股100指數 現貨 ($1)", "instrumentType": "INDICES", "expiry": "-", "marketStatus": "EDITS_ONLY"}},
+    }
+    group = discover_market_groups(FakeClient(results, details))[0]
+    assert group.status == "VERIFIED"
+    assert [candidate.epic for candidate in group.verified_variants] == ["CASH"]
+    assert group.verified_variants[0].market_status == "EDITS_ONLY"
+
+
+def test_live_japan_cash_beats_futures():
+    results = {"Japan 225": [
+        {"epic": "FUTURE", "instrumentName": "日本225", "instrumentType": "INDICES", "expiry": "26年12月"},
+        {"epic": "CASH", "instrumentName": "日本225 現貨 ($1)", "instrumentType": "INDICES", "expiry": "-"},
+    ]}
+    details = {
+        "FUTURE": {"instrument": {"instrumentName": "日本225", "instrumentType": "INDICES", "expiry": "26年12月", "marketStatus": "TRADEABLE"}},
+        "CASH": {"instrument": {"instrumentName": "日本225 現貨 ($1)", "instrumentType": "INDICES", "expiry": "-", "marketStatus": "CLOSED"}},
+    }
+    group = discover_market_groups(FakeClient(results, details))[1]
+    assert group.status == "VERIFIED"
+    assert [candidate.epic for candidate in group.verified_variants] == ["CASH"]
+
+
+def test_hs50_cash_only_excludes_weekend_futures_hstech_h_shares_and_products():
+    results = {"Hong Kong HS50": [
+        {"epic": "CASH1", "instrumentName": "香港HS50 現貨 ($1)", "instrumentType": "INDICES", "expiry": "-"},
+        {"epic": "CASH10", "instrumentName": "香港HS50 現貨 (HK$10)", "instrumentType": "INDICES", "expiry": "-"},
+        {"epic": "FUTURE", "instrumentName": "香港HS50 (HK$10)", "instrumentType": "INDICES", "expiry": "SEP-26"},
+        {"epic": "WEEKEND", "instrumentName": "週末香港HS50 現貨 (HK$10)", "instrumentType": "INDICES", "expiry": "-"},
+        {"epic": "TECH", "instrumentName": "香港HSTECH", "instrumentType": "INDICES", "expiry": "-"},
+        {"epic": "SHARES", "instrumentName": "China H-shares", "instrumentType": "SHARES", "expiry": "-"},
+        {"epic": "ETF", "instrumentName": "Hang Seng ETF", "instrumentType": "ETF", "expiry": "-"},
+        {"epic": "KO", "instrumentName": "Hong Kong 50 Knockout", "instrumentType": "KNOCKOUTS", "expiry": "-"},
+    ]}
+    details = {
+        "CASH1": {"instrument": {"instrumentName": "香港HS50 現貨 ($1)", "instrumentType": "INDICES", "expiry": "-", "marketStatus": "EDITS_ONLY", "currency": "USD", "lotSize": 1, "contractSize": 1, "unit": "CONTRACTS", "streamingPricesAvailable": True}},
+        "CASH10": {"instrument": {"instrumentName": "香港HS50 現貨 (HK$10)", "instrumentType": "INDICES", "expiry": "-", "marketStatus": "CLOSED", "currency": "HKD", "lotSize": 10, "contractSize": 10, "unit": "CONTRACTS", "streamingPricesAvailable": True}},
+        "FUTURE": {"instrument": {"instrumentName": "香港HS50 (HK$10)", "instrumentType": "INDICES", "expiry": "SEP-26", "marketStatus": "TRADEABLE"}},
+        "WEEKEND": {"instrument": {"instrumentName": "週末香港HS50 現貨 (HK$10)", "instrumentType": "INDICES", "expiry": "-", "marketStatus": "TRADEABLE"}},
+        "TECH": {"instrument": {"instrumentName": "香港HSTECH", "instrumentType": "INDICES", "expiry": "-", "marketStatus": "TRADEABLE"}},
+    }
+    group = discover_market_groups(FakeClient(results, details))[2]
+    assert group.status == "VERIFIED_VARIANTS"
+    assert {candidate.epic for candidate in group.verified_variants} == {"CASH1", "CASH10"}
+    assert {candidate.metadata["currency"] for candidate in group.verified_variants} == {"USD", "HKD"}
+    assert not any(candidate.verified for candidate in group.candidates if candidate.epic in {"FUTURE", "WEEKEND", "TECH"})
+
+
+def test_plain_hang_seng_does_not_substitute_for_hs50():
+    results = {"Hong Kong 50": [{"epic": "OTHER", "instrumentName": "Hang Seng China Enterprises", "instrumentType": "INDICES"}]}
+    details = {"OTHER": {"instrument": {"instrumentName": "Hang Seng China Enterprises", "instrumentType": "INDICES", "expiry": "-", "marketStatus": "TRADEABLE"}}}
+    group = discover_market_groups(FakeClient(results, details))[2]
+    assert group.status == "NOT FOUND"

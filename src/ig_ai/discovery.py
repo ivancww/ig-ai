@@ -12,10 +12,24 @@ SEARCH_TERMS = {
     "Japan 225": ("Japan 225", "Japan 225 Index", "Nikkei 225"),
     "Hong Kong HS50": ("Hong Kong HS50", "Hong Kong 50", "Hong Kong", "HS50", "Hang Seng"),
 }
+LOCALIZED_ALIASES = {
+    "US Tech 100": ("美國科技股100", "纳斯达克100", "NASDAQ"),
+    "Japan 225": ("日本225", "日經225", "NIKKEI"),
+    "Hong Kong HS50": ("香港HS50", "香港50", "HS50", "HONG KONG 50"),
+}
 DEFAULT_DETAIL_BUDGET = 3
 ALLOWANCE_ERROR = "error.public-api.exceeded-api-key-allowance"
 INDEX_TYPES = {"INDICES", "INDEX"}
-REJECTED_TYPES = {"OPT_INDICES", "OPTIONS", "SHARES"}
+REJECTED_TYPES = {
+    "OPT_INDICES",
+    "OPTIONS",
+    "SHARES",
+    "ETFS",
+    "ETF",
+    "KNOCKOUTS",
+    "KNOCKOUT",
+    "LEVERAGED",
+}
 
 
 @dataclass(frozen=True)
@@ -30,6 +44,7 @@ class DiscoveryCandidate:
     eligible_primary: bool
     verified: bool
     metadata: dict[str, Any]
+    exclusion_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -37,6 +52,9 @@ class MarketDiscovery:
     requested_market: str
     status: str
     candidates: tuple[DiscoveryCandidate, ...]
+    detail_calls: int = 0
+    detail_budget: int = DEFAULT_DETAIL_BUDGET
+    ambiguity_reason: str | None = None
 
     @property
     def verified_variants(self) -> tuple[DiscoveryCandidate, ...]:
@@ -55,7 +73,7 @@ def classify_instrument(data: dict[str, Any]) -> str:
     """Classify only from provider fields; UNKNOWN is safer than an assumption."""
     instrument_type = str(_value(data, "instrumentType", "type") or "").upper()
     expiry = str(_value(data, "expiry", "expiration") or "").upper()
-    name = str(_value(data, "name", "marketName") or "").upper()
+    name = str(_value(data, "name", "marketName", "instrumentName") or "").upper()
     if instrument_type in {"SHARES", "OPT_INDICES", "OPTIONS"}:
         return "OTHER"
     if instrument_type in {"INDICES", "INDEX"}:
@@ -71,8 +89,8 @@ def classify_instrument(data: dict[str, Any]) -> str:
 
 def _eligible(data: dict[str, Any], classification: str, requested_market: str | None = None) -> bool:
     instrument_type = str(_value(data, "instrumentType", "type") or "").upper()
-    name = str(_value(data, "name", "marketName") or "").upper()
-    if _is_excluded_name(name) or (
+    name = str(_value(data, "name", "marketName", "instrumentName") or "").upper()
+    if _is_excluded_name(name) or _is_weekend_instrument(data) or (
         name and requested_market and not _matches_requested_identity(requested_market, name)
     ):
         return False
@@ -88,25 +106,43 @@ def _is_excluded_name(name: str) -> bool:
         term in name
         for term in (
             "WEEKEND",
+            "週末",
+            "周末",
             "SATURDAY",
             "SUNDAY",
             "OPTION",
             "ETF",
             "SHARE",
             "LEVERAGED",
+            "KNOCKOUT",
+            "KNOCK-OUT",
             " 2X",
             " 3X",
         )
     ) or name.startswith(("2X", "3X"))
 
 
+def _is_weekend_instrument(data: dict[str, Any]) -> bool:
+    name = str(_value(data, "name", "marketName", "instrumentName") or "").upper()
+    if any(term in name for term in ("WEEKEND", "週末", "周末", "SATURDAY", "SUNDAY")):
+        return True
+    for key in ("classification", "marketClassification", "marketType", "marketSession"):
+        value = str(data.get(key) or "").upper()
+        if "WEEKEND" in value or "週末" in value or "周末" in value:
+            return True
+    return False
+
+
 def _matches_requested_identity(requested_market: str, name: str) -> bool:
     if requested_market != "Hong Kong HS50":
         return True
     # HSTECH is a separate confirmation market and must never satisfy HS50.
-    if any(term in name for term in ("HSTECH", "HS TECH", "HANG SENG TECH", "TECHNOLOGY")):
+    if any(term in name for term in (
+        "HSTECH", "HS TECH", "HANG SENG TECH", "TECHNOLOGY", "H-SHARE", "H SHARES",
+        "H-SHARES", "CHINA ENTERPRISE",
+    )):
         return False
-    return any(term in name for term in ("HS50", "HS 50", "HONG KONG 50", "HANG SENG 50", "HANG SENG"))
+    return any(term in name for term in ("HS50", "HS 50", "HONG KONG 50", "HANG SENG 50"))
 
 
 def _search_score(requested_market: str, data: dict[str, Any]) -> int | None:
@@ -117,10 +153,18 @@ def _search_score(requested_market: str, data: dict[str, Any]) -> int | None:
         return None
     if instrument_type and instrument_type not in INDEX_TYPES:
         return None
-    if name and (_is_excluded_name(name) or not _matches_requested_identity(requested_market, name)):
+    if name and (
+        _is_excluded_name(name)
+        or _is_weekend_instrument(data)
+        or not _matches_requested_identity(requested_market, name)
+    ):
         return None
 
-    aliases = (requested_market, *SEARCH_TERMS.get(requested_market, ()))
+    aliases = (
+        requested_market,
+        *SEARCH_TERMS.get(requested_market, ()),
+        *LOCALIZED_ALIASES.get(requested_market, ()),
+    )
     name_match = any(alias.upper() in name for alias in aliases if alias)
     # A named, unrelated result is not a plausible primary index. An entirely
     # sparse provider result remains eligible for ranking for compatibility, but
@@ -134,8 +178,11 @@ def _search_score(requested_market: str, data: dict[str, Any]) -> int | None:
         score += 50
     if str(_value(data, "marketStatus", "status") or "").upper() == "TRADEABLE":
         score += 10
-    if str(_value(data, "expiry", "expiration") or "").upper() == "DFB":
-        score += 5
+    expiry = str(_value(data, "expiry", "expiration") or "").upper()
+    if expiry in {"DFB", "-", "NULL", "NONE"}:
+        score += 20
+    if _is_excluded_name(name):
+        score -= 100
     return score
 
 
@@ -150,7 +197,7 @@ def _candidate(
     classification = classify_instrument(merged)
     status = _value(merged, "marketStatus")
     eligible = _eligible(merged, classification, requested_market)
-    verified = bool(epic and details and eligible and str(status or "").upper() == "TRADEABLE")
+    verified = bool(epic and details and eligible)
     safe_metadata = {
         key: merged[key]
         for key in (
@@ -175,6 +222,7 @@ def _candidate(
         eligible,
         verified,
         safe_metadata,
+        None if eligible else "not a normal weekday cash/rolling index instrument",
     )
 
 
@@ -242,7 +290,22 @@ def _discover_group(
         status = "AMBIGUOUS"
     else:
         status = "NOT FOUND"
-    return MarketDiscovery(requested_market, status, candidates)
+    ambiguity_reason = None
+    if status == "AMBIGUOUS":
+        if primary and not verified:
+            ambiguity_reason = "eligible candidates need provider detail verification"
+        elif len(verified) > 1:
+            ambiguity_reason = "multiple structurally verified candidates remain"
+        elif detail_calls < len(ranked):
+            ambiguity_reason = "detail budget exhausted before all plausible candidates were checked"
+    return MarketDiscovery(
+        requested_market,
+        status,
+        candidates,
+        detail_calls=detail_calls,
+        detail_budget=detail_budget,
+        ambiguity_reason=ambiguity_reason,
+    )
 
 
 def _has_distinct_variant_metadata(candidates: tuple[DiscoveryCandidate, ...]) -> bool:
