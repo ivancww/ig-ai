@@ -96,9 +96,15 @@ class StreamDiagnostics:
     conok_received: bool = False
     session_id_established: bool = False
     control_sent: bool = False
+    control_requests: dict[str, str] = field(default_factory=dict)
     subscription_requests_sent: dict[str, str] = field(default_factory=dict)
+    reqok_request_ids: set[str] = field(default_factory=set)
+    reqerr_request_ids: set[str] = field(default_factory=set)
+    subok_subscription_ids: set[str] = field(default_factory=set)
+    subcmd_subscription_ids: set[str] = field(default_factory=set)
     subscriptions_accepted: set[str] = field(default_factory=set)
     first_updates_received: set[str] = field(default_factory=set)
+    subscription_states: dict[str, str] = field(default_factory=dict)
     server_messages: list[str] = field(default_factory=list)
     protocol_errors: list[str] = field(default_factory=list)
     socket_close_code: int | None = None
@@ -231,8 +237,14 @@ class IGStreamService:
             if value is not None and (value is True or value is not False):
                 setattr(current, name, value)
         current.subscription_requests_sent.update(diagnostics.subscription_requests_sent)
+        current.control_requests.update(diagnostics.control_requests)
+        current.reqok_request_ids.update(diagnostics.reqok_request_ids)
+        current.reqerr_request_ids.update(diagnostics.reqerr_request_ids)
+        current.subok_subscription_ids.update(diagnostics.subok_subscription_ids)
+        current.subcmd_subscription_ids.update(diagnostics.subcmd_subscription_ids)
         current.subscriptions_accepted.update(diagnostics.subscriptions_accepted)
         current.first_updates_received.update(diagnostics.first_updates_received)
+        current.subscription_states.update(diagnostics.subscription_states)
         for target, source in ((current.server_messages, diagnostics.server_messages), (current.protocol_errors, diagnostics.protocol_errors)):
             for value in source:
                 if value not in target:
@@ -318,17 +330,21 @@ class WebSocketLightstreamerTransport:
             raise ConnectionError("Lightstreamer session is not established")
         if command == "subscribe":
             self._field_names = params["fields"].split(",")
+            request_id = self._request_id()
+            subscription_id = params["LS_subId"]
             params = {
                 "LS_op": "add",
-                "LS_reqId": self._request_id(),
-                "LS_subId": params["LS_subId"],
+                "LS_reqId": request_id,
+                "LS_subId": subscription_id,
                 "LS_group": params["item"],
                 "LS_schema": params["fields"],
                 "LS_data_adapter": params.get("adapter", "Pricing"),
                 "LS_mode": "MERGE",
             }
             params["LS_session"] = self._session_id
-            self.diagnostics.subscription_requests_sent[params["LS_subId"]] = params["LS_group"]
+            self.diagnostics.control_requests[request_id] = subscription_id
+            self.diagnostics.subscription_requests_sent[subscription_id] = params["LS_group"]
+            self.diagnostics.subscription_states[subscription_id] = "CONTROL_SENT"
             self._send_request("control", params)
             self.diagnostics.control_sent = True
             return
@@ -352,22 +368,55 @@ class WebSocketLightstreamerTransport:
             self._record_server_message("PROBE")
             return {"type": "PROBE"}
         tag, args = self._response(line)
-        if tag in {"ERROR", "END", "CONERR", "REQERR"}:
+        if tag == "REQOK":
+            request_id = args[0] if args else ""
+            self._record_server_message(tag)
+            if request_id:
+                self.diagnostics.reqok_request_ids.add(request_id)
+                subscription_id = self.diagnostics.control_requests.get(request_id)
+                if subscription_id:
+                    self.diagnostics.subscription_states[subscription_id] = "CONTROL_ACCEPTED"
+            return {
+                "type": tag,
+                "request_id": request_id,
+                "subscription_id": self.diagnostics.control_requests.get(request_id, ""),
+            }
+        if tag == "REQERR":
+            request_id = args[0] if args else ""
+            self._record_server_message(tag)
+            if request_id:
+                self.diagnostics.reqerr_request_ids.add(request_id)
+            self._raise_protocol(tag, args, "stream")
+        if tag in {"ERROR", "END", "CONERR"}:
             self._record_server_message(tag)
             self._raise_protocol(tag, args, "stream")
         if tag == "SUBOK":
             self._record_server_message(tag)
-            if args:
-                self.diagnostics.subscriptions_accepted.add(args[0])
-            return {"type": "SUB", "subscription_id": args[0] if args else ""}
+            subscription_id = args[0] if args else ""
+            if subscription_id in self.diagnostics.subscription_requests_sent:
+                self.diagnostics.subok_subscription_ids.add(subscription_id)
+                self.diagnostics.subscriptions_accepted.add(subscription_id)
+                self.diagnostics.subscription_states[subscription_id] = "SUBSCRIPTION_ESTABLISHED"
+            return {"type": "SUB", "subscription_id": subscription_id}
         if tag == "UNSUBOK":
             self._record_server_message(tag)
             return {"type": "UNSUB"}
         if tag == "U":
             if len(args) < 3:
                 return {"type": "U"}
-            self.diagnostics.first_updates_received.add(args[0])
-        elif tag in {"LOOP", "PROG", "SYNC", "CONF", "CONS", "REQOK", "SUBCMD"}:
+            subscription_id = args[0]
+            if subscription_id in self.diagnostics.subscription_requests_sent:
+                self.diagnostics.first_updates_received.add(subscription_id)
+                self.diagnostics.subscription_states[subscription_id] = "DATA_OBSERVED"
+        elif tag == "SUBCMD":
+            self._record_server_message(tag)
+            subscription_id = args[0] if args else ""
+            if subscription_id in self.diagnostics.subscription_requests_sent:
+                self.diagnostics.subcmd_subscription_ids.add(subscription_id)
+                self.diagnostics.subscriptions_accepted.add(subscription_id)
+                self.diagnostics.subscription_states[subscription_id] = "SUBSCRIPTION_ESTABLISHED"
+            return {"type": tag, "subscription_id": subscription_id}
+        elif tag in {"LOOP", "PROG", "SYNC", "CONF", "CONS"}:
             self._record_server_message(tag)
             return {"type": tag}
         if tag != "U" or len(args) < 3:

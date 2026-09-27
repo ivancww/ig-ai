@@ -253,6 +253,8 @@ def test_handshake_status_is_safe_and_structurally_invalid_not_retried():
 def test_lightstreamer_parser_carries_forward_partial_fields():
     transport = object.__new__(WebSocketLightstreamerTransport)
     transport._field_names = ["BIDPRICE1", "ASKPRICE1", "TIMESTAMP", "DLG_FLAG"]
+    transport.diagnostics = StreamDiagnostics()
+    transport.diagnostics.subscription_requests_sent["1"] = "PRICE:EPIC"
     first = transport._parse("U,1,PRICE:EPIC,100|102|123|TRADEABLE")
     second = transport._parse("U,1,PRICE:EPIC,100|^1|124|$")
     assert first["BIDPRICE1"] == "100" and first["ASKPRICE1"] == "102"
@@ -264,6 +266,7 @@ def test_lightstreamer_parser_tracks_keepalives_and_rejects_protocol_errors_safe
     transport._field_names = ["BIDPRICE1"]
     transport._secrets = ("CST-secret|XST-token",)
     transport.diagnostics = StreamDiagnostics()
+    transport.diagnostics.subscription_requests_sent["1"] = "PRICE:EPIC"
     assert transport._parse("LOOP,123") == {"type": "LOOP"}
     assert transport._parse("PROG,456") == {"type": "PROG"}
     assert transport.diagnostics.server_messages == ["LOOP", "PROG"]
@@ -279,9 +282,11 @@ def test_lightstreamer_parser_tracks_control_lifecycle_without_emitting_control_
     transport._field_names = ["BIDPRICE1"]
     transport._secrets = ()
     transport.diagnostics = StreamDiagnostics()
+    transport.diagnostics.control_requests["1"] = "1"
+    transport.diagnostics.subscription_requests_sent["1"] = "PRICE:EPIC"
 
-    assert transport._parse("REQOK,1") == {"type": "REQOK"}
-    assert transport._parse("SUBCMD,1,ADD") == {"type": "SUBCMD"}
+    assert transport._parse("REQOK,1") == {"type": "REQOK", "request_id": "1", "subscription_id": "1"}
+    assert transport._parse("SUBCMD,1,1,2,1,2") == {"type": "SUBCMD", "subscription_id": "1"}
     assert transport._parse("SUBOK,1,1,1") == {"type": "SUB", "subscription_id": "1"}
     assert transport._parse("U,1,PRICE:EPIC,100") == {
         "item": "PRICE:EPIC",
@@ -290,6 +295,52 @@ def test_lightstreamer_parser_tracks_control_lifecycle_without_emitting_control_
     }
     assert transport.diagnostics.server_messages == ["REQOK", "SUBCMD", "SUBOK"]
     assert transport.diagnostics.first_updates_received == {"1"}
+    assert transport.diagnostics.reqok_request_ids == {"1"}
+    assert transport.diagnostics.subcmd_subscription_ids == {"1"}
+    assert transport.diagnostics.subok_subscription_ids == {"1"}
+    assert transport.diagnostics.subscription_states["1"] == "DATA_OBSERVED"
+
+
+def test_control_and_subscription_correlations_do_not_false_accept():
+    transport = object.__new__(WebSocketLightstreamerTransport)
+    transport._field_names = ["BIDPRICE1"]
+    transport._secrets = ()
+    transport.diagnostics = StreamDiagnostics()
+    transport.diagnostics.control_requests = {"11": "1", "12": "2", "13": "3"}
+    transport.diagnostics.subscription_requests_sent = {
+        "1": "PRICE:EPIC1", "2": "PRICE:EPIC2", "3": "PRICE:EPIC3"
+    }
+
+    assert transport._parse("REQOK,12")["subscription_id"] == "2"
+    with pytest.raises(LightstreamerError):
+        transport._parse("REQERR,13,68,safe failure")
+    assert transport.diagnostics.reqok_request_ids == {"12"}
+    assert transport.diagnostics.reqerr_request_ids == {"13"}
+    assert transport.diagnostics.subscription_states["2"] == "CONTROL_ACCEPTED"
+    assert "3" not in transport.diagnostics.subscriptions_accepted
+
+    transport._parse("SUBOK,2,1,1")
+    transport._parse("SUBCMD,1,1,2,1,2")
+    transport._parse("U,2,PRICE:EPIC2,100")
+    transport._parse("U,99,UNKNOWN,999")
+    assert transport.diagnostics.subok_subscription_ids == {"2"}
+    assert transport.diagnostics.subcmd_subscription_ids == {"1"}
+    assert transport.diagnostics.first_updates_received == {"2"}
+    assert "99" not in transport.diagnostics.first_updates_received
+    assert transport.diagnostics.subscription_states["2"] == "DATA_OBSERVED"
+
+
+def test_reqerr_correlation_redacts_error_content():
+    transport = object.__new__(WebSocketLightstreamerTransport)
+    transport._field_names = []
+    transport._secrets = ("CST-secret|XST-token",)
+    transport.diagnostics = StreamDiagnostics()
+    transport.diagnostics.control_requests["7"] = "1"
+    transport.diagnostics.subscription_requests_sent["1"] = "PRICE:EPIC"
+    with pytest.raises(LightstreamerError) as error:
+        transport._parse("REQERR,7,68,invalid CST-secret|XST-token")
+    assert transport.diagnostics.reqerr_request_ids == {"7"}
+    assert "CST-secret" not in error.value.safe_diagnostic()
 
 
 def test_stale_detection_uses_last_update():
