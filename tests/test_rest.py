@@ -27,7 +27,7 @@ class Response:
         return False
 
     def read(self):
-        return io.BytesIO(b'{"lightstreamerEndpoint":"wss://example"}').read()
+        return io.BytesIO(b'{"lightstreamerEndpoint":"wss://example","currentAccountId":"ABC123"}').read()
 
 
 def test_authentication_creates_private_session():
@@ -35,6 +35,7 @@ def test_authentication_creates_private_session():
     result = client.authenticate()
     assert result["lightstreamerEndpoint"].startswith("wss://")
     assert client.session and client.session.cst == "cst"
+    assert client.session.account_id == "ABC123"
 
 
 def test_unauthorized_clears_session():

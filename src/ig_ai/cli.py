@@ -18,6 +18,7 @@ from .streaming import (
     Subscription,
     WebSocketLightstreamerTransport,
     lightstreamer_password,
+    lightstreamer_ws_endpoint,
 )
 
 
@@ -115,10 +116,10 @@ def main() -> int:
             endpoint = session.lightstreamer_endpoint
             if not endpoint:
                 raise RuntimeError("IG authentication did not provide a Lightstreamer endpoint")
-            if endpoint.startswith("https://"):
-                endpoint = "wss://" + endpoint.removeprefix("https://")
-            elif endpoint.startswith("http://"):
-                endpoint = "ws://" + endpoint.removeprefix("http://")
+            endpoint = lightstreamer_ws_endpoint(endpoint)
+            account_id = session.account_id
+            if not account_id:
+                raise RuntimeError("IG authentication did not provide the active account identifier")
             database = Database(client.settings.database_path)
             instruments = {}
             for candidate in selected:
@@ -131,13 +132,18 @@ def main() -> int:
                 database.save_instrument_model(instrument)
             stream = IGStreamService(
                 endpoint,
-                client.settings.username,
+                account_id,
                 lightstreamer_password(session.cst, session.security_token),
                 WebSocketLightstreamerTransport(),
                 reconnect_seconds=client.settings.stream_reconnect_seconds,
             )
             for instrument in instruments.values():
-                stream.add_subscription(Subscription(instrument.instrument_id, f"MARKET:{instrument.epic}"))
+                stream.add_subscription(
+                    Subscription(
+                        instrument.instrument_id,
+                        f"PRICE:{account_id}:{instrument.epic}",
+                    )
+                )
             sink = PersistedStream(database, instruments, client.settings.market_timezone)
             try:
                 sink.run_for(stream, args.duration)
@@ -149,7 +155,7 @@ def main() -> int:
                 authentication="PASS",
                 market_discovery="PASS — provider-verified weekday cash instruments selected",
                 streaming=(
-                    f"{stream.stats.connection_state} / SUBSCRIBED; "
+                    f"{stream.stats.connection_state}; "
                     + "; ".join(
                         f"{instrument.market_name}: updates={stream.stats.updates_received.get(instrument.instrument_id, 0)}, "
                         f"last_update={sink.last_update.get(instrument.instrument_id, 'NO LIVE TICKS YET')}"
@@ -160,7 +166,7 @@ def main() -> int:
                 ),
                 checks="read-only Lightstreamer runtime completed",
                 warnings="; ".join(stream.stats.warnings) if stream.stats.warnings else "NONE",
-                not_verified="A market with zero ticks has connection/subscription evidence but no real price-update evidence",
+                not_verified="A market with zero ticks has connection/subscription evidence but no real price-update evidence; LIVE streaming PASS was not claimed",
                 output="; ".join(f"{candidate.market_name}\t{candidate.epic}" for candidate in selected),
                 secrets=(client.settings.api_key, client.settings.username, client.settings.password, session.cst, session.security_token),
             )

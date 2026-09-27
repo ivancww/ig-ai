@@ -7,9 +7,57 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
-from urllib.parse import quote
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 log = logging.getLogger(__name__)
+
+LIGHTSTREAMER_PROTOCOL = "TLCP-2.4.0"
+LIGHTSTREAMER_SUBPROTOCOL = "TLCP-2.4.0.lightstreamer.com"
+LIGHTSTREAMER_CLIENT_ID = "mgQkwtwdysogQz2BJ4Ji kOj2Bg"
+
+
+def lightstreamer_ws_endpoint(endpoint: str) -> str:
+    """Build the documented WS endpoint without retaining endpoint query data."""
+    parsed = urlsplit(endpoint)
+    if parsed.scheme not in {"http", "https", "ws", "wss"} or not parsed.netloc:
+        raise ValueError("Lightstreamer endpoint must be an absolute HTTP(S) URL")
+    scheme = {"http": "ws", "https": "wss", "ws": "ws", "wss": "wss"}[parsed.scheme]
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/lightstreamer"):
+        path += "/lightstreamer"
+    return urlunsplit((scheme, parsed.netloc, path, "", ""))
+
+
+def _safe_endpoint(endpoint: str) -> str:
+    parsed = urlsplit(endpoint)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", "", ""))
+
+
+class LightstreamerError(ConnectionError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        endpoint: str,
+        phase: str,
+        status: int | None = None,
+        provider_error: str | None = None,
+        retryable: bool = False,
+    ):
+        super().__init__(message)
+        self.endpoint = _safe_endpoint(endpoint)
+        self.phase = phase
+        self.status = status
+        self.provider_error = provider_error
+        self.retryable = retryable
+
+    def safe_diagnostic(self) -> str:
+        return (
+            "Lightstreamer diagnostic: "
+            f"status={self.status if self.status is not None else 'none'} "
+            f"phase={self.phase} endpoint={self.endpoint} "
+            f"provider_error={self.provider_error or 'none'}"
+        )
 
 
 class StreamTransport(Protocol):
@@ -23,7 +71,8 @@ class StreamTransport(Protocol):
 class Subscription:
     instrument_id: str
     item: str
-    fields: tuple[str, ...] = ("BID", "OFFER", "UPDATE_TIME", "MARKET_STATE")
+    fields: tuple[str, ...] = ("BIDPRICE1", "ASKPRICE1", "TIMESTAMP", "DLG_FLAG")
+    data_adapter: str = "Pricing"
 
 
 @dataclass
@@ -36,7 +85,7 @@ class StreamStats:
 
 
 def lightstreamer_password(cst: str, security_token: str) -> str:
-    return f"CST-{cst}|X-SECURITY-TOKEN-{security_token}"
+    return f"CST-{cst}|XST-{security_token}"
 
 
 class IGStreamService:
@@ -100,12 +149,18 @@ class IGStreamService:
                     on_update(update)
             except Exception as exc:
                 if not self._stop.is_set():
-                    self.stats.connection_state = "RECONNECTING"
-                    self.stats.reconnect_count += 1
-                    self.stats.warnings.append(type(exc).__name__)
-                    log.warning("IG Lightstreamer disconnected; reconnecting")
-                    self._stop.wait(delay)
-                    delay = min(self.max_reconnect_seconds, max(0.1, delay * 2 or 0.1))
+                    diagnostic = exc.safe_diagnostic() if isinstance(exc, LightstreamerError) else type(exc).__name__
+                    self.stats.warnings.append(diagnostic)
+                    if isinstance(exc, LightstreamerError) and not exc.retryable:
+                        self.stats.connection_state = "FAILED"
+                        log.warning("IG Lightstreamer stopped: %s", diagnostic)
+                        self._stop.set()
+                    else:
+                        self.stats.connection_state = "RECONNECTING"
+                        self.stats.reconnect_count += 1
+                        log.warning("IG Lightstreamer disconnected; reconnecting: %s", diagnostic)
+                        self._stop.wait(delay)
+                        delay = min(self.max_reconnect_seconds, max(0.1, delay * 2 or 0.1))
             finally:
                 try:
                     self.transport.close()
@@ -125,34 +180,71 @@ class WebSocketLightstreamerTransport:
         self._websocket = websocket
         self._socket = None
         self._field_names: list[str] = []
+        self._endpoint = ""
+        self._session_id: str | None = None
 
     def connect(self, endpoint: str, username: str, password: str) -> None:
-        self._socket = self._websocket.create_connection(endpoint, timeout=30)
-        self._socket.send("LS_op2=create&LS_cid=ig-ai&LS_adapter_set=QUOTE" f"&LS_user={quote(username)}&LS_password={quote(password)}\r\n")
+        self._endpoint = lightstreamer_ws_endpoint(endpoint)
+        try:
+            self._socket = self._websocket.create_connection(
+                self._endpoint,
+                timeout=30,
+                subprotocols=[LIGHTSTREAMER_SUBPROTOCOL],
+            )
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            retryable = status is None or status >= 500
+            raise LightstreamerError(
+                "Lightstreamer WebSocket handshake failed",
+                endpoint=self._endpoint,
+                phase="websocket_handshake",
+                status=status,
+                retryable=retryable,
+            ) from exc
+        self._send_request("wsok")
+        self._expect("WSOK", "websocket_check")
+        self._send_request(
+            "create_session",
+            {
+                "LS_cid": LIGHTSTREAMER_CLIENT_ID,
+                "LS_user": username,
+                "LS_password": password,
+                "LS_send_sync": "false",
+            },
+        )
         while True:
-            message = self._socket.recv()
+            message = self._recv("session_creation")
             if not message:
-                raise ConnectionError("Lightstreamer session closed during setup")
-            line = str(message).strip()
-            if line.startswith("CONOK"):
+                raise LightstreamerError(
+                    "Lightstreamer session closed during setup",
+                    endpoint=self._endpoint,
+                    phase="session_creation",
+                )
+            tag, args = self._response(str(message))
+            if tag == "CONOK":
+                self._session_id = args[0] if args else None
                 return
-            if line.startswith("ERROR"):
-                raise ConnectionError("Lightstreamer session setup failed")
+            if tag in {"CONERR", "ERROR", "REQERR"}:
+                self._raise_protocol(tag, args, "session_creation")
 
     def send(self, command: str, params: dict[str, str]) -> None:
         if self._socket is None:
             raise ConnectionError("stream is not connected")
         if command == "subscribe":
+            self._field_names = params["fields"].split(",")
             params = {
                 "LS_op": "add",
                 "LS_subId": params["LS_subId"],
                 "LS_group": params["item"],
                 "LS_schema": params["fields"],
-                "LS_data_adapter": params.get("adapter", "QUOTE"),
+                "LS_data_adapter": params.get("adapter", "Pricing"),
                 "LS_mode": "MERGE",
             }
-        encoded = "&".join(f"{quote(key)}={quote(value)}" for key, value in params.items())
-        self._socket.send(f"{command.upper()}\r\n{encoded}\r\n")
+            if self._session_id:
+                params["LS_session"] = self._session_id
+            self._send_request("control", params)
+            return
+        raise ValueError(f"unsupported Lightstreamer command: {command}")
 
     def receive(self) -> dict[str, Any] | None:
         if self._socket is None:
@@ -164,24 +256,60 @@ class WebSocketLightstreamerTransport:
         line = raw.strip("\r\n")
         if line.startswith("PROBE"):
             return {"type": "PROBE"}
-        if line.startswith("ERROR"):
-            raise ConnectionError("Lightstreamer reported a stream error")
-        if line.startswith("SUB|"):
-            parts = line.split("|")
-            self._field_names = parts[4:]
-            return {"type": "SUB", "item": parts[3] if len(parts) > 3 else ""}
-        if line.startswith("UNSUB"):
+        tag, args = self._response(line)
+        if tag in {"ERROR", "END", "CONERR", "REQERR"}:
+            self._raise_protocol(tag, args, "stream")
+        if tag == "SUBOK":
+            return {"type": "SUB", "subscription_id": args[0] if args else ""}
+        if tag == "UNSUBOK":
             return {"type": "UNSUB"}
-        parts = line.split("|")
-        if not parts or not parts[0].startswith("ITEM"):
-            return {"type": parts[0] if parts else "UNKNOWN"}
-        update: dict[str, Any] = {"item": parts[0]}
-        for index, value in enumerate(parts[1:]):
+        if tag != "U" or len(args) < 3:
+            return {"type": tag or "UNKNOWN"}
+        subscription_id, item, values = args[0], args[1], args[2]
+        update: dict[str, Any] = {"item": item, "subscription_id": subscription_id}
+        for index, value in enumerate(values.split("|")):
             if index < len(self._field_names) and value != "":
+                if value.startswith("^"):
+                    continue
                 update[self._field_names[index]] = value
         return update
+
+    def _send_request(self, name: str, params: dict[str, str] | None = None) -> None:
+        encoded = urlencode(params or {})
+        self._socket.send(name + ("\r\n" + encoded if params is not None else ""))
+
+    def _recv(self, phase: str) -> str:
+        try:
+            raw = self._socket.recv()
+        except Exception as exc:
+            raise LightstreamerError(
+                "Lightstreamer receive failed", endpoint=self._endpoint, phase=phase
+            ) from exc
+        return str(raw) if raw else ""
+
+    def _expect(self, expected: str, phase: str) -> None:
+        response = self._recv(phase).strip("\r\n")
+        if response != expected:
+            tag, args = self._response(response)
+            self._raise_protocol(tag or "UNKNOWN", args, phase)
+
+    @staticmethod
+    def _response(line: str) -> tuple[str, list[str]]:
+        parts = line.split(",", 1)
+        return parts[0], parts[1].split(",") if len(parts) == 2 else []
+
+    def _raise_protocol(self, tag: str, args: list[str], phase: str) -> None:
+        # Keep only the provider error code. Messages can echo request values.
+        provider_error = args[-2][:160] if len(args) >= 2 else tag
+        raise LightstreamerError(
+            f"Lightstreamer protocol response {tag}",
+            endpoint=self._endpoint,
+            phase=phase,
+            provider_error=provider_error,
+        )
 
     def close(self) -> None:
         if self._socket is not None:
             self._socket.close()
             self._socket = None
+        self._session_id = None

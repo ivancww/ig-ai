@@ -20,6 +20,7 @@ class IGSession:
     cst: str
     security_token: str
     lightstreamer_endpoint: str | None = None
+    account_id: str | None = None
 
 
 class IGRestClient:
@@ -45,7 +46,12 @@ class IGRestClient:
             raise MalformedResponseError(
                 "IG authentication response did not include session headers"
             )
-        self.session = IGSession(cst, token, data.get("lightstreamerEndpoint"))
+        self.session = IGSession(
+            cst,
+            token,
+            data.get("lightstreamerEndpoint"),
+            data.get("currentAccountId") or data.get("accountId"),
+        )
         return data
 
     def _headers(self, version: str) -> dict[str, str]:
