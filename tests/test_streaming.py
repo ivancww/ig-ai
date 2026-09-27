@@ -137,8 +137,10 @@ def test_websocket_session_flow_uses_protocol_and_subscribes_after_conok():
     assert transport.diagnostics.create_session_sent
     assert transport.diagnostics.conok_received
     assert transport.diagnostics.session_id_established
+    assert transport.diagnostics.control_sent
     assert transport.diagnostics.subscriptions_accepted == {"1"}
     assert transport.diagnostics.first_updates_received == {"1"}
+    assert transport.diagnostics.server_messages == ["SUBOK"]
 
 
 def test_control_request_ids_are_sequential_and_reset_for_new_session():
@@ -270,6 +272,24 @@ def test_lightstreamer_parser_tracks_keepalives_and_rejects_protocol_errors_safe
     assert error.value.provider_error == "LS_reqId"
     assert "CST-secret" not in error.value.safe_diagnostic()
     assert transport.diagnostics.protocol_errors == ["REQERR"]
+
+
+def test_lightstreamer_parser_tracks_control_lifecycle_without_emitting_control_frames():
+    transport = object.__new__(WebSocketLightstreamerTransport)
+    transport._field_names = ["BIDPRICE1"]
+    transport._secrets = ()
+    transport.diagnostics = StreamDiagnostics()
+
+    assert transport._parse("REQOK,1") == {"type": "REQOK"}
+    assert transport._parse("SUBCMD,1,ADD") == {"type": "SUBCMD"}
+    assert transport._parse("SUBOK,1,1,1") == {"type": "SUB", "subscription_id": "1"}
+    assert transport._parse("U,1,PRICE:EPIC,100") == {
+        "item": "PRICE:EPIC",
+        "subscription_id": "1",
+        "BIDPRICE1": "100",
+    }
+    assert transport.diagnostics.server_messages == ["REQOK", "SUBCMD", "SUBOK"]
+    assert transport.diagnostics.first_updates_received == {"1"}
 
 
 def test_stale_detection_uses_last_update():

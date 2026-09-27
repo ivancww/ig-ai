@@ -95,6 +95,7 @@ class StreamDiagnostics:
     create_session_sent: bool = False
     conok_received: bool = False
     session_id_established: bool = False
+    control_sent: bool = False
     subscription_requests_sent: dict[str, str] = field(default_factory=dict)
     subscriptions_accepted: set[str] = field(default_factory=set)
     first_updates_received: set[str] = field(default_factory=set)
@@ -172,6 +173,7 @@ class IGStreamService:
                     self._sync_transport_diagnostics()
                     if update.get("type") in {
                         "PROBE", "SUB", "UNSUB", "LOOP", "PROG", "SYNC", "CONF", "CONS", "REQOK",
+                        "SUBCMD",
                     }:
                         continue
                     item = str(update.get("item") or update.get("epic") or "")
@@ -221,7 +223,7 @@ class IGStreamService:
         current = self.stats.diagnostics
         for name in (
             "websocket_handshake_accepted", "wsok_received", "create_session_sent",
-            "conok_received", "session_id_established", "intentional_shutdown",
+            "conok_received", "session_id_established", "control_sent", "intentional_shutdown",
             "duration_expired", "unexpected_disconnect", "socket_close_code",
             "socket_close_reason",
         ):
@@ -328,6 +330,7 @@ class WebSocketLightstreamerTransport:
             params["LS_session"] = self._session_id
             self.diagnostics.subscription_requests_sent[params["LS_subId"]] = params["LS_group"]
             self._send_request("control", params)
+            self.diagnostics.control_sent = True
             return
         raise ValueError(f"unsupported Lightstreamer command: {command}")
 
@@ -350,18 +353,21 @@ class WebSocketLightstreamerTransport:
             return {"type": "PROBE"}
         tag, args = self._response(line)
         if tag in {"ERROR", "END", "CONERR", "REQERR"}:
+            self._record_server_message(tag)
             self._raise_protocol(tag, args, "stream")
         if tag == "SUBOK":
+            self._record_server_message(tag)
             if args:
                 self.diagnostics.subscriptions_accepted.add(args[0])
             return {"type": "SUB", "subscription_id": args[0] if args else ""}
         if tag == "UNSUBOK":
+            self._record_server_message(tag)
             return {"type": "UNSUB"}
         if tag == "U":
             if len(args) < 3:
                 return {"type": "U"}
             self.diagnostics.first_updates_received.add(args[0])
-        elif tag in {"LOOP", "PROG", "SYNC", "CONF", "CONS", "REQOK"}:
+        elif tag in {"LOOP", "PROG", "SYNC", "CONF", "CONS", "REQOK", "SUBCMD"}:
             self._record_server_message(tag)
             return {"type": tag}
         if tag != "U" or len(args) < 3:
