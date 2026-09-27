@@ -59,3 +59,17 @@ class Instrument:
     instrument_type: str | None = None
     market_status: str | None = None
     metadata: dict | None = None
+
+
+@dataclass(frozen=True)
+class VerifiedInstrument:
+    """Provider-confirmed identity; never represents an official cash index."""
+
+    requested_market: str
+    market_name: str
+    epic: str
+    instrument_type: str | None
+    market_status: str | None
+    expiry: str | None
+    classification: str
+    metadata: dict

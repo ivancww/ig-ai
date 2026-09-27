@@ -16,6 +16,7 @@ streaming = ["websocket-client>=1.8,<2"]
 
 [project.scripts]
 ig-ai = "ig_ai.cli:main"
+igai-report = "ig_ai.reporting:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

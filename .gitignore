@@ -25,3 +25,6 @@ build/
 *.egg-info/
 .coverage
 htmlcov/
+.igai/
+igai-report.txt
+terminal-report.txt

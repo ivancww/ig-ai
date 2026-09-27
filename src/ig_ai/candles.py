@@ -19,6 +19,7 @@ class _Working:
     low: Decimal
     close: Decimal
     last_timestamp: datetime
+    epic: str
 
 
 class CandleAggregator:
@@ -61,7 +62,7 @@ class CandleAggregator:
             closed.append(self._to_candle(observation, current, True))
             current = None
         if current is None:
-            current = _Working(start, end, price, price, price, price, timestamp)
+            current = _Working(start, end, price, price, price, price, timestamp, observation.epic)
             self._working[key] = current
         else:
             current.high = max(current.high, price)
@@ -82,8 +83,10 @@ class CandleAggregator:
             working = self._working.pop(key, None)
             if working:
                 result.append(
-                    Candle(key, "", self.timeframe, working.start, working.end,
-                           working.open, working.high, working.low, working.close, is_closed=True)
+                    Candle(
+                        key, working.epic, self.timeframe, working.start, working.end,
+                        working.open, working.high, working.low, working.close, is_closed=False,
+                    )
                 )
         return result
 
@@ -92,7 +95,7 @@ class CandleAggregator:
     ) -> Candle:
         return Candle(
             observation.instrument_id,
-            observation.epic,
+            working.epic,
             self.timeframe,
             working.start,
             working.end,

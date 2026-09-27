@@ -52,3 +52,12 @@ def test_late_tick_does_not_mutate_current_candle():
     agg.update(observation("2026-01-01T00:12:00", "102"))
     agg.update(observation("2026-01-01T00:11:00", "1"))
     assert agg.forming(observation("2026-01-01T00:12:00", "102")).low == Decimal("100")
+
+
+def test_shutdown_flush_preserves_epic_and_does_not_close_incomplete_candle():
+    agg = CandleAggregator("15M")
+    agg.update(observation("2026-01-01T00:01:00", "100"))
+    flushed = agg.flush()
+    assert len(flushed) == 1
+    assert flushed[0].epic == "EPIC"
+    assert not flushed[0].is_closed

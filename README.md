@@ -34,9 +34,14 @@ The CLI validates credentials without printing them. `IG_ACCOUNT_TYPE` supports 
 ig-ai db-init
 ig-ai rest-check       # read-only authentication check
 ig-ai discover         # searches US Tech 100, Japan 225, Hong Kong HS50
+igai-report            # prints and refreshes the unified Codex/runtime report
+igai-report --run pytest -q
+igai-report --run ruff check .
 ```
 
-Discovery outputs candidate EPICs and metadata returned by IG. No EPIC is hardcoded or treated as verified until checked by the user/runtime. The streaming extra is optional:
+The unified report is also saved as `igai-report.txt` for Cloud Shell Editor copy/paste. Runtime commands update only the Terminal section; Codex updates update only the Codex section. Report state is local and ignored by Git.
+
+Discovery searches provider-name variants, deduplicates results, fetches instrument details for every returned EPIC, and classifies candidates as `CASH/ROLLING CFD`, `FUTURES/FORWARD`, `OTHER`, or `UNKNOWN`. Options, shares, and ambiguous primary candidates are never silently selected; a candidate is verified only when provider details identify one eligible, tradeable rolling/index instrument. IG CFD labels do not represent official Nasdaq-100, Nikkei, or Hang Seng cash indexes. The streaming extra is optional:
 
 ```bash
 uv pip install -e '.[streaming]'
@@ -55,7 +60,7 @@ Tests are unit/mock tests and never need IG credentials. Timestamps are timezone
 
 Never put API keys, passwords, CST, X-SECURITY-TOKEN, session tokens, raw market data, databases, or logs in source, tests, documentation, or commits. Logging includes a sensitive-field redaction filter.
 
-Real IG Demo verification status: **NOT VERIFIED** unless the user runs the read-only commands with secure environment credentials. The `Runtime` boundary installs SIGINT/SIGTERM handlers and delegates reconnect behavior to the streaming service; schedule and timezone remain configurable rather than hardcoded.
+Real IG verification status is recorded only from read-only runtime evidence. The `Runtime` boundary installs SIGINT/SIGTERM handlers and delegates reconnect behavior to the streaming service; schedule and timezone remain configurable rather than hardcoded. A controlled shutdown flush preserves a forming candle as not closed, including its EPIC.
 
 ## Phase 1 limitations and next phase
 

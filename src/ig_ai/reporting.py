@@ -1,0 +1,131 @@
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+PROJECT_DIR = Path(__file__).resolve().parents[2]
+STATE_DIR = PROJECT_DIR / ".igai"
+CODEX_REPORT = STATE_DIR / "codex-report.txt"
+TERMINAL_REPORT = STATE_DIR / "terminal-report.txt"
+UNIFIED_REPORT = PROJECT_DIR / "igai-report.txt"
+
+
+def _safe_text(value: object, secrets: tuple[str, ...] = ()) -> str:
+    text = str(value)
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    lines = []
+    sensitive_names = ("ig_api_key", "ig_username", "ig_password", "cst", "x-security-token", "session", "token", "authorization")
+    for line in text.splitlines():
+        lower = line.lower()
+        if any(name in lower for name in sensitive_names):
+            lines.append("[REDACTED SENSITIVE OUTPUT]")
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _write(path: Path, text: str) -> None:
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text(text.rstrip() + "\n", encoding="utf-8")
+
+
+def update_terminal_report(
+    *,
+    command: str,
+    account_type: str = "UNKNOWN",
+    authentication: str = "NOT VERIFIED",
+    market_discovery: str = "NOT RUN",
+    streaming: str = "NOT RUN",
+    checks: str = "NOT RUN",
+    warnings: str = "NONE",
+    not_verified: str = "None stated",
+    output: str = "",
+    secrets: tuple[str, ...] = (),
+) -> None:
+    account = account_type.upper() if account_type.upper() in {"LIVE", "DEMO"} else "DEMO"
+    body = "\n".join(
+        [
+            "Command executed: " + _safe_text(command, secrets),
+            "Timestamp (UTC): " + datetime.now(UTC).isoformat(),
+            "IG account environment: " + account,
+            "Authentication: " + _safe_text(authentication, secrets),
+            "Market discovery: " + _safe_text(market_discovery, secrets),
+            "Streaming: " + _safe_text(streaming, secrets),
+            "Tests/runtime checks: " + _safe_text(checks, secrets),
+            "Warnings/errors: " + _safe_text(warnings, secrets),
+            "Anything not verified: " + _safe_text(not_verified, secrets),
+        ]
+    )
+    if output.strip():
+        body += "\n\nSafe command output:\n" + _safe_text(output, secrets)
+    _write(TERMINAL_REPORT, body)
+
+
+def update_codex_report(text: str) -> None:
+    _write(CODEX_REPORT, _safe_text(text))
+
+
+def render_report() -> str:
+    secrets = tuple(
+        os.environ.get(name, "") for name in ("IG_API_KEY", "IG_USERNAME", "IG_PASSWORD", "CST", "X-SECURITY-TOKEN")
+    )
+    codex = (
+        _safe_text(CODEX_REPORT.read_text(encoding="utf-8"), secrets).strip()
+        if CODEX_REPORT.exists()
+        else "Not available."
+    )
+    terminal = (
+        _safe_text(TERMINAL_REPORT.read_text(encoding="utf-8"), secrets).strip()
+        if TERMINAL_REPORT.exists()
+        else "Not available."
+    )
+    report = (
+        "=== CODEX / DEVELOPMENT REPORT ===\n\n"
+        + codex
+        + "\n\n=== TERMINAL / RUNTIME REPORT ===\n\n"
+        + terminal
+        + "\n"
+    )
+    UNIFIED_REPORT.write_text(report, encoding="utf-8")
+    return report
+
+
+def _run_and_record(command: list[str]) -> int:
+    completed = subprocess.run(command, cwd=PROJECT_DIR, text=True, capture_output=True, check=False)
+    output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
+    update_terminal_report(
+        command=" ".join(command),
+        account_type=os.environ.get("IG_ACCOUNT_TYPE", "DEMO"),
+        authentication="NOT RUN",
+        checks=f"exit code {completed.returncode}",
+        warnings="Command failed" if completed.returncode else "NONE",
+        not_verified="IG authentication and market discovery were not run by this command",
+        output=output,
+        secrets=tuple(os.environ.get(name, "") for name in ("IG_API_KEY", "IG_USERNAME", "IG_PASSWORD")),
+    )
+    sys.stdout.write(render_report())
+    return completed.returncode
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="igai-report")
+    parser.add_argument("--run", nargs=argparse.REMAINDER, help="run a safe check and record its output")
+    args = parser.parse_args(argv)
+    if args.run:
+        if args.run[0] in {"", "--"}:
+            args.run.pop(0)
+        if not args.run:
+            parser.error("--run requires a command")
+        return _run_and_record(args.run)
+    sys.stdout.write(render_report())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
