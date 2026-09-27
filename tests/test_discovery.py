@@ -64,6 +64,47 @@ def test_multiple_plausible_candidates_are_ambiguous_and_hong_kong_variants_are_
     assert {"Hong Kong HS50", "Hong Kong 50", "Hong Kong", "HS50", "Hang Seng"}.issubset(client.terms)
 
 
+def test_hong_kong_cash_variants_are_verified_without_selecting_an_epic():
+    results = {
+        "Hong Kong 50": [
+            {"epic": "HK1", "name": "Hong Kong 50 $1", "instrumentType": "INDICES"},
+            {"epic": "HK10", "name": "Hong Kong 50 HK$10", "instrumentType": "INDICES"},
+        ]
+    }
+    details = {
+        "HK1": {"instrument": {"name": "Hong Kong 50 $1", "instrumentType": "INDICES", "expiry": "DFB", "marketStatus": "TRADEABLE", "currency": "USD", "contractSize": 1}},
+        "HK10": {"instrument": {"name": "Hong Kong 50 HK$10", "instrumentType": "INDICES", "expiry": "DFB", "marketStatus": "TRADEABLE", "currency": "HKD", "contractSize": 10}},
+    }
+    client = FakeClient(results, details)
+    group = discover_market_groups(client)[2]
+
+    assert group.status == "VERIFIED_VARIANTS"
+    assert {candidate.epic for candidate in group.verified_variants} == {"HK1", "HK10"}
+    assert {candidate.metadata["contractSize"] for candidate in group.verified_variants} == {1, 10}
+    assert {candidate.metadata["currency"] for candidate in group.verified_variants} == {"USD", "HKD"}
+
+
+def test_hong_kong_hstech_weekend_and_futures_are_not_hs50_primary_candidates():
+    results = {
+        "Hong Kong 50": [
+            {"epic": "TECH", "name": "Hong Kong HSTECH", "instrumentType": "INDICES"},
+            {"epic": "WEEKEND", "name": "Hong Kong 50 Weekend", "instrumentType": "INDICES"},
+            {"epic": "FUTURE", "name": "Hong Kong 50", "instrumentType": "INDICES"},
+            {"epic": "CASH", "name": "Hong Kong 50", "instrumentType": "INDICES"},
+        ]
+    }
+    details = {
+        "TECH": {"instrument": {"name": "Hong Kong HSTECH", "instrumentType": "INDICES", "expiry": "DFB", "marketStatus": "TRADEABLE"}},
+        "WEEKEND": {"instrument": {"name": "Hong Kong 50 Weekend", "instrumentType": "INDICES", "expiry": "DFB", "marketStatus": "TRADEABLE"}},
+        "FUTURE": {"instrument": {"name": "Hong Kong 50", "instrumentType": "INDICES", "expiry": "DEC-26", "marketStatus": "TRADEABLE"}},
+        "CASH": {"instrument": {"name": "Hong Kong 50", "instrumentType": "INDICES", "expiry": "DFB", "marketStatus": "TRADEABLE"}},
+    }
+    client = FakeClient(results, details)
+    group = discover_market_groups(client)[2]
+
+    assert [candidate.epic for candidate in group.candidates if candidate.eligible_primary] == ["CASH"]
+
+
 def test_no_detail_means_candidate_is_not_verified():
     client = FakeClient({"US Tech 100": [{"epic": "EPIC"}]}, {"EPIC": {}})
     group = discover_market_groups(client)[0]

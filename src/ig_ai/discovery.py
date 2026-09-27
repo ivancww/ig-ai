@@ -38,6 +38,11 @@ class MarketDiscovery:
     status: str
     candidates: tuple[DiscoveryCandidate, ...]
 
+    @property
+    def verified_variants(self) -> tuple[DiscoveryCandidate, ...]:
+        """All provider-verified primary variants, without choosing an EPIC."""
+        return tuple(candidate for candidate in self.candidates if candidate.verified)
+
 
 def _value(data: dict[str, Any], *keys: str) -> Any:
     for key in keys:
@@ -64,14 +69,44 @@ def classify_instrument(data: dict[str, Any]) -> str:
     return "OTHER" if instrument_type else "UNKNOWN"
 
 
-def _eligible(data: dict[str, Any], classification: str) -> bool:
+def _eligible(data: dict[str, Any], classification: str, requested_market: str | None = None) -> bool:
     instrument_type = str(_value(data, "instrumentType", "type") or "").upper()
     name = str(_value(data, "name", "marketName") or "").upper()
+    if _is_excluded_name(name) or (
+        name and requested_market and not _matches_requested_identity(requested_market, name)
+    ):
+        return False
     return (
         instrument_type in {"INDICES", "INDEX"}
         and classification == "CASH/ROLLING CFD"
-        and not any(term in name for term in ("OPTION", "ETF", "SHARE"))
+        and not any(term in name for term in ("OPTION", "ETF", "SHARE", "LEVERAGED"))
     )
+
+
+def _is_excluded_name(name: str) -> bool:
+    return any(
+        term in name
+        for term in (
+            "WEEKEND",
+            "SATURDAY",
+            "SUNDAY",
+            "OPTION",
+            "ETF",
+            "SHARE",
+            "LEVERAGED",
+            " 2X",
+            " 3X",
+        )
+    ) or name.startswith(("2X", "3X"))
+
+
+def _matches_requested_identity(requested_market: str, name: str) -> bool:
+    if requested_market != "Hong Kong HS50":
+        return True
+    # HSTECH is a separate confirmation market and must never satisfy HS50.
+    if any(term in name for term in ("HSTECH", "HS TECH", "HANG SENG TECH", "TECHNOLOGY")):
+        return False
+    return any(term in name for term in ("HS50", "HS 50", "HONG KONG 50", "HANG SENG 50", "HANG SENG"))
 
 
 def _search_score(requested_market: str, data: dict[str, Any]) -> int | None:
@@ -82,10 +117,7 @@ def _search_score(requested_market: str, data: dict[str, Any]) -> int | None:
         return None
     if instrument_type and instrument_type not in INDEX_TYPES:
         return None
-    if (
-        any(term in name for term in ("OPTION", "ETF", "SHARE", "LEVERAGED", " 2X", " 3X"))
-        or name.startswith(("2X", "3X"))
-    ):
+    if name and (_is_excluded_name(name) or not _matches_requested_identity(requested_market, name)):
         return None
 
     aliases = (requested_market, *SEARCH_TERMS.get(requested_market, ()))
@@ -117,13 +149,16 @@ def _candidate(
     epic = str(_value(merged, "epic") or "").strip()
     classification = classify_instrument(merged)
     status = _value(merged, "marketStatus")
-    eligible = _eligible(merged, classification)
+    eligible = _eligible(merged, classification, requested_market)
     verified = bool(epic and details and eligible and str(status or "").upper() == "TRADEABLE")
     safe_metadata = {
         key: merged[key]
         for key in (
             "name", "instrumentType", "marketStatus", "expiry", "lotSize", "contractSize",
             "streamingPricesAvailable", "type", "instrumentName", "marketId",
+            "currency", "currencyCode", "denomination", "contractSize", "lotSize",
+            "valuePerPoint", "pointValue", "unit", "unitOfMeasure", "instrumentUnit",
+            "dealingSize", "minDealSize", "maxDealSize",
         )
         if key in merged and merged[key] not in (None, "")
     }
@@ -194,6 +229,13 @@ def _discover_group(
     verified = tuple(candidate for candidate in primary if candidate.verified)
     if rate_limited:
         status = "RATE_LIMITED"
+    elif (
+        requested_market == "Hong Kong HS50"
+        and len(verified) > 1
+        and len(ranked) == detail_calls
+        and _has_distinct_variant_metadata(verified)
+    ):
+        status = "VERIFIED_VARIANTS"
     elif len(verified) == 1 and len(ranked) == detail_calls:
         status = "VERIFIED"
     elif primary or (shortlisted and detail_calls >= detail_budget):
@@ -201,6 +243,24 @@ def _discover_group(
     else:
         status = "NOT FOUND"
     return MarketDiscovery(requested_market, status, candidates)
+
+
+def _has_distinct_variant_metadata(candidates: tuple[DiscoveryCandidate, ...]) -> bool:
+    """Require provider denomination/size evidence before naming variants."""
+    variant_fields = (
+        "denomination", "currency", "currencyCode", "contractSize", "lotSize",
+        "valuePerPoint", "pointValue", "unit", "unitOfMeasure", "instrumentUnit",
+        "dealingSize",
+    )
+    signatures = {
+        tuple(candidate.metadata.get(field) for field in variant_fields)
+        for candidate in candidates
+    }
+    name_signals = sum(
+        any(token in candidate.market_name.upper() for token in ("$", "HK$", "£", "€"))
+        for candidate in candidates
+    )
+    return len(signatures) > 1 and (any(any(value is not None for value in signature) for signature in signatures) or name_signals > 1)
 
 
 def _configured_detail_budget(client: IGRestClient, override: int | None) -> int:

@@ -59,7 +59,8 @@ def main() -> int:
                         f"  {candidate.market_name}\t{candidate.epic}\t"
                         f"{candidate.market_status or ''}\t{candidate.instrument_type or ''}\t"
                         f"{candidate.expiry or ''}\t{candidate.classification}\t"
-                        f"eligible_primary={candidate.eligible_primary}\tverified={candidate.verified}"
+                        f"eligible_primary={candidate.eligible_primary}\tverified={candidate.verified}\t"
+                        f"metadata={candidate.metadata}"
                     )
                     safe_results.append(line)
                     print(line)
