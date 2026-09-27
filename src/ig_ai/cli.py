@@ -7,6 +7,7 @@ import os
 from .config import Settings
 from .database import Database
 from .discovery import discover_market_groups
+from .exceptions import IGHTTPError
 from .reporting import update_terminal_report
 from .rest import IGRestClient
 from .security import SecretRedactionFilter
@@ -75,6 +76,7 @@ def main() -> int:
                 secrets=(client.settings.api_key, client.settings.username, client.settings.password),
             )
     except Exception as exc:
+        safe_output = exc.safe_diagnostic() if isinstance(exc, IGHTTPError) else type(exc).__name__
         update_terminal_report(
             command=f"ig-ai {args.command}",
             account_type=os.environ.get("IG_ACCOUNT_TYPE", "DEMO"),
@@ -83,7 +85,12 @@ def main() -> int:
             checks="command failed",
             warnings="Runtime error",
             not_verified="Successful completion was not verified",
-            output=type(exc).__name__,
+            output=safe_output,
+            secrets=(
+                os.environ.get("IG_API_KEY", ""),
+                os.environ.get("IG_USERNAME", ""),
+                os.environ.get("IG_PASSWORD", ""),
+            ),
         )
         raise
     return 0

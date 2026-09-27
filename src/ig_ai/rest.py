@@ -69,6 +69,7 @@ class IGRestClient:
         params: dict | None = None,
         version: str = "1",
         retry: bool = True,
+        phase: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, str]]:
         read_only_get = method == "GET" and any(
             path == prefix or path.startswith(prefix)
@@ -103,25 +104,72 @@ class IGRestClient:
                         raise MalformedResponseError("IG response was not a JSON object")
                     return decoded, dict(response.headers)
             except HTTPError as exc:
+                provider_code = self._safe_provider_code(exc)
+                diagnostic = {
+                    "provider_code": provider_code,
+                    "endpoint": path,
+                    "method": method,
+                    "phase": phase or self._phase_for(path),
+                }
                 if exc.code == 401:
                     self.session = None
-                    raise AuthenticationError(exc.code, "authentication rejected") from exc
+                    raise AuthenticationError(
+                        exc.code, "authentication rejected", **diagnostic
+                    ) from exc
                 if exc.code == 429:
                     if attempt + 1 < attempts:
                         time.sleep(min(2**attempt, 4))
                         continue
-                    raise RateLimitError(exc.code, "rate limit exceeded", retryable=True) from exc
+                    raise RateLimitError(
+                        exc.code, "rate limit exceeded", retryable=True, **diagnostic
+                    ) from exc
                 retryable = exc.code == 429 or exc.code >= 500
                 if retryable and attempt + 1 < attempts:
                     time.sleep(min(2**attempt, 4))
                     continue
-                raise IGHTTPError(exc.code, "request failed", retryable=retryable) from exc
+                raise IGHTTPError(
+                    exc.code, "request failed", retryable=retryable, **diagnostic
+                ) from exc
             except (URLError, TimeoutError) as exc:
                 if attempt + 1 < attempts:
                     time.sleep(min(2**attempt, 4))
                     continue
-                raise IGHTTPError(0, "network request failed", retryable=True) from exc
-        raise IGHTTPError(0, "request failed")
+                raise IGHTTPError(
+                    0,
+                    "network request failed",
+                    retryable=True,
+                    endpoint=path,
+                    method=method,
+                    phase=phase or self._phase_for(path),
+                ) from exc
+        raise IGHTTPError(
+            0,
+            "request failed",
+            endpoint=path,
+            method=method,
+            phase=phase or self._phase_for(path),
+        )
+
+    @staticmethod
+    def _phase_for(path: str) -> str:
+        if path == "/session":
+            return "authentication"
+        if path == "/markets":
+            return "search"
+        return "instrument_details"
+
+    @staticmethod
+    def _safe_provider_code(error: HTTPError) -> str | None:
+        """Parse only the explicitly approved provider error-code field."""
+        try:
+            raw = error.read()
+            decoded = json.loads(raw) if raw else {}
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(decoded, dict):
+            return None
+        provider_code = decoded.get("errorCode")
+        return provider_code if isinstance(provider_code, str) and provider_code else None
 
     def ensure_session(self) -> IGSession:
         if self.session is None:
@@ -136,7 +184,9 @@ class IGRestClient:
 
     def search_markets(self, search_term: str) -> list[dict[str, Any]]:
         self.ensure_session()
-        data, _ = self._request("GET", "/markets", params={"searchTerm": search_term}, version="1")
+        data, _ = self._request(
+            "GET", "/markets", params={"searchTerm": search_term}, version="1", phase="search"
+        )
         markets = data.get("markets", [])
         if not isinstance(markets, list):
             raise MalformedResponseError("IG market search returned invalid markets")
@@ -144,7 +194,9 @@ class IGRestClient:
 
     def market_details(self, epic: str) -> dict[str, Any]:
         self.ensure_session()
-        data, _ = self._request("GET", f"/markets/{epic}", version="3")
+        data, _ = self._request(
+            "GET", f"/markets/{epic}", version="3", phase="instrument_details"
+        )
         return data
 
     def prices(self, epic: str, resolution: str = "MINUTE", **params: str) -> list[dict[str, Any]]:
