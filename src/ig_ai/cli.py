@@ -6,11 +6,19 @@ import os
 
 from .config import Settings
 from .database import Database
-from .discovery import discover_market_groups
+from .discovery import discover_market_groups, select_stream_instruments
 from .exceptions import IGHTTPError
+from .models import Instrument
 from .reporting import update_terminal_report
 from .rest import IGRestClient
+from .runtime import PersistedStream
 from .security import SecretRedactionFilter
+from .streaming import (
+    IGStreamService,
+    Subscription,
+    WebSocketLightstreamerTransport,
+    lightstreamer_password,
+)
 
 
 def main() -> int:
@@ -19,6 +27,10 @@ def main() -> int:
     commands.add_parser("db-init")
     commands.add_parser("discover")
     commands.add_parser("rest-check")
+    stream_parser = commands.add_parser("stream")
+    stream_parser.add_argument("--duration", type=float, default=300.0)
+    stream_parser.add_argument("--markets", default="US Tech 100,Japan 225,Hong Kong HS50")
+    stream_parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     handler = logging.StreamHandler()
     handler.addFilter(SecretRedactionFilter())
@@ -90,6 +102,69 @@ def main() -> int:
                 output="\n".join(safe_results),
                 secrets=(client.settings.api_key, client.settings.username, client.settings.password),
             )
+        elif args.command == "stream":
+            if args.duration <= 0:
+                raise ValueError("--duration must be positive")
+            groups = discover_market_groups(client)
+            requested = {name.strip() for name in args.markets.split(",") if name.strip()}
+            selected = [candidate for candidate in select_stream_instruments(groups) if candidate.requested_market in requested]
+            missing = sorted(requested - {candidate.requested_market for candidate in selected})
+            if missing:
+                raise RuntimeError("No provider-verified weekday cash instrument for: " + ", ".join(missing))
+            session = client.ensure_session()
+            endpoint = session.lightstreamer_endpoint
+            if not endpoint:
+                raise RuntimeError("IG authentication did not provide a Lightstreamer endpoint")
+            if endpoint.startswith("https://"):
+                endpoint = "wss://" + endpoint.removeprefix("https://")
+            elif endpoint.startswith("http://"):
+                endpoint = "ws://" + endpoint.removeprefix("http://")
+            database = Database(client.settings.database_path)
+            instruments = {}
+            for candidate in selected:
+                instrument_id = candidate.epic
+                instrument = Instrument(
+                    instrument_id, candidate.epic, candidate.market_name,
+                    candidate.instrument_type, candidate.market_status, candidate.metadata,
+                )
+                instruments[instrument_id] = instrument
+                database.save_instrument_model(instrument)
+            stream = IGStreamService(
+                endpoint,
+                client.settings.username,
+                lightstreamer_password(session.cst, session.security_token),
+                WebSocketLightstreamerTransport(),
+                reconnect_seconds=client.settings.stream_reconnect_seconds,
+            )
+            for instrument in instruments.values():
+                stream.add_subscription(Subscription(instrument.instrument_id, f"MARKET:{instrument.epic}"))
+            sink = PersistedStream(database, instruments, client.settings.market_timezone)
+            try:
+                sink.run_for(stream, args.duration)
+            finally:
+                database.close()
+            update_terminal_report(
+                command=f"ig-ai stream --duration {args.duration:g}",
+                account_type=client.settings.account_type,
+                authentication="PASS",
+                market_discovery="PASS — provider-verified weekday cash instruments selected",
+                streaming=(
+                    f"{stream.stats.connection_state} / SUBSCRIBED; "
+                    + "; ".join(
+                        f"{instrument.market_name}: updates={stream.stats.updates_received.get(instrument.instrument_id, 0)}, "
+                        f"last_update={sink.last_update.get(instrument.instrument_id, 'NO LIVE TICKS YET')}"
+                        for instrument in instruments.values()
+                    )
+                    + f"; observations={sink.observations_written}; 15M candles={sink.candles_written['15M']}; "
+                    + f"1H candles={sink.candles_written['1H']}; reconnects={stream.stats.reconnect_count}"
+                ),
+                checks="read-only Lightstreamer runtime completed",
+                warnings="; ".join(stream.stats.warnings) if stream.stats.warnings else "NONE",
+                not_verified="A market with zero ticks has connection/subscription evidence but no real price-update evidence",
+                output="; ".join(f"{candidate.market_name}\t{candidate.epic}" for candidate in selected),
+                secrets=(client.settings.api_key, client.settings.username, client.settings.password, session.cst, session.security_token),
+            )
+            print("Streaming runtime completed (read-only)")
     except Exception as exc:
         safe_output = exc.safe_diagnostic() if isinstance(exc, IGHTTPError) else type(exc).__name__
         update_terminal_report(

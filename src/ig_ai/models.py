@@ -45,6 +45,7 @@ class Candle:
     close: Decimal
     volume: Decimal | None = None
     is_closed: bool = False
+    observation_count: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "start", as_utc(self.start))

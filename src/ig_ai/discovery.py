@@ -386,3 +386,29 @@ def to_verified_instrument(candidate: DiscoveryCandidate) -> VerifiedInstrument:
         candidate.classification,
         candidate.metadata,
     )
+
+
+def select_stream_instruments(groups: list[MarketDiscovery]) -> list[DiscoveryCandidate]:
+    """Choose one verified weekday cash instrument per requested market.
+
+    Selection is based on provider metadata. In particular, HS50's $1 contract
+    wins over the legitimate HK$10 variant when metadata exposes that choice.
+    No EPIC is embedded in this policy.
+    """
+    selected: list[DiscoveryCandidate] = []
+    for group in groups:
+        candidates = list(group.verified_variants)
+        if not candidates:
+            continue
+        if group.requested_market == "Hong Kong HS50":
+            def hk_rank(candidate: DiscoveryCandidate) -> tuple[int, int, str]:
+                metadata = {str(k).lower(): str(v).lower() for k, v in candidate.metadata.items()}
+                name = candidate.market_name.lower()
+                size_one = metadata.get("contractsize") in {"1", "1.0"} or metadata.get("lotsize") in {"1", "1.0"}
+                dollar_one = "$1" in name and "hk$10" not in name
+                return (0 if size_one or dollar_one else 1, 0 if metadata.get("currency") in {"usd", "us dollar"} else 1, candidate.epic)
+            candidates.sort(key=hk_rank)
+        else:
+            candidates.sort(key=lambda candidate: candidate.epic)
+        selected.append(candidates[0])
+    return selected

@@ -1,4 +1,4 @@
-from ig_ai.discovery import classify_instrument, discover_market_groups
+from ig_ai.discovery import classify_instrument, discover_market_groups, select_stream_instruments
 from ig_ai.exceptions import IGHTTPError
 
 
@@ -245,3 +245,18 @@ def test_plain_hang_seng_does_not_substitute_for_hs50():
     details = {"OTHER": {"instrument": {"instrumentName": "Hang Seng China Enterprises", "instrumentType": "INDICES", "expiry": "-", "marketStatus": "TRADEABLE"}}}
     group = discover_market_groups(FakeClient(results, details))[2]
     assert group.status == "NOT FOUND"
+
+
+def test_stream_selection_prefers_hs50_dollar_one_variant():
+    results = {
+        "Hong Kong 50": [
+            {"epic": "HK10", "name": "香港HS50 現貨 (HK$10)", "instrumentType": "INDICES"},
+            {"epic": "HK1", "name": "香港HS50 現貨 ($1)", "instrumentType": "INDICES"},
+        ]
+    }
+    details = {
+        "HK10": {"instrument": {"name": "香港HS50 現貨 (HK$10)", "instrumentType": "INDICES", "expiry": "DFB", "contractSize": 10, "currency": "HKD"}},
+        "HK1": {"instrument": {"name": "香港HS50 現貨 ($1)", "instrumentType": "INDICES", "expiry": "DFB", "contractSize": 1, "currency": "USD"}},
+    }
+    group = discover_market_groups(FakeClient(results, details))[2]
+    assert select_stream_instruments([group])[0].epic == "HK1"

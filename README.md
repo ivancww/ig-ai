@@ -23,7 +23,7 @@ Copy `.env.example` to `.env` or export equivalent variables. Do not commit `.en
 export IG_API_KEY='...'
 export IG_USERNAME='...'
 export IG_PASSWORD='...'
-export IG_ACCOUNT_TYPE='DEMO'
+export IG_ACCOUNT_TYPE='LIVE'
 ```
 
 The CLI validates credentials without printing them. `IG_ACCOUNT_TYPE` supports `DEMO` and `LIVE`; this application remains read-only in either mode. Optional settings include `IG_DATABASE_PATH`, `IG_REQUEST_TIMEOUT_SECONDS`, `IG_DISCOVERY_DETAIL_BUDGET`, `IG_STREAM_RECONNECT_SECONDS`, and `IG_MARKET_TIMEZONE`.
@@ -34,6 +34,7 @@ The CLI validates credentials without printing them. `IG_ACCOUNT_TYPE` supports 
 ig-ai db-init
 ig-ai rest-check       # read-only authentication check
 ig-ai discover         # searches US Tech 100, Japan 225, Hong Kong HS50
+ig-ai stream --duration 300  # authenticated read-only Lightstreamer validation
 igai-report            # prints and refreshes the unified Codex/runtime report
 igai-report --run pytest -q
 igai-report --run ruff check .
@@ -47,7 +48,7 @@ Discovery searches provider-name variants, cheaply filters and ranks search meta
 uv pip install -e '.[streaming]'
 ```
 
-The transport boundary is covered with fakes. A real Lightstreamer session requires secure Demo credentials and runtime configuration; no live verification is implied by the test suite.
+The transport boundary is covered with fakes. A real Lightstreamer session uses the selected LIVE or DEMO environment and runtime configuration; no live verification is implied by the test suite. `stream` authenticates through REST, resolves instruments through discovery, prefers the provider-confirmed $1 HS50 weekday cash variant when available, and never selects weekend HS50 or futures.
 
 ## Tests and security
 
@@ -60,8 +61,8 @@ Tests are unit/mock tests and never need IG credentials. Timestamps are timezone
 
 Never put API keys, passwords, CST, X-SECURITY-TOKEN, session tokens, raw market data, databases, or logs in source, tests, documentation, or commits. Logging includes a sensitive-field redaction filter.
 
-Real IG verification status is recorded only from read-only runtime evidence. The `Runtime` boundary installs SIGINT/SIGTERM handlers and delegates reconnect behavior to the streaming service; schedule and timezone remain configurable rather than hardcoded. A controlled shutdown flush preserves a forming candle as not closed, including its EPIC.
+Real IG verification status is recorded only from read-only runtime evidence. The `Runtime` boundary installs SIGINT/SIGTERM handlers and delegates reconnect behavior to the streaming service; schedule and timezone remain configurable rather than hardcoded. A controlled shutdown flush preserves a forming candle as not closed, including its EPIC. `igai-report` records connection/subscription evidence separately from real price-update evidence and redacts session credentials.
 
 ## Phase 1 limitations and next phase
 
-This phase does not implement technical indicators, direction scores, probabilities, alerts, news/macro regimes, backtesting, model calibration, automatic trading, or a production daemon supervisor. Real Lightstreamer field decoding and real IG connectivity still require Demo verification. The recommended Phase 2 is to verify Demo discovery/streaming, persist configured instruments, harden provider-specific streaming parsing, and add feature computation over only closed candles before introducing signal/outcome records.
+This phase does not implement technical indicators, direction scores, probabilities, alerts, news/macro regimes, backtesting, model calibration, automatic trading, or a production daemon supervisor. The automated suite does not claim LIVE streaming PASS: that status requires running `ig-ai stream --duration 300` against the real read-only LIVE account and reviewing the Terminal / Runtime Report. All current operations remain read-only.

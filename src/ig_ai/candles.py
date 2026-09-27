@@ -20,6 +20,7 @@ class _Working:
     close: Decimal
     last_timestamp: datetime
     epic: str
+    observation_count: int
 
 
 class CandleAggregator:
@@ -62,13 +63,14 @@ class CandleAggregator:
             closed.append(self._to_candle(observation, current, True))
             current = None
         if current is None:
-            current = _Working(start, end, price, price, price, price, timestamp, observation.epic)
+            current = _Working(start, end, price, price, price, price, timestamp, observation.epic, 1)
             self._working[key] = current
         else:
             current.high = max(current.high, price)
             current.low = min(current.low, price)
             current.close = price
             current.last_timestamp = timestamp
+            current.observation_count += 1
         return closed
 
     def forming(self, observation: MarketObservation) -> Candle | None:
@@ -85,7 +87,8 @@ class CandleAggregator:
                 result.append(
                     Candle(
                         key, working.epic, self.timeframe, working.start, working.end,
-                        working.open, working.high, working.low, working.close, is_closed=False,
+                        working.open, working.high, working.low, working.close,
+                        is_closed=False, observation_count=working.observation_count,
                     )
                 )
         return result
@@ -104,4 +107,5 @@ class CandleAggregator:
             working.low,
             working.close,
             is_closed=is_closed,
+            observation_count=working.observation_count,
         )

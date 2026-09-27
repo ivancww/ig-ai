@@ -29,4 +29,6 @@ def test_database_persists_observation(tmp_path):
     )
     db.save_observation(observation)
     assert db.connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
+    db.save_observation(observation)
+    assert db.connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
     db.close()

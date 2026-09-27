@@ -25,6 +25,7 @@ def test_15m_forming_and_closed():
     closed = agg.update(observation("2026-01-01T00:15:00", "103"))
     assert len(closed) == 1 and closed[0].is_closed
     assert closed[0].open == Decimal("100") and closed[0].close == Decimal("105")
+    assert closed[0].observation_count == 2
 
 
 def test_1h_4h_and_daily_boundaries():
