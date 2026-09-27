@@ -26,7 +26,7 @@ export IG_PASSWORD='...'
 export IG_ACCOUNT_TYPE='DEMO'
 ```
 
-The CLI validates credentials without printing them. `IG_ACCOUNT_TYPE` supports `DEMO` and `LIVE`; this application remains read-only in either mode. Optional settings include `IG_DATABASE_PATH`, `IG_REQUEST_TIMEOUT_SECONDS`, `IG_STREAM_RECONNECT_SECONDS`, and `IG_MARKET_TIMEZONE`.
+The CLI validates credentials without printing them. `IG_ACCOUNT_TYPE` supports `DEMO` and `LIVE`; this application remains read-only in either mode. Optional settings include `IG_DATABASE_PATH`, `IG_REQUEST_TIMEOUT_SECONDS`, `IG_DISCOVERY_DETAIL_BUDGET`, `IG_STREAM_RECONNECT_SECONDS`, and `IG_MARKET_TIMEZONE`.
 
 ## Commands
 
@@ -41,7 +41,7 @@ igai-report --run ruff check .
 
 The unified report is also saved as `igai-report.txt` for Cloud Shell Editor copy/paste. Runtime commands update only the Terminal section; Codex updates update only the Codex section. Report state is local and ignored by Git.
 
-Discovery searches provider-name variants, deduplicates results, fetches instrument details for every returned EPIC, and classifies candidates as `CASH/ROLLING CFD`, `FUTURES/FORWARD`, `OTHER`, or `UNKNOWN`. Options, shares, and ambiguous primary candidates are never silently selected; a candidate is verified only when provider details identify one eligible, tradeable rolling/index instrument. IG CFD labels do not represent official Nasdaq-100, Nikkei, or Hang Seng cash indexes. The streaming extra is optional:
+Discovery searches provider-name variants, cheaply filters and ranks search metadata, then fetches details only for a small configurable shortlist (`IG_DISCOVERY_DETAIL_BUDGET`, default 3) and classifies candidates as `CASH/ROLLING CFD`, `FUTURES/FORWARD`, `OTHER`, or `UNKNOWN`. Options, shares, rate-limited, and ambiguous primary candidates are never silently selected; a candidate is verified only when provider details identify one eligible, tradeable rolling/index instrument. IG CFD labels do not represent official Nasdaq-100, Nikkei, or Hang Seng cash indexes. The streaming extra is optional:
 
 ```bash
 uv pip install -e '.[streaming]'

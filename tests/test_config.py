@@ -15,3 +15,25 @@ def test_demo_is_default():
         {"IG_API_KEY": "key", "IG_USERNAME": "user", "IG_PASSWORD": "pass"}
     )
     assert settings.account_type == "DEMO"
+
+
+def test_discovery_detail_budget_is_configurable_and_positive():
+    settings = Settings.from_env(
+        {
+            "IG_API_KEY": "key",
+            "IG_USERNAME": "user",
+            "IG_PASSWORD": "pass",
+            "IG_DISCOVERY_DETAIL_BUDGET": "5",
+        }
+    )
+    assert settings.discovery_detail_budget == 5
+
+    with pytest.raises(ConfigurationError, match="discovery detail budget"):
+        Settings.from_env(
+            {
+                "IG_API_KEY": "key",
+                "IG_USERNAME": "user",
+                "IG_PASSWORD": "pass",
+                "IG_DISCOVERY_DETAIL_BUDGET": "0",
+            }
+        )
