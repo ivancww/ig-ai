@@ -120,13 +120,85 @@ def test_websocket_session_flow_uses_protocol_and_subscribes_after_conok():
     assert "LS_user=ACCOUNT" in socket.sent[1]
     assert "LS_password=CST-cst%7CXST-token" in socket.sent[1]
     assert "LS_adapter_set" not in socket.sent[1]
+    # TLCP does not require LS_reqId on ordinary create_session requests;
+    # standalone control requests do require it.
+    assert "LS_reqId" not in socket.sent[1]
 
     transport.send("subscribe", {"LS_subId": "1", "item": "PRICE:ACCOUNT:EPIC", "fields": "BIDPRICE1,ASKPRICE1,TIMESTAMP,DLG_FLAG", "adapter": "Pricing"})
     assert socket.sent[2].startswith("control\r\n")
+    assert "LS_reqId=1" in socket.sent[2]
     assert "LS_data_adapter=Pricing" in socket.sent[2]
     assert "LS_session=session-id" in socket.sent[2]
     assert transport.receive() == {"type": "SUB", "subscription_id": "1"}
     assert transport.receive()["BIDPRICE1"] == "100"
+
+
+def test_control_request_ids_are_sequential_and_reset_for_new_session():
+    first_socket = FakeSocket(["WSOK", "CONOK,first-session,50000,5000,*"])
+    transport = object.__new__(WebSocketLightstreamerTransport)
+    transport._websocket = FakeWebSocket(first_socket)
+    transport._socket = None
+    transport._field_names = []
+    transport._endpoint = ""
+    transport._session_id = None
+    transport._next_request_id = 999
+
+    transport.connect("https://stream.example/", "ACCOUNT", "password")
+    for subscription_id in ("1", "2"):
+        transport.send(
+            "subscribe",
+            {
+                "LS_subId": subscription_id,
+                "item": f"PRICE:ACCOUNT:EPIC{subscription_id}",
+                "fields": "BIDPRICE1,ASKPRICE1,TIMESTAMP,DLG_FLAG",
+            },
+        )
+    assert "LS_reqId=1" in first_socket.sent[2]
+    assert "LS_reqId=2" in first_socket.sent[3]
+    assert len({first_socket.sent[2], first_socket.sent[3]}) == 2
+
+    second_socket = FakeSocket(["WSOK", "CONOK,second-session,50000,5000,*"])
+    transport._websocket = FakeWebSocket(second_socket)
+    transport.close()
+    transport.connect("https://stream.example/", "ACCOUNT", "password")
+    transport.send(
+        "subscribe",
+        {
+            "LS_subId": "1",
+            "item": "PRICE:ACCOUNT:EPIC1",
+            "fields": "BIDPRICE1,ASKPRICE1,TIMESTAMP,DLG_FLAG",
+        },
+    )
+    assert "LS_reqId=1" in second_socket.sent[2]
+    assert "LS_session=second-session" in second_socket.sent[2]
+
+
+def test_subscription_requires_conok_session_establishment():
+    socket = FakeSocket(["WSOK", "PROBE"])
+    transport = object.__new__(WebSocketLightstreamerTransport)
+    transport._websocket = FakeWebSocket(socket)
+    transport._socket = None
+    transport._field_names = []
+    transport._endpoint = ""
+    transport._session_id = None
+    transport._next_request_id = 1
+
+    with pytest.raises(LightstreamerError):
+        transport.connect("https://stream.example/", "ACCOUNT", "password")
+    with pytest.raises(ConnectionError, match="session is not established"):
+        transport.send(
+            "subscribe",
+            {"LS_subId": "1", "item": "PRICE:ACCOUNT:EPIC", "fields": "BIDPRICE1"},
+        )
+
+
+def test_service_passes_subscription_data_adapter():
+    transport = FakeTransport()
+    service = IGStreamService("endpoint", "user", "secret", transport, reconnect_seconds=0)
+    service.add_subscription(Subscription("id", "PRICE:ACCOUNT:EPIC", data_adapter="Pricing"))
+
+    service.run(lambda _: service.stop())
+    assert transport.subscriptions[0][1]["adapter"] == "Pricing"
 
 
 def test_handshake_status_is_safe_and_structurally_invalid_not_retried():

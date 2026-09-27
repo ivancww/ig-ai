@@ -122,7 +122,15 @@ class IGStreamService:
                 self.stats.connection_state = "CONNECTING"
                 self.transport.connect(self.endpoint, self.username, self.password)
                 for index, subscription in enumerate(self.subscriptions, 1):
-                    self.transport.send("subscribe", {"item": subscription.item, "fields": ",".join(subscription.fields), "adapter": "QUOTE", "LS_subId": str(index)})
+                    self.transport.send(
+                        "subscribe",
+                        {
+                            "item": subscription.item,
+                            "fields": ",".join(subscription.fields),
+                            "adapter": subscription.data_adapter,
+                            "LS_subId": str(index),
+                        },
+                    )
                 self.stats.connection_state = "CONNECTED"
                 delay = self.reconnect_seconds
                 while not self._stop.is_set():
@@ -182,9 +190,14 @@ class WebSocketLightstreamerTransport:
         self._field_names: list[str] = []
         self._endpoint = ""
         self._session_id: str | None = None
+        self._next_request_id = 1
 
     def connect(self, endpoint: str, username: str, password: str) -> None:
         self._endpoint = lightstreamer_ws_endpoint(endpoint)
+        # Request IDs are unique within a WebSocket connection. A fresh
+        # connection creates a fresh TLCP session and starts at one.
+        self._session_id = None
+        self._next_request_id = 1
         try:
             self._socket = self._websocket.create_connection(
                 self._endpoint,
@@ -230,21 +243,28 @@ class WebSocketLightstreamerTransport:
     def send(self, command: str, params: dict[str, str]) -> None:
         if self._socket is None:
             raise ConnectionError("stream is not connected")
+        if self._session_id is None:
+            raise ConnectionError("Lightstreamer session is not established")
         if command == "subscribe":
             self._field_names = params["fields"].split(",")
             params = {
                 "LS_op": "add",
+                "LS_reqId": self._request_id(),
                 "LS_subId": params["LS_subId"],
                 "LS_group": params["item"],
                 "LS_schema": params["fields"],
                 "LS_data_adapter": params.get("adapter", "Pricing"),
                 "LS_mode": "MERGE",
             }
-            if self._session_id:
-                params["LS_session"] = self._session_id
+            params["LS_session"] = self._session_id
             self._send_request("control", params)
             return
         raise ValueError(f"unsupported Lightstreamer command: {command}")
+
+    def _request_id(self) -> str:
+        request_id = str(self._next_request_id)
+        self._next_request_id += 1
+        return request_id
 
     def receive(self) -> dict[str, Any] | None:
         if self._socket is None:
