@@ -12,7 +12,7 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0,<9", "ruff>=0.6,<1"]
-streaming = ["websocket-client>=1.8,<2"]
+streaming = ["lightstreamer-client-lib>=2.2,<3"]
 
 [project.scripts]
 ig-ai = "ig_ai.cli:main"

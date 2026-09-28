@@ -4,7 +4,7 @@ Technical-first market analysis infrastructure. Phase 1 provides a secure, read-
 
 ## Architecture
 
-`config` validates environment configuration, `rest` handles IG REST sessions and read-only market endpoints, `discovery` searches rather than guesses EPICs, `streaming` provides a reconnect/resubscribe boundary, `normalization` converts provider updates into UTC observations, `candles` aggregates forming and closed OHLC candles, and `database` stores instruments, observations, and candles in SQLite. Technical features, signals, outcomes, and regimes are intentionally future schema extensions.
+`config` validates environment configuration, `rest` handles IG REST sessions and read-only market endpoints, `discovery` searches rather than guesses EPICs, `streaming` uses the official Lightstreamer Python Client SDK, `normalization` converts provider updates into UTC observations, `candles` aggregates forming and closed OHLC candles, and `database` stores instruments, observations, and candles in SQLite. Technical features, signals, outcomes, and regimes are intentionally future schema extensions.
 
 The internal model preserves the distinction between market name, IG EPIC, instrument type, and data source. It is ready for separate cash-index, futures, and CFD instruments later.
 
@@ -48,7 +48,7 @@ Discovery searches provider-name variants, cheaply filters and ranks search meta
 uv pip install -e '.[streaming]'
 ```
 
-The transport boundary is covered with fakes. A real Lightstreamer session uses the selected LIVE or DEMO environment and runtime configuration; no live verification is implied by the test suite. `stream` authenticates through REST, resolves instruments through discovery, prefers the provider-confirmed $1 HS50 weekday cash variant when available, and never selects weekend HS50 or futures.
+The official Lightstreamer SDK boundary is covered with mocks. The SDK receives the `/session` `lightstreamerEndpoint`, the active account identifier, and `CST-...|XST-...` credentials; it creates MERGE `PRICE:{account}:{epic}` subscriptions with the `Pricing` adapter and required price fields. The SDK owns transport framing and reconnection. A real session uses the selected LIVE environment and runtime configuration; no live verification is implied by the test suite. `stream` authenticates through REST, resolves instruments through discovery, prefers the provider-confirmed $1 HS50 weekday cash variant when available, and never selects weekend HS50 or futures.
 
 ## Tests and security
 

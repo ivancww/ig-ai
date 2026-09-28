@@ -15,10 +15,9 @@ from .runtime import PersistedStream
 from .security import SecretRedactionFilter
 from .streaming import (
     IGStreamService,
+    OfficialLightstreamerTransport,
     Subscription,
-    WebSocketLightstreamerTransport,
     lightstreamer_password,
-    lightstreamer_ws_endpoint,
 )
 
 
@@ -116,7 +115,6 @@ def main() -> int:
             endpoint = session.lightstreamer_endpoint
             if not endpoint:
                 raise RuntimeError("IG authentication did not provide a Lightstreamer endpoint")
-            endpoint = lightstreamer_ws_endpoint(endpoint)
             account_id = session.account_id
             if not account_id:
                 raise RuntimeError("IG authentication did not provide the active account identifier")
@@ -134,7 +132,7 @@ def main() -> int:
                 endpoint,
                 account_id,
                 lightstreamer_password(session.cst, session.security_token),
-                WebSocketLightstreamerTransport(),
+                OfficialLightstreamerTransport(),
                 reconnect_seconds=client.settings.stream_reconnect_seconds,
             )
             for instrument in instruments.values():
@@ -155,53 +153,26 @@ def main() -> int:
                 authentication="PASS",
                 market_discovery="PASS — provider-verified weekday cash instruments selected",
                 streaming=(
+                    "Streaming client: OFFICIAL LIGHTSTREAMER SDK; "
+                    f"Connection: {'VERIFIED' if stream.stats.diagnostics.connection_verified else 'NOT VERIFIED'}; "
                     f"{stream.stats.connection_state}; "
                     + "; ".join(
                         f"{instrument.market_name}: updates={stream.stats.updates_received.get(instrument.instrument_id, 0)}, "
                         f"last_update={sink.last_update.get(instrument.instrument_id, 'NO LIVE TICKS YET')}"
                         for instrument in instruments.values()
                     )
-                    + f"; observations={sink.observations_written}; 15M candles={sink.candles_written['15M']}; "
+                    + f"; subscriptions={len(stream.stats.diagnostics.subscriptions_accepted)}/{len(instruments)}; "
+                    + f"markets receiving updates={sum(bool(value) for value in stream.stats.updates_received.values())}/{len(instruments)}; "
+                    + f"observations={sink.observations_written}; 15M candles={sink.candles_written['15M']}; "
                     + f"1H candles={sink.candles_written['1H']}; reconnects={stream.stats.reconnect_count}; "
-                    + "lifecycle="
-                    + ", ".join(
-                        [
-                            f"handshake={'VERIFIED' if stream.stats.diagnostics.websocket_handshake_accepted else 'NOT OBSERVED'}",
-                            f"wsok={'VERIFIED' if stream.stats.diagnostics.wsok_received else 'NOT OBSERVED'}",
-                            f"create_session={'SENT' if stream.stats.diagnostics.create_session_sent else 'NOT OBSERVED'}",
-                            f"conok={'VERIFIED' if stream.stats.diagnostics.conok_received else 'NOT OBSERVED'}",
-                            f"session={'VERIFIED' if stream.stats.diagnostics.session_id_established else 'NOT OBSERVED'}",
-                            f"control_requests={len(stream.stats.diagnostics.control_requests)}",
-                            f"reqok={len(stream.stats.diagnostics.reqok_request_ids)}/{len(stream.stats.diagnostics.control_requests)}",
-                            f"reqerr={len(stream.stats.diagnostics.reqerr_request_ids)}",
-                            f"subok={len(stream.stats.diagnostics.subok_subscription_ids)}/{len(stream.stats.diagnostics.control_requests)}",
-                            f"subcmd={len(stream.stats.diagnostics.subcmd_subscription_ids)}",
-                            f"first_u={len(stream.stats.diagnostics.first_updates_received)}/{len(stream.stats.diagnostics.control_requests)}",
-                            f"u_messages={len(stream.stats.diagnostics.u_messages_received)}/{len(stream.stats.diagnostics.control_requests)}",
-                            f"CONTROL_ACCEPTED={len(stream.stats.diagnostics.reqok_request_ids)}/{len(stream.stats.diagnostics.control_requests)}",
-                            f"SUBSCRIPTION_ESTABLISHED={len(stream.stats.diagnostics.subscriptions_accepted)}/{len(stream.stats.diagnostics.control_requests)}",
-                            f"DATA_OBSERVED={len(stream.stats.diagnostics.first_updates_received)}/{len(stream.stats.diagnostics.control_requests)}",
-                            f"decode_diagnostics={len(stream.stats.diagnostics.safe_update_diagnostics)}",
-                            "decode_details="
-                            + " || ".join(
-                                ",".join(f"{key}={value}" for key, value in diagnostic.items())
-                                for diagnostic in stream.stats.diagnostics.safe_update_diagnostics
-                            )
-                            if stream.stats.diagnostics.safe_update_diagnostics
-                            else "NONE",
-                            f"server_messages={','.join(stream.stats.diagnostics.server_messages) or 'NONE'}",
-                            f"protocol_errors={','.join(stream.stats.diagnostics.protocol_errors) or 'NONE'}",
-                            f"close_code={stream.stats.diagnostics.socket_close_code or 'NONE'}",
-                            f"close_reason={stream.stats.diagnostics.socket_close_reason or 'NONE'}",
-                        ]
-                    )
+                    + f"; SDK statuses={','.join(stream.stats.diagnostics.sdk_statuses) or 'NONE'}"
                 ),
                 runtime_outcome="COMPLETED",
                 connection_established=(
-                    "VERIFIED" if stream.stats.diagnostics.websocket_handshake_accepted else "NOT VERIFIED"
+                    "VERIFIED" if stream.stats.diagnostics.connection_verified else "NOT VERIFIED"
                 ),
                 session_established=(
-                    "VERIFIED" if stream.stats.diagnostics.session_id_established else "NOT VERIFIED"
+                    "VERIFIED" if stream.stats.diagnostics.connection_verified else "NOT VERIFIED"
                 ),
                 subscriptions_accepted=(
                     f"VERIFIED ({len(stream.stats.diagnostics.subscriptions_accepted)}/{len(instruments)})"
