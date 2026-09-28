@@ -88,6 +88,18 @@ class StreamStats:
     warnings: list[str] = field(default_factory=list)
     diagnostics: StreamDiagnostics = field(default_factory=StreamDiagnostics)
 
+    def live_validation_passed(self, instrument_ids: list[str] | tuple[str, ...]) -> bool:
+        """Require independent subscription and real update evidence per market."""
+        return bool(
+            self.diagnostics.connection_verified
+            and instrument_ids
+            and all(
+                self.updates_received.get(instrument_id, 0) > 0
+                and str(index) in self.diagnostics.subscriptions_accepted
+                for index, instrument_id in enumerate(instrument_ids, 1)
+            )
+        )
+
 
 class OfficialLightstreamerTransport:
     """Official Lightstreamer Python SDK boundary for IG streaming."""

@@ -109,6 +109,7 @@ def main() -> int:
             if args.duration <= 0:
                 raise ValueError("--duration must be positive")
             groups = discover_market_groups(client)
+            groups_by_market = {group.requested_market: group for group in groups}
             requested = {name.strip() for name in args.markets.split(",") if name.strip()}
             selected = [candidate for candidate in select_stream_instruments(groups) if candidate.requested_market in requested]
             missing = sorted(requested - {candidate.requested_market for candidate in selected})
@@ -150,6 +151,22 @@ def main() -> int:
                 sink.run_for(stream, args.duration)
             finally:
                 database.close()
+            instrument_ids = [instrument.instrument_id for instrument in instruments.values()]
+            validation_passed = stream.stats.live_validation_passed(instrument_ids)
+            validation_lines = []
+            for candidate in selected:
+                group = groups_by_market[candidate.requested_market]
+                subscription_id = str(selected.index(candidate) + 1)
+                subscription_ok = subscription_id in stream.stats.diagnostics.subscriptions_accepted
+                update_ok = stream.stats.updates_received.get(candidate.epic, 0) > 0
+                line = (
+                    f"{candidate.requested_market}: discovery: {group.status}; "
+                    f"subscription: {'YES' if subscription_ok else 'NO'}; "
+                    f"ItemUpdate: {'YES' if update_ok else 'NO'}"
+                )
+                if candidate.requested_market == "Hong Kong HS50":
+                    line += f"; selected weekday cash variant: {candidate.market_name} ({candidate.epic})"
+                validation_lines.append(line)
             update_terminal_report(
                 command=f"ig-ai stream --duration {args.duration:g}",
                 account_type=client.settings.account_type,
@@ -159,6 +176,8 @@ def main() -> int:
                     "Streaming client: OFFICIAL LIGHTSTREAMER SDK; "
                     f"Connection: {'VERIFIED' if stream.stats.diagnostics.connection_verified else 'NOT VERIFIED'}; "
                     f"{stream.stats.connection_state}; "
+                    + "; ".join(validation_lines)
+                    + "; "
                     + "; ".join(
                         f"{instrument.market_name}: updates={stream.stats.updates_received.get(instrument.instrument_id, 0)}, "
                         f"last_update={sink.last_update.get(instrument.instrument_id, 'NO LIVE TICKS YET')}"
@@ -189,22 +208,32 @@ def main() -> int:
                     else f"NOT VERIFIED ({len(stream.stats.diagnostics.subscriptions_accepted)}/{len(instruments)})"
                 ),
                 real_price_updates=(
-                    "VERIFIED" if any(stream.stats.updates_received.values()) else "NOT OBSERVED"
+                    "VERIFIED (ALL MARKETS)" if validation_passed
+                    else f"NOT VERIFIED ({sum(bool(value) for value in stream.stats.updates_received.values())}/{len(instruments)} markets)"
                 ),
                 final_state=(
-                    "DISCONNECTED (EXPECTED AFTER DURATION)"
-                    if stream.stats.diagnostics.duration_expired
-                    else "DISCONNECTED (UNEXPECTED)"
-                    if stream.stats.diagnostics.unexpected_disconnect
-                    else "DISCONNECTED"
+                    "LIVE MULTI-MARKET VALIDATION PASS"
+                    if validation_passed
+                    else "LIVE MULTI-MARKET VALIDATION FAIL"
                 ),
-                checks="read-only Lightstreamer runtime completed",
+                checks=(
+                    "read-only Lightstreamer runtime completed; observations entered persistence/candle pipeline"
+                    if validation_passed
+                    else "read-only Lightstreamer runtime completed; all-market validation gate failed"
+                ),
                 warnings="; ".join(stream.stats.warnings) if stream.stats.warnings else "NONE",
-                not_verified="A market with zero ticks has connection/subscription evidence but no real price-update evidence; LIVE streaming PASS was not claimed",
-                output="; ".join(f"{candidate.market_name}\t{candidate.epic}" for candidate in selected),
+                not_verified=(
+                    "Candle validation is not claimed; this command validates live observations and pipeline capability"
+                ),
+                output="\n".join(validation_lines) + "\n" + "; ".join(
+                    f"{candidate.market_name}\t{candidate.epic}" for candidate in selected
+                ),
                 secrets=(client.settings.api_key, client.settings.username, client.settings.password, session.cst, session.security_token),
             )
-            print("Streaming runtime completed (read-only)")
+            for line in validation_lines:
+                print(line)
+            print(f"LIVE MULTI-MARKET STREAM VALIDATION: {'PASS' if validation_passed else 'FAIL'}")
+            return 0 if validation_passed else 1
         elif args.command == "stream-smoke":
             result = run_stream_smoke(client, args.duration)
             print(format_smoke_result(result))

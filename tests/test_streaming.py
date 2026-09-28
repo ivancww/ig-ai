@@ -9,6 +9,7 @@ from ig_ai.streaming import (
     IGStreamService,
     OfficialLightstreamerTransport,
     StreamDiagnostics,
+    StreamStats,
     Subscription,
     configure_lightstreamer_connection,
     lightstreamer_password,
@@ -261,6 +262,41 @@ def test_multiple_markets_are_isolated_and_sdk_diagnostics_are_safe():
     seen = []
     service.run(lambda update: (seen.append(update), service.stop()) if len(seen) == 1 else seen.append(update))
     assert {update["instrument_id"] for update in seen} == {"ONE", "TWO"}
+
+
+def test_three_market_validation_requires_every_subscription_and_item_update():
+    stats = StreamStats()
+    stats.diagnostics.connection_verified = True
+    stats.diagnostics.subscriptions_accepted = {"1", "2", "3"}
+    stats.updates_received = {"US": 1, "JP": 1, "HK": 0}
+
+    assert not stats.live_validation_passed(("US", "JP", "HK"))
+    stats.updates_received["HK"] = 1
+    assert stats.live_validation_passed(("US", "JP", "HK"))
+
+
+def test_three_market_sdk_subscriptions_keep_price_schema_and_pricing_adapter(monkeypatch):
+    install_sdk(monkeypatch)
+    transport = OfficialLightstreamerTransport()
+    transport.connect("https://stream.example", "ACCOUNT", "password")
+    epics = ("US-EPIC", "JP-EPIC", "HK-EPIC")
+    for index, epic in enumerate(epics, 1):
+        transport.send(
+            "subscribe",
+            {
+                "LS_subId": str(index),
+                "item": f"PRICE:ACCOUNT:{epic}",
+                "fields": ",".join(REQUIRED_FIELDS),
+                "adapter": "Pricing",
+            },
+        )
+
+    assert len(FakeSubscription.instances) == 3
+    assert {subscription.items[0] for subscription in FakeSubscription.instances} == {
+        f"PRICE:ACCOUNT:{epic}" for epic in epics
+    }
+    assert all(subscription.adapter == "Pricing" for subscription in FakeSubscription.instances)
+    assert transport.diagnostics.subscriptions_accepted == {"1", "2", "3"}
 
 
 def test_disconnect_state_is_reported_without_custom_reconnect():

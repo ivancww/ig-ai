@@ -34,7 +34,7 @@ The CLI validates credentials without printing them. `IG_ACCOUNT_TYPE` supports 
 ig-ai db-init
 ig-ai rest-check       # read-only authentication check
 ig-ai discover         # searches US Tech 100, Japan 225, Hong Kong HS50
-ig-ai stream --duration 300  # authenticated read-only Lightstreamer validation
+ig-ai stream --duration 300  # three-market LIVE read-only Lightstreamer validation
 igai-report            # prints and refreshes the unified Codex/runtime report
 igai-report --run pytest -q
 igai-report --run ruff check .
@@ -61,7 +61,7 @@ Tests are unit/mock tests and never need IG credentials. Timestamps are timezone
 
 Never put API keys, passwords, CST, X-SECURITY-TOKEN, session tokens, raw market data, databases, or logs in source, tests, documentation, or commits. Logging includes a sensitive-field redaction filter.
 
-Real IG verification status is recorded only from read-only runtime evidence. The `Runtime` boundary installs SIGINT/SIGTERM handlers and delegates reconnect behavior to the streaming service; schedule and timezone remain configurable rather than hardcoded. A controlled shutdown flush preserves a forming candle as not closed, including its EPIC. `igai-report` records connection/subscription evidence separately from real price-update evidence and redacts session credentials.
+Real IG verification status is recorded only from read-only runtime evidence. Run `ig-ai stream --duration 300` as the single production validation command: it discovers the three requested markets, uses one official Lightstreamer client, subscribes concurrently, and requires an independent subscription and ItemUpdate for US Tech 100, Japan 225, and Hong Kong HS50 before reporting PASS. The `Runtime` boundary installs SIGINT/SIGTERM handlers and delegates reconnect behavior to the streaming service; schedule and timezone remain configurable rather than hardcoded. A controlled shutdown flush preserves a forming candle as not closed, including its EPIC. `igai-report` records connection/subscription evidence separately from real price-update evidence and redacts session credentials. Candle counts demonstrate pipeline capability only; candle validation requires actual LIVE observations and is not claimed by the command itself.
 
 ## Phase 1 limitations and next phase
 
