@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import threading
 
 from ig_ai.rest import IGSession
@@ -108,6 +109,27 @@ def test_smoke_path_connects_and_receives_one_update_without_high_level_service(
     assert subscription.items == ["PRICE:ACCOUNT:CS.D.US. NASDAQ. MINI.IP"]
     assert subscription.adapter == "Pricing"
     assert subscription.fields == ["BIDPRICE1", "ASKPRICE1", "TIMESTAMP", "DLG_FLAG"]
+
+
+def test_stream_smoke_command_connects_once_after_client_creation(monkeypatch):
+    fake_discovery(monkeypatch)
+    from ig_ai import cli, stream_smoke
+
+    created = []
+
+    def factory(endpoint, adapter_set):
+        client = FakeSDKClient(endpoint, adapter_set)
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(stream_smoke, "_sdk", lambda: (factory, FakeSDKSubscription))
+    monkeypatch.setattr(cli, "IGRestClient", lambda _settings: FakeRestClient())
+    monkeypatch.setattr(cli.Settings, "from_env", lambda: object())
+    monkeypatch.setattr(sys, "argv", ["ig-ai", "stream-smoke", "--duration", "1"])
+
+    assert cli.main() == 0
+    assert len(created) == 1
+    assert [event for event in created[0].events if event == ("connect",)] == [("connect",)]
 
 
 def test_smoke_fails_if_sdk_never_reaches_connected(monkeypatch):

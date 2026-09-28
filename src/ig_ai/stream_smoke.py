@@ -129,10 +129,10 @@ def run_stream_smoke(
 
         sdk_client = client_factory(endpoint, "DEFAULT")
         result.sdk_client_created = True
-        sdk_client.setUser(account_id)
-        sdk_client.setPassword(lightstreamer_password(session.cst, session.security_token))
         connected = threading.Event()
         sdk_client.addListener(_ConnectionListener(result, connected))
+        sdk_client.setUser(account_id)
+        sdk_client.setPassword(lightstreamer_password(session.cst, session.security_token))
         result.connect_invoked = True
         started = time.monotonic()
         sdk_client.connect()
