@@ -119,6 +119,44 @@ def test_controlled_shutdown_persists_incomplete_candle_as_forming_and_restart_c
     db.close()
 
 
+@pytest.mark.parametrize(
+    ("timeframe", "later_timestamp"),
+    (("15M", "2026-01-01T00:15:00"), ("1H", "2026-01-01T01:00:00"),
+     ("4H", "2026-01-01T04:00:00"), ("1D", "2026-01-02T00:00:00")),
+)
+def test_restart_later_bucket_finalizes_previous_forming_candle_once(tmp_path, timeframe, later_timestamp):
+    path = tmp_path / f"restart-{timeframe}.sqlite3"
+    instrument = Instrument("EPIC", "EPIC", "Market")
+    db = Database(path)
+    first = PersistedStream(db, {"EPIC": instrument})
+    first.on_update({"instrument_id": "EPIC", "BIDPRICE1": "100", "ASKPRICE1": "102", "TIMESTAMP": "2026-01-01T00:01:00+00:00"})
+    for aggregator in first.aggregators.values():
+        for candle in aggregator.flush():
+            db.save_candle(candle)
+    db.close()
+
+    db = Database(path)
+    resumed = PersistedStream(db, {"EPIC": instrument})
+    resumed.on_update({"instrument_id": "EPIC", "BIDPRICE1": "104", "ASKPRICE1": "106", "TIMESTAMP": f"{later_timestamp}+00:00"})
+    rows = db.connection.execute(
+        "SELECT is_closed, observation_count FROM candles WHERE timeframe = ? ORDER BY start_at",
+        (timeframe,),
+    ).fetchall()
+    assert rows == [(1, 1), (0, 1)]
+    assert db.connection.execute("SELECT COUNT(*) FROM candles WHERE timeframe = ?", (timeframe,)).fetchone()[0] == 2
+    db.close()
+
+
+def test_database_schema_uses_required_identities_and_wal(tmp_path):
+    db = Database(tmp_path / "integrity.sqlite3")
+    assert db.connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    candle_pk = db.connection.execute("PRAGMA table_info(candles)").fetchall()
+    assert {row[1] for row in candle_pk if row[5]} == {"instrument_id", "timeframe", "start_at"}
+    observation_pk = db.connection.execute("PRAGMA table_info(observations)").fetchall()
+    assert {row[1] for row in observation_pk if row[5]} == {"instrument_id", "observed_at"}
+    db.close()
+
+
 def test_duplicate_observation_does_not_create_another_candle_or_observation(tmp_path):
     db, sink = _sink(tmp_path)
     update = {"instrument_id": "EPIC", "BIDPRICE1": "100", "ASKPRICE1": "102", "TIMESTAMP": "1760000000000"}

@@ -106,6 +106,10 @@ class StreamStats:
 class OfficialLightstreamerTransport:
     """Official Lightstreamer Python SDK boundary for IG streaming."""
 
+    # The official SDK owns reconnect/recovery.  The surrounding service must
+    # not interpret its transient DISCONNECTED state as a terminal failure.
+    reconnect_managed = True
+
     def __init__(self, client_factory: Callable[..., Any] | None = None, *, connection_timeout: float = 15.0):
         self._client_factory = client_factory
         self._connection_timeout = connection_timeout
@@ -214,6 +218,8 @@ class OfficialLightstreamerTransport:
 
     def is_connection_terminated(self) -> bool:
         """Return true only when the SDK has reported a real terminal disconnect."""
+        if getattr(self, "reconnect_managed", False) and self._client is not None:
+            return False
         return self._client is None or (
             self.diagnostics.connection_state.startswith("DISCONNECTED")
             and not self.diagnostics.intentional_shutdown
@@ -293,6 +299,15 @@ class IGStreamService:
         if subscription not in self.subscriptions:
             self.subscriptions.append(subscription)
             self.stats.updates_received.setdefault(subscription.instrument_id, 0)
+
+    @property
+    def reconnect_status(self) -> str:
+        """Return evidence status without overstating an unobserved recovery."""
+        if self.stats.reconnect_count > 0:
+            return "VERIFIED"
+        if self.stats.diagnostics.unexpected_disconnect:
+            return "FAILED"
+        return "NOT OBSERVED"
 
     def stop(self, *, reason: str = "requested") -> None:
         self._stop.set()

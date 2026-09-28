@@ -35,6 +35,7 @@ ig-ai db-init
 ig-ai rest-check       # read-only authentication check
 ig-ai discover         # searches US Tech 100, Japan 225, Hong Kong HS50
 ig-ai stream --duration 300  # three-market LIVE read-only Lightstreamer validation
+ig-ai phase1-check      # offline final acceptance; does not start a LIVE run
 igai-report            # prints and refreshes the unified Codex/runtime report
 igai-report --run pytest -q
 igai-report --run ruff check .

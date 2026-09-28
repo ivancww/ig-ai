@@ -316,3 +316,37 @@ def test_disconnect_state_is_reported_without_custom_reconnect():
     assert service.stats.connection_state == "DISCONNECTED"
     assert service.stats.reconnect_count == 0
     assert service.stats.diagnostics.unexpected_disconnect
+
+
+def test_official_sdk_recovery_is_observed_without_duplicate_application_subscription(monkeypatch):
+    install_sdk(monkeypatch)
+
+    class RecoveryClient(FakeClient):
+        def subscribe(self, subscription):
+            self.subscriptions.append(subscription)
+            subscription.listener.onSubscription()
+            self.listener.onStatusChange("DISCONNECTED")
+            self.listener.onStatusChange("CONNECTING")
+            self.listener.onStatusChange("CONNECTED:STREAM-SENSING")
+            subscription.listener.onItemUpdate(
+                FakeUpdate(
+                    "PRICE:ACCOUNT:EPIC",
+                    {"BIDPRICE1": "100", "ASKPRICE1": "102", "TIMESTAMP": "1760000000000", "DLG_FLAG": "DEAL"},
+                )
+            )
+
+    transport = OfficialLightstreamerTransport(client_factory=RecoveryClient)
+    service = IGStreamService("https://stream.example", "ACCOUNT", "password", transport)
+    service.add_subscription(Subscription("EPIC", "PRICE:ACCOUNT:EPIC"))
+    received = []
+
+    def on_update(update):
+        received.append(update)
+        service.stop()
+
+    service.run(on_update)
+    assert received[0]["instrument_id"] == "EPIC"
+    assert service.reconnect_status == "VERIFIED"
+    assert service.stats.reconnect_count == 1
+    assert len(RecoveryClient.instances[0].subscriptions) == 1
+    assert transport.diagnostics.subscriptions_accepted == {"1"}

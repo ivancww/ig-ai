@@ -4,12 +4,14 @@ import argparse
 import logging
 import os
 import time
+from pathlib import Path
 
 from .config import Settings
 from .database import Database
 from .discovery import discover_market_groups, select_stream_instruments
 from .exceptions import IGHTTPError
 from .models import Instrument
+from .phase1 import run_phase1_check
 from .reporting import update_terminal_report, write_runtime_record
 from .rest import IGRestClient
 from .runtime import PersistedStream
@@ -29,6 +31,7 @@ def main() -> int:
     commands.add_parser("db-init")
     commands.add_parser("discover")
     commands.add_parser("rest-check")
+    commands.add_parser("phase1-check")
     stream_parser = commands.add_parser("stream")
     stream_parser.add_argument("--duration", type=float, default=300.0)
     stream_parser.add_argument("--markets", default="US Tech 100,Japan 225,Hong Kong HS50")
@@ -40,6 +43,10 @@ def main() -> int:
     handler.addFilter(SecretRedactionFilter())
     logging.basicConfig(level=logging.INFO, handlers=[handler])
     try:
+        if args.command == "phase1-check":
+            code, output = run_phase1_check(Path(__file__).resolve().parents[2])
+            print(output)
+            return code
         if args.command == "db-init":
             settings = Settings.from_env(require_credentials=False)
             database = Database(settings.database_path)
@@ -94,6 +101,12 @@ def main() -> int:
                     ambiguity_line = f"  ambiguity: {group.ambiguity_reason}"
                     safe_results.append(ambiguity_line)
                     print(ambiguity_line)
+                if group.requested_market == "Hong Kong HS50":
+                    variant_line = (
+                        f"  eligible weekday cash variants: {len(group.verified_variants)}"
+                    )
+                    safe_results.append(variant_line)
+                    print(variant_line)
             update_terminal_report(
                 command="ig-ai discover",
                 account_type=client.settings.account_type,
@@ -161,11 +174,7 @@ def main() -> int:
             write_runtime_record({"status": "COMPLETED", **audit})
             instrument_ids = [instrument.instrument_id for instrument in instruments.values()]
             validation_passed = stream.stats.live_validation_passed(instrument_ids)
-            reconnect_outcome = (
-                "PASS" if stream.stats.reconnect_count > 0
-                else "FAIL" if stream.stats.diagnostics.unexpected_disconnect
-                else "NOT OBSERVED"
-            )
+            reconnect_outcome = stream.reconnect_status
             validation_lines = []
             for candidate in selected:
                 group = groups_by_market[candidate.requested_market]
@@ -178,7 +187,10 @@ def main() -> int:
                     f"ItemUpdate: {'YES' if update_ok else 'NO'}"
                 )
                 if candidate.requested_market == "Hong Kong HS50":
-                    line += f"; selected weekday cash variant: {candidate.market_name} ({candidate.epic})"
+                    line += (
+                        f"; eligible weekday cash variants: {len(group.verified_variants)}"
+                        f"; selected weekday cash variant: {candidate.market_name} ({candidate.epic})"
+                    )
                 line += (
                     f"; received={sink.received_item_updates.get(candidate.epic, 0)}"
                     f"; normalized={sink.normalized_observations.get(candidate.epic, 0)}"
