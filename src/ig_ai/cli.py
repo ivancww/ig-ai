@@ -38,6 +38,9 @@ def main() -> int:
     pattern_parser = commands.add_parser("pattern-status")
     pattern_parser.add_argument("--instrument", default=None)
     pattern_parser.add_argument("--timeframe", choices=("15M", "1H", "4H", "1D"), default="1H")
+    direction_parser = commands.add_parser("direction-status")
+    direction_parser.add_argument("--instrument", default=None)
+    direction_parser.add_argument("--timeframe", choices=("15M", "1H", "4H", "1D"), default="1H")
     stream_parser = commands.add_parser("stream")
     stream_parser.add_argument("--duration", type=float, default=300.0)
     stream_parser.add_argument("--markets", default="US Tech 100,Japan 225,Hong Kong HS50")
@@ -109,6 +112,39 @@ def main() -> int:
                     print(f"  {pattern['pattern']}: {pattern.get('lifecycle')} ({pattern.get('candle_state')})")
                 print(f"Direction/reversal evidence: {status['direction_reversal']}")
                 print("Inspection only; no trading recommendation.")
+            finally:
+                database.close()
+            return 0
+        if args.command == "direction-status":
+            settings = Settings.from_env(require_credentials=False)
+            database = Database(settings.database_path)
+            try:
+                instruments = database.list_instruments()
+                selected = args.instrument or (instruments[0][0] if instruments else None)
+                if selected is None:
+                    print("No instruments or direction snapshots available.")
+                    return 0
+                snapshot = database.get_direction_status(selected, args.timeframe)
+                if snapshot is None:
+                    print(f"No direction snapshot for {selected} {args.timeframe}.")
+                    return 0
+                print(selected)
+                print(f"Primary Direction: {snapshot['direction']}")
+                print(f"UP Score: {snapshot['up_score']}")
+                print(f"DOWN Score: {snapshot['down_score']}")
+                print(f"Trend Stage: {snapshot['trend_stage']}")
+                print(f"Holding Window: {snapshot['holding_window']}")
+                print(f"Reversal Risk: {snapshot['reversal_risk']['category']}")
+                print(f"Timeframe Agreement: {snapshot['timeframe_agreement']['status']}")
+                positive = [item for item in snapshot["evidence_ledger"] if item["direction"] == "UP"]
+                risks = [item for item in snapshot["evidence_ledger"] if item["direction"] == "DOWN"]
+                print("Positive Evidence:")
+                for item in positive:
+                    print(f"  - {item['timeframe']} {item['evidence_type']}: {item['raw_state']}")
+                print("Risk Evidence:")
+                for item in risks:
+                    print(f"  - {item['timeframe']} {item['evidence_type']}: {item['raw_state']}")
+                print("Technical score only — not a calibrated probability or trading recommendation.")
             finally:
                 database.close()
             return 0

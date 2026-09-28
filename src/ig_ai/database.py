@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+from .direction import DIRECTION_SCHEMA_VERSION
 from .models import Candle, Instrument, MarketObservation, as_utc
 from .patterns import PATTERN_SCHEMA_VERSION
 from .technical import FEATURE_SCHEMA_VERSION, TechnicalFeatureEngine
@@ -105,6 +106,32 @@ CREATE TABLE IF NOT EXISTS pattern_outcomes (
     time_to_reversal TEXT,
     created_at TEXT NOT NULL,
     PRIMARY KEY (instrument_id, timeframe, pattern_name, pattern_start, horizon)
+);
+CREATE TABLE IF NOT EXISTS direction_snapshots (
+    instrument_id TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    candle_start TEXT NOT NULL,
+    direction_schema_version TEXT NOT NULL,
+    is_closed INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (instrument_id, timeframe, candle_start, direction_schema_version)
+);
+CREATE TABLE IF NOT EXISTS direction_outcomes (
+    instrument_id TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    snapshot_candle_start TEXT NOT NULL,
+    horizon TEXT NOT NULL,
+    reference_price TEXT NOT NULL,
+    future_timestamp TEXT,
+    future_price TEXT,
+    absolute_move TEXT,
+    percentage_move TEXT,
+    max_favourable_move TEXT,
+    max_adverse_move TEXT,
+    time_to_reversal TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (instrument_id, timeframe, snapshot_candle_start, horizon)
 );
 """
 
@@ -328,6 +355,27 @@ class Database:
             (instrument_id, timeframe, PATTERN_SCHEMA_VERSION),
         ).fetchone()
         return {"structure": json.loads(structure[0]) if structure else None, "patterns": [json.loads(row[0]) for row in patterns], "direction_reversal": json.loads(direction[0]) if direction else None}
+
+    def save_direction_snapshot(self, snapshot: dict) -> None:
+        self.connection.execute(
+            "INSERT INTO direction_snapshots VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instrument_id, timeframe, candle_start, direction_schema_version) DO UPDATE SET is_closed=excluded.is_closed, snapshot_json=excluded.snapshot_json, updated_at=excluded.updated_at",
+            (snapshot["instrument"], snapshot["timeframe"], snapshot["candle_timestamp"], snapshot.get("schema_version", DIRECTION_SCHEMA_VERSION), int(snapshot.get("candle_state") == "CLOSED"), json.dumps(snapshot, sort_keys=True, separators=(",", ":")), datetime.now(UTC).isoformat()),
+        )
+        self.connection.commit()
+
+    def get_direction_status(self, instrument_id: str, timeframe: str = "1H") -> dict | None:
+        row = self.connection.execute(
+            "SELECT snapshot_json FROM direction_snapshots WHERE instrument_id=? AND timeframe=? AND direction_schema_version=? ORDER BY candle_start DESC LIMIT 1",
+            (instrument_id, timeframe, DIRECTION_SCHEMA_VERSION),
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def save_direction_outcome(self, *, instrument_id: str, timeframe: str, snapshot_candle_start: str, horizon: str, reference_price: str, future_timestamp: str | None = None, future_price: str | None = None, absolute_move: str | None = None, percentage_move: str | None = None, max_favourable_move: str | None = None, max_adverse_move: str | None = None, time_to_reversal: str | None = None) -> None:
+        self.connection.execute(
+            "INSERT INTO direction_outcomes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instrument_id, timeframe, snapshot_candle_start, horizon) DO UPDATE SET future_timestamp=excluded.future_timestamp, future_price=excluded.future_price, absolute_move=excluded.absolute_move, percentage_move=excluded.percentage_move, max_favourable_move=excluded.max_favourable_move, max_adverse_move=excluded.max_adverse_move, time_to_reversal=excluded.time_to_reversal",
+            (instrument_id, timeframe, snapshot_candle_start, horizon, reference_price, future_timestamp, future_price, absolute_move, percentage_move, max_favourable_move, max_adverse_move, time_to_reversal, datetime.now(UTC).isoformat()),
+        )
+        self.connection.commit()
 
     def save_pattern_outcome(self, *, instrument_id: str, timeframe: str, pattern_name: str, pattern_start: str, horizon: str, reference_price: str, future_timestamp: str | None = None, future_price: str | None = None, absolute_move: str | None = None, percentage_move: str | None = None, max_favourable_move: str | None = None, max_adverse_move: str | None = None, time_to_reversal: str | None = None) -> None:
         self.connection.execute(

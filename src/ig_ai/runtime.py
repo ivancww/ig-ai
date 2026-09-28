@@ -210,6 +210,9 @@ class PersistedStream:
         if analysis is not None:
             analysis["direction_reversal"] = coordinated["direction_reversal"]
             self.database.save_phase2b_analysis(analysis)
+            direction = dict(coordinated["direction_score"])
+            direction.update({"instrument": candle.instrument_id, "timeframe": candle.timeframe, "candle_timestamp": candle.start.isoformat(), "candle_state": "CLOSED" if candle.is_closed else "FORMING"})
+            self.database.save_direction_snapshot(direction)
 
     @staticmethod
     def _exit_reason(stream: IGStreamService) -> str | None:

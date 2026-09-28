@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from .direction import DirectionScoreEngine
 from .models import Candle
 from .technical import TechnicalFeatureEngine, _structure, ema, rsi
 
@@ -380,7 +381,8 @@ class MultiTimeframeCoordinator:
             features[timeframe] = {"structure": analysis["structure"], "macd": technical["macd"], "rsi14": technical["rsi"]}
             divergences[timeframe] = analysis["divergences"]
         direction = DirectionReversalEngine().classify(features, divergences)
-        return {"schema_version": PATTERN_SCHEMA_VERSION, "timeframes": analyses, "direction_reversal": direction, "history_lengths": {timeframe: len(candles) for timeframe, candles in aligned.items()}}
+        direction_score = DirectionScoreEngine().analyze(analyses)
+        return {"schema_version": PATTERN_SCHEMA_VERSION, "timeframes": analyses, "direction_reversal": direction, "direction_score": direction_score, "history_lengths": {timeframe: len(candles) for timeframe, candles in aligned.items()}}
 
 
 class Phase2BEngine:
