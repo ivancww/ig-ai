@@ -4,6 +4,7 @@ import argparse
 import logging
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 
 from .config import Settings
@@ -60,7 +61,7 @@ def main() -> int:
         "--instrument": {"default": None}, "--window": {"choices": ("1Y", "3Y", "5Y"), "default": "3Y"},
         "--timeframe": {"choices": ("15M", "1H", "4H", "1D"), "default": "1H"}, "--direction": {"choices": ("UP", "DOWN"), "default": None},
         "--score-bucket": {"default": None}, "--trend-stage": {"default": None}, "--reversal-risk": {"default": None},
-        "--agreement": {"default": None}, "--four-hour-alignment": {"default": None}, "--pattern": {"default": None}, "--alert-type": {"default": None}, "--horizon": {"default": None},
+        "--agreement": {"default": None}, "--four-hour-alignment": {"default": None}, "--pattern": {"default": None}, "--alert-type": {"default": None}, "--horizon": {"default": None}, "--as-of": {"default": None},
     }
     research_parser = commands.add_parser("research", help="run an explicit local historical research job")
     for option, kwargs in research_filters.items():
@@ -215,22 +216,31 @@ def main() -> int:
             try:
                 engine = ResearchEngine(database, ResearchConfig(default_window=args.window))
                 instruments = [args.instrument] if args.instrument else [row[0] for row in database.list_instruments()]
+                as_of = datetime.fromisoformat(args.as_of) if args.as_of else None
                 if args.command == "research" and not args.pattern and not args.alert_type:
                     for instrument in instruments:
-                        result = engine.run_direction_research(instrument_id=instrument, window=args.window)
+                        result = engine.run_direction_research(instrument_id=instrument, window=args.window, now=as_of)
                         available = result["available_history"]
                         print(f"{instrument}: recorded={result['recorded_snapshots']} outcomes={result['outcomes_written']} requested={args.window} available_days={available['days']}")
+                        for timeframe in ("15M", "1H", "4H", "1D"):
+                            pattern_result = engine.run_pattern_research(instrument_id=instrument, timeframe=timeframe, window=args.window, now=as_of)
+                            print(f"{instrument} {timeframe} patterns/divergences: recorded={pattern_result['recorded_snapshots']} outcomes={pattern_result['outcomes_written']}")
+                        alert_result = engine.run_alert_research(instrument_id=instrument, window=args.window, now=as_of)
+                        print(f"{instrument} alerts: recorded={alert_result['recorded_snapshots']} outcomes={alert_result['outcomes_written']}")
                 if args.command == "research-status":
                     for instrument in instruments:
                         available = database.available_history(instrument, args.timeframe, requested_window=args.window)
                         print(f"{instrument} {args.timeframe}: requested={args.window} available_days={available['days']} status={available['status']}")
-                summary = engine.summary(window=args.window, instrument_id=args.instrument, timeframe=args.timeframe, direction=args.direction, score_bucket=args.score_bucket, trend_stage=args.trend_stage, reversal_risk=args.reversal_risk, agreement=args.agreement, four_hour_alignment=args.four_hour_alignment, pattern_name=args.pattern, alert_type=args.alert_type, horizon=args.horizon)
+                summary = engine.summary(window=args.window, as_of=as_of, instrument_id=args.instrument, timeframe=args.timeframe, direction=args.direction, score_bucket=args.score_bucket, trend_stage=args.trend_stage, reversal_risk=args.reversal_risk, agreement=args.agreement, four_hour_alignment=args.four_hour_alignment, pattern_name=args.pattern, alert_type=args.alert_type, horizon=args.horizon)
                 print(f"Research Engine: {summary['research_version']}")
-                print(f"Samples: {summary['sample_count']}")
+                print(f"As of: {summary['as_of']}")
+                print(f"Samples: {summary['sample_count']} completed snapshots; eligible snapshots: {summary['snapshot_count']}; outcome observations: {summary['outcome_observation_count']}")
                 print(f"Status: {summary['quality']}")
                 for row in summary["rows"]:
                     count = row["sample_count"]
-                    print(f"Future {row['horizon']}: samples={count} UP={row['up_count']} DOWN={row['down_count']} FLAT={row['flat_count']} average_move={row['average_move']}")
+                    print(f"Future {row['horizon']}: n={count} UP={row['up_percentage']}% DOWN={row['down_percentage']}% FLAT={row['flat_percentage']}% average_move={row['average_move']} median_mfe={row['median_mfe']} median_mae={row['median_mae']}")
+                comparison = database.research_4h_comparison(instrument_id=args.instrument, timeframe=args.timeframe, horizon=args.horizon)
+                print(f"4H value study: {comparison}")
                 if not summary["rows"]:
                     print("No completed historical outcomes are available; pending outcomes are not counted as samples.")
             finally:
