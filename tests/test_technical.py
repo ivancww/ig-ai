@@ -6,7 +6,7 @@ import pytest
 
 from ig_ai.database import Database
 from ig_ai.models import Candle
-from ig_ai.technical import TechnicalFeatureEngine, atr, ema, rsi
+from ig_ai.technical import TechnicalConfig, TechnicalFeatureEngine, atr, ema, rsi
 
 
 def candle(index: int, *, close: float, open_: float | None = None, high: float | None = None, low: float | None = None, closed: bool = True) -> Candle:
@@ -43,6 +43,13 @@ def test_atr_uses_true_range_and_wilder_smoothing():
     assert values[2] == pytest.approx(2.75)
 
 
+def test_first_atr_has_no_recent_history():
+    candles = [candle(i, close=100 + i, high=101 + i, low=99 + i) for i in range(14)]
+    feature = TechnicalFeatureEngine().calculate(candles)
+    assert feature["atr14"]["value"] == pytest.approx(2.0)
+    assert feature["atr14"]["recent_comparison"] == "insufficient_history"
+
+
 def test_feature_record_contains_numerically_checkable_price_geometry_and_bands():
     candles = [candle(i, close=100 + i, open_=99 + i) for i in range(25)]
     feature = TechnicalFeatureEngine().calculate(candles)
@@ -64,6 +71,14 @@ def test_macd_does_not_create_signal_before_slow_ema_plus_signal_period():
     assert feature["macd"]["signal"] is not None
 
 
+def test_macd_histogram_state_uses_only_current_and_prior_available_values():
+    candles = [candle(i, close=100 + i) for i in range(36)]
+    first_signal = TechnicalFeatureEngine().calculate(candles, target_index=33)
+    next_signal = TechnicalFeatureEngine().calculate(candles, target_index=34)
+    assert first_signal["macd"]["histogram_state"] == "insufficient_history"
+    assert next_signal["macd"]["histogram_state"] in {"strengthening", "weakening", "unchanged"}
+
+
 def test_swing_confirmation_and_labels_are_explicit():
     closes = [10, 12, 9, 13, 10, 11, 14, 10, 11]
     candles = [candle(i, close=value, high=value + 0.25, low=value - 0.25) for i, value in enumerate(closes)]
@@ -71,6 +86,28 @@ def test_swing_confirmation_and_labels_are_explicit():
     assert feature["structure"]["confirmed_highs"][0]["classification"] is None
     assert feature["structure"]["confirmed_highs"][1]["classification"] == "HH"
     assert "candidate_high" in feature["structure"]
+
+
+def test_forming_right_candle_cannot_confirm_pivot_and_later_invalidation_is_not_retroactive():
+    forming = [
+        candle(0, close=10, high=10, low=9),
+        candle(1, close=12, high=12, low=11),
+        candle(2, close=11, high=11, low=10, closed=False),
+    ]
+    invalidated = [*forming[:2], candle(2, close=13, high=13, low=10, closed=True)]
+    engine = TechnicalFeatureEngine()
+    assert engine.calculate(forming)["structure"]["confirmed_highs"] == []
+    assert engine.calculate(invalidated)["structure"]["confirmed_highs"] == []
+
+
+@pytest.mark.parametrize(
+    ("close", "expected"),
+    [(12.0, "above_upper"), (11.2, "upper_zone"), (10.8, "middle_zone"), (10.1, "lower_zone"), (9.0, "below_lower")],
+)
+def test_bollinger_has_explicit_configurable_zones(close, expected):
+    candles = [candle(0, close=10), candle(1, close=11), candle(2, close=close)]
+    config = TechnicalConfig(bollinger_period=3, bollinger_stddevs=1.0)
+    assert TechnicalFeatureEngine(config).calculate(candles)["bollinger"]["zone"] == expected
 
 
 def test_gaps_are_open_until_a_later_candle_fills_them_and_are_target_bounded():
