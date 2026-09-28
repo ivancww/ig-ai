@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+from .alerts import ALERT_ENGINE_VERSION
 from .direction import DIRECTION_SCHEMA_VERSION
 from .models import Candle, Instrument, MarketObservation, as_utc
 from .patterns import PATTERN_SCHEMA_VERSION
@@ -132,6 +133,50 @@ CREATE TABLE IF NOT EXISTS direction_outcomes (
     time_to_reversal TEXT,
     created_at TEXT NOT NULL,
     PRIMARY KEY (instrument_id, timeframe, snapshot_candle_start, horizon)
+);
+CREATE TABLE IF NOT EXISTS monitor_state (
+    instrument_id TEXT NOT NULL,
+    alert_engine_version TEXT NOT NULL,
+    state_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (instrument_id, alert_engine_version)
+);
+CREATE TABLE IF NOT EXISTS alerts (
+    alert_id TEXT PRIMARY KEY,
+    instrument_id TEXT NOT NULL,
+    alert_type TEXT NOT NULL,
+    priority TEXT NOT NULL,
+    event_identity TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    model_reference_time TEXT,
+    trigger_time TEXT,
+    previous_direction TEXT,
+    current_direction TEXT,
+    previous_score REAL,
+    current_score REAL,
+    previous_trend_stage TEXT,
+    current_trend_stage TEXT,
+    previous_reversal_risk TEXT,
+    current_reversal_risk TEXT,
+    previous_holding_window TEXT,
+    current_holding_window TEXT,
+    timeframe_agreement_json TEXT,
+    trigger_evidence_json TEXT NOT NULL,
+    confirmed INTEGER NOT NULL,
+    score_version TEXT,
+    alert_engine_version TEXT NOT NULL,
+    message TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS alerts_instrument_time ON alerts (instrument_id, created_at);
+CREATE TABLE IF NOT EXISTS alert_delivery_state (
+    alert_id TEXT PRIMARY KEY,
+    delivery_status TEXT NOT NULL DEFAULT 'PENDING',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT,
+    delivered_at TEXT,
+    error_code TEXT,
+    FOREIGN KEY (alert_id) REFERENCES alerts(alert_id)
 );
 """
 
@@ -376,6 +421,53 @@ class Database:
             (instrument_id, timeframe, snapshot_candle_start, horizon, reference_price, future_timestamp, future_price, absolute_move, percentage_move, max_favourable_move, max_adverse_move, time_to_reversal, datetime.now(UTC).isoformat()),
         )
         self.connection.commit()
+
+    def get_monitor_state(self, instrument_id: str) -> dict | None:
+        row = self.connection.execute(
+            "SELECT state_json FROM monitor_state WHERE instrument_id=? AND alert_engine_version=?",
+            (instrument_id, ALERT_ENGINE_VERSION),
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def save_monitor_state(self, state: dict) -> None:
+        self.connection.execute(
+            "INSERT INTO monitor_state VALUES (?, ?, ?, ?) ON CONFLICT(instrument_id, alert_engine_version) DO UPDATE SET state_json=excluded.state_json, updated_at=excluded.updated_at",
+            (state["instrument"], state.get("schema_version", ALERT_ENGINE_VERSION), json.dumps(state, sort_keys=True, separators=(",", ":")), datetime.now(UTC).isoformat()),
+        )
+        self.connection.commit()
+
+    def save_alert(self, alert: dict) -> bool:
+        cursor = self.connection.execute(
+            "INSERT OR IGNORE INTO alerts (alert_id, instrument_id, alert_type, priority, event_identity, created_at, model_reference_time, trigger_time, previous_direction, current_direction, previous_score, current_score, previous_trend_stage, current_trend_stage, previous_reversal_risk, current_reversal_risk, previous_holding_window, current_holding_window, timeframe_agreement_json, trigger_evidence_json, confirmed, score_version, alert_engine_version, message, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (alert["alert_id"], alert["instrument"], alert["alert_type"], alert["priority"], alert["event_identity"], alert["created_at"], alert.get("model_reference_time"), alert.get("trigger_time"), alert.get("previous_direction"), alert.get("current_direction"), alert.get("previous_score"), alert.get("current_score"), alert.get("previous_trend_stage"), alert.get("current_trend_stage"), alert.get("previous_reversal_risk"), alert.get("current_reversal_risk"), alert.get("previous_holding_window"), alert.get("current_holding_window"), json.dumps(alert.get("timeframe_agreement"), sort_keys=True, separators=(",", ":")), json.dumps(alert.get("trigger_evidence", []), sort_keys=True, separators=(",", ":")), int(alert.get("confirmed", False)), alert.get("score_version"), alert.get("alert_engine_version", ALERT_ENGINE_VERSION), alert["message"], json.dumps(alert, sort_keys=True, separators=(",", ":"))),
+        )
+        self.connection.execute("INSERT OR IGNORE INTO alert_delivery_state (alert_id) VALUES (?)", (alert["alert_id"],))
+        self.connection.commit()
+        return cursor.rowcount == 1
+
+    def list_alerts(self, instrument_id: str | None = None, priority: str | None = None, limit: int = 20) -> list[dict]:
+        query = "SELECT payload_json FROM alerts WHERE 1=1"
+        params: list[object] = []
+        if instrument_id:
+            query += " AND instrument_id=?"
+            params.append(instrument_id)
+        if priority:
+            query += " AND priority=?"
+            params.append(priority)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        return [json.loads(row[0]) for row in self.connection.execute(query, params).fetchall()]
+
+    def get_monitor_status(self, instrument_id: str | None = None) -> dict:
+        if instrument_id:
+            states = self.connection.execute("SELECT state_json FROM monitor_state WHERE instrument_id=? ORDER BY updated_at DESC", (instrument_id,)).fetchall()
+            count = self.connection.execute("SELECT COUNT(*) FROM alerts WHERE instrument_id=?", (instrument_id,)).fetchone()[0]
+            last = self.connection.execute("SELECT payload_json FROM alerts WHERE instrument_id=? ORDER BY created_at DESC LIMIT 1", (instrument_id,)).fetchone()
+        else:
+            states = self.connection.execute("SELECT state_json FROM monitor_state ORDER BY updated_at DESC").fetchall()
+            count = self.connection.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+            last = self.connection.execute("SELECT payload_json FROM alerts ORDER BY created_at DESC LIMIT 1").fetchone()
+        return {"states": [json.loads(row[0]) for row in states], "alert_count": count, "last_alert": json.loads(last[0]) if last else None}
 
     def save_pattern_outcome(self, *, instrument_id: str, timeframe: str, pattern_name: str, pattern_start: str, horizon: str, reference_price: str, future_timestamp: str | None = None, future_price: str | None = None, absolute_move: str | None = None, percentage_move: str | None = None, max_favourable_move: str | None = None, max_adverse_move: str | None = None, time_to_reversal: str | None = None) -> None:
         self.connection.execute(
