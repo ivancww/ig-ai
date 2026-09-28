@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 from .models import Candle, Instrument, MarketObservation, as_utc
@@ -74,10 +75,10 @@ class Database:
             "SELECT instrument_id, epic, market_name, instrument_type, market_status, metadata_json FROM instruments ORDER BY market_name"
         ).fetchall()
 
-    def save_observation(self, observation: MarketObservation) -> None:
+    def save_observation(self, observation: MarketObservation) -> bool:
         timestamp = as_utc(observation.timestamp).isoformat()
-        self.connection.execute(
-            "INSERT OR REPLACE INTO observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        cursor = self.connection.execute(
+            "INSERT OR IGNORE INTO observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 observation.instrument_id,
                 timestamp,
@@ -91,6 +92,7 @@ class Database:
             ),
         )
         self.connection.commit()
+        return cursor.rowcount == 1
 
     def save_candle(self, candle: Candle) -> None:
         self.connection.execute(
@@ -111,3 +113,20 @@ class Database:
             ),
         )
         self.connection.commit()
+
+    def load_forming_candles(self) -> list[Candle]:
+        rows = self.connection.execute(
+            "SELECT instrument_id, timeframe, start_at, end_at, epic, open, high, low, close, volume, is_closed, observation_count "
+            "FROM candles WHERE is_closed = 0 ORDER BY instrument_id, timeframe, start_at"
+        ).fetchall()
+        return [
+            Candle(
+                instrument_id=row[0], timeframe=row[1],
+                start=datetime.fromisoformat(row[2]), end=datetime.fromisoformat(row[3]),
+                epic=row[4], open=Decimal(row[5]), high=Decimal(row[6]),
+                low=Decimal(row[7]), close=Decimal(row[8]),
+                volume=Decimal(row[9]) if row[9] is not None else None,
+                is_closed=bool(row[10]), observation_count=int(row[11]),
+            )
+            for row in rows
+        ]

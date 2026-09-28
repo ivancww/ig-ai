@@ -45,9 +45,21 @@ class PersistedStream:
     market_timezone: str = "UTC"
 
     def __post_init__(self) -> None:
-        self.aggregators = {timeframe: CandleAggregator(timeframe, market_timezone=self.market_timezone) for timeframe in ("15M", "1H")}
+        self.timeframes = ("15M", "1H", "4H", "1D")
+        self.aggregators = {
+            timeframe: CandleAggregator(timeframe, market_timezone=self.market_timezone)
+            for timeframe in self.timeframes
+        }
         self.observations_written = 0
-        self.candles_written = {timeframe: 0 for timeframe in self.aggregators}
+        self.candles_written = {"15M": 0, "1H": 0}
+        self.candle_counts = {timeframe: 0 for timeframe in self.timeframes}
+        self.candle_counts_by_instrument = {
+            key: {timeframe: 0 for timeframe in self.timeframes} for key in self.instruments
+        }
+        self.received_item_updates = {key: 0 for key in self.instruments}
+        self.normalized_observations = {key: 0 for key in self.instruments}
+        self.observations_persisted = {key: 0 for key in self.instruments}
+        self.persistence_failures = {key: 0 for key in self.instruments}
         self.last_update: dict[str, datetime] = {}
         self._seen_observations: set[tuple] = set()
         self.safe_skip_diagnostics: list[dict[str, str]] = []
@@ -56,6 +68,10 @@ class PersistedStream:
         # them.  SDK callbacks are delivered on an SDK-owned thread, so those
         # callbacks only enqueue immutable update dictionaries.
         self._database_owner_thread_id = threading.get_ident()
+        for candle in self.database.load_forming_candles():
+            aggregator = self.aggregators.get(candle.timeframe)
+            if aggregator is not None and candle.instrument_id in self.instruments:
+                aggregator.restore(candle)
 
     def on_update(self, update: dict) -> dict[str, str]:
         if update.get("type") in {"PROBE", "SUB", "UNSUB"}:
@@ -88,21 +104,30 @@ class PersistedStream:
         if observation.mid is None:
             self.safe_skip_diagnostics.append({"instrument_id": instrument_id, "reason": "missing_bid_or_ask"})
             return {"observation_created": "false", "skip_reason": "missing_bid_or_ask"}
+        self.normalized_observations[instrument_id] += 1
         signature = (observation.instrument_id, observation.timestamp, observation.bid, observation.offer)
         if signature in self._seen_observations:
             return {"observation_created": "false", "skip_reason": "duplicate_observation"}
         self._seen_observations.add(signature)
-        self.database.save_observation(observation)
+        if self.database.save_observation(observation) is False:
+            return {"observation_created": "false", "skip_reason": "duplicate_observation"}
         self.observations_written += 1
+        self.observations_persisted[instrument_id] += 1
         self.last_update[instrument_id] = observation.timestamp
         for timeframe, aggregator in self.aggregators.items():
             for candle in aggregator.update(observation):
                 self.database.save_candle(candle)
-                self.candles_written[timeframe] += 1
+                self.candle_counts[timeframe] += 1
+                self.candle_counts_by_instrument[instrument_id][timeframe] += 1
+                if timeframe in self.candles_written:
+                    self.candles_written[timeframe] += 1
             forming = aggregator.forming(observation)
             if forming:
                 self.database.save_candle(forming)
-                self.candles_written[timeframe] += 1
+                self.candle_counts[timeframe] += 1
+                self.candle_counts_by_instrument[instrument_id][timeframe] += 1
+                if timeframe in self.candles_written:
+                    self.candles_written[timeframe] += 1
         return {"observation_created": "true", "skip_reason": "none"}
 
     def _record_runtime_failure(self, stage: str, update: dict, error: Exception) -> None:
@@ -118,12 +143,17 @@ class PersistedStream:
         )
 
     def _process_update_safely(self, update: dict) -> None:
+        instrument_id = str(update.get("instrument_id") or "")
+        if instrument_id in self.received_item_updates and update.get("type") not in {"PROBE", "SUB", "UNSUB"}:
+            self.received_item_updates[instrument_id] += 1
         try:
             self.on_update(update)
         except Exception as error:
             # Keep the stream worker alive for the other subscriptions and
             # retain only sanitized diagnostic fields, never exception text.
             self._record_runtime_failure("persistence/candle_pipeline", update, error)
+            if instrument_id in self.persistence_failures:
+                self.persistence_failures[instrument_id] += 1
 
     def run_for(self, stream: IGStreamService, duration: float) -> None:
         if threading.get_ident() != self._database_owner_thread_id:
@@ -164,4 +194,7 @@ class PersistedStream:
         for aggregator in self.aggregators.values():
             for candle in aggregator.flush():
                 self.database.save_candle(candle)
-                self.candles_written[candle.timeframe] += 1
+                self.candle_counts[candle.timeframe] += 1
+                self.candle_counts_by_instrument[candle.instrument_id][candle.timeframe] += 1
+                if candle.timeframe in self.candles_written:
+                    self.candles_written[candle.timeframe] += 1

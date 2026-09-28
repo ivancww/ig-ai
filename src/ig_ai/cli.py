@@ -153,6 +153,11 @@ def main() -> int:
                 database.close()
             instrument_ids = [instrument.instrument_id for instrument in instruments.values()]
             validation_passed = stream.stats.live_validation_passed(instrument_ids)
+            reconnect_outcome = (
+                "PASS" if stream.stats.reconnect_count > 0
+                else "FAIL" if stream.stats.diagnostics.unexpected_disconnect
+                else "NOT OBSERVED"
+            )
             validation_lines = []
             for candidate in selected:
                 group = groups_by_market[candidate.requested_market]
@@ -166,6 +171,16 @@ def main() -> int:
                 )
                 if candidate.requested_market == "Hong Kong HS50":
                     line += f"; selected weekday cash variant: {candidate.market_name} ({candidate.epic})"
+                line += (
+                    f"; received={sink.received_item_updates.get(candidate.epic, 0)}"
+                    f"; normalized={sink.normalized_observations.get(candidate.epic, 0)}"
+                    f"; persisted={sink.observations_persisted.get(candidate.epic, 0)}"
+                    f"; persistence_failures={sink.persistence_failures.get(candidate.epic, 0)}"
+                    + "; " + ", ".join(
+                        f"{timeframe} candles={sink.candle_counts_by_instrument[candidate.epic][timeframe]}"
+                        for timeframe in sink.timeframes
+                    )
+                )
                 if not update_ok:
                     if sink.runtime_failures:
                         line += "; no ItemUpdate classification: processing failure recorded"
@@ -198,8 +213,11 @@ def main() -> int:
                     )
                     + f"; subscriptions={len(stream.stats.diagnostics.subscriptions_accepted)}/{len(instruments)}; "
                     + f"markets receiving updates={sum(bool(value) for value in stream.stats.updates_received.values())}/{len(instruments)}; "
-                    + f"observations={sink.observations_written}; 15M candles={sink.candles_written['15M']}; "
-                    + f"1H candles={sink.candles_written['1H']}; reconnects={stream.stats.reconnect_count}; "
+                    + f"observations normalized={sum(sink.normalized_observations.values())}; "
+                    + f"observations persisted={sum(sink.observations_persisted.values())}; "
+                    + f"persistence failures={sum(sink.persistence_failures.values())}; "
+                    + ", ".join(f"{timeframe} candles={sink.candle_counts[timeframe]}" for timeframe in sink.timeframes) + "; "
+                    + f"reconnect/recovery={reconnect_outcome}; reconnects={stream.stats.reconnect_count}; "
                     + f"; SDK statuses={','.join(stream.stats.diagnostics.sdk_statuses) or 'NONE'}; "
                     + f"SDK client created={str(stream.stats.diagnostics.sdk_client_created).lower()}; "
                     + f"connect invoked={str(stream.stats.diagnostics.connect_invoked).lower()}; "
@@ -230,7 +248,11 @@ def main() -> int:
                     else "LIVE MULTI-MARKET VALIDATION FAIL"
                 ),
                 checks=(
-                    "read-only Lightstreamer runtime completed; observations entered persistence/candle pipeline"
+                    "read-only Lightstreamer runtime completed; observations entered persistence/candle pipeline; "
+                    f"STREAMING {'PASS' if validation_passed else 'FAIL'}; "
+                    f"PERSISTENCE {'PASS' if sum(sink.persistence_failures.values()) == 0 and sum(sink.observations_persisted.values()) > 0 else 'FAIL'}; "
+                    f"CANDLE PIPELINE {'PASS' if all(sink.candle_counts.values()) else 'NOT VERIFIED'}; "
+                    f"RECONNECT {reconnect_outcome}; LONG-RUN {'PASS' if validation_passed and not sum(sink.persistence_failures.values()) else 'FAIL'}"
                     if validation_passed
                     else "read-only Lightstreamer runtime completed; all-market validation gate failed"
                 ),

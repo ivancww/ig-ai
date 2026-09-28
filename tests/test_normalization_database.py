@@ -218,3 +218,57 @@ def test_pipeline_failure_is_sanitized_and_does_not_stop_other_market(tmp_path):
     assert "CST-token" not in str(sink.runtime_failures)
     assert db.connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
     db.close()
+
+
+def test_three_market_counters_distinguish_received_normalized_persisted_and_failures(tmp_path):
+    db = Database(tmp_path / "three-market.sqlite3")
+    instruments = {
+        market: Instrument(market, market, market)
+        for market in ("US Tech 100", "Japan 225", "Hong Kong HS50")
+    }
+    sink = PersistedStream(db, instruments)
+    for index, market in enumerate(instruments):
+        sink._process_update_safely({
+            "instrument_id": market,
+            "BIDPRICE1": str(100 + index),
+            "ASKPRICE1": str(102 + index),
+            "TIMESTAMP": str(1760000000000 + index * 1000),
+            "DLG_FLAG": "DEAL",
+        })
+    sink._process_update_safely({
+        "instrument_id": "US Tech 100",
+        "BIDPRICE1": "100",
+        "ASKPRICE1": "102",
+        "TIMESTAMP": "1760000000000",
+        "DLG_FLAG": "DEAL",
+    })
+    assert sink.received_item_updates == {market: 1 for market in instruments} | {"US Tech 100": 2}
+    assert sink.normalized_observations == {market: 1 for market in instruments} | {"US Tech 100": 2}
+    assert sink.observations_persisted == {market: 1 for market in instruments}
+    assert sink.persistence_failures == {market: 0 for market in instruments}
+    db.close()
+
+
+def test_restart_restores_forming_candles_and_deduplicates_existing_observation(tmp_path):
+    path = tmp_path / "restart.sqlite3"
+    instrument = Instrument("EPIC", "EPIC", "US Tech 100")
+    db = Database(path)
+    first = PersistedStream(db, {instrument.instrument_id: instrument})
+    update = {
+        "instrument_id": "EPIC", "BIDPRICE1": "100", "ASKPRICE1": "102",
+        "TIMESTAMP": "1760000000000", "DLG_FLAG": "DEAL",
+    }
+    first.on_update(update)
+    db.close()
+
+    db = Database(path)
+    resumed = PersistedStream(db, {instrument.instrument_id: instrument})
+    assert resumed.on_update(update)["skip_reason"] == "duplicate_observation"
+    resumed.on_update({**update, "BIDPRICE1": "104", "ASKPRICE1": "106", "TIMESTAMP": "1760000060000"})
+    forming = resumed.aggregators["15M"].forming(
+        normalize_price_update({**update, "BIDPRICE1": "104", "ASKPRICE1": "106", "TIMESTAMP": "1760000060000"}, instrument_id="EPIC", epic="EPIC", market_name="US Tech 100")
+    )
+    assert forming is not None
+    assert forming.observation_count == 2
+    assert db.connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 2
+    db.close()
