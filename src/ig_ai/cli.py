@@ -13,6 +13,7 @@ from .reporting import update_terminal_report
 from .rest import IGRestClient
 from .runtime import PersistedStream
 from .security import SecretRedactionFilter
+from .stream_smoke import format_smoke_result, run_stream_smoke
 from .streaming import (
     IGStreamService,
     OfficialLightstreamerTransport,
@@ -31,6 +32,8 @@ def main() -> int:
     stream_parser.add_argument("--duration", type=float, default=300.0)
     stream_parser.add_argument("--markets", default="US Tech 100,Japan 225,Hong Kong HS50")
     stream_parser.add_argument("--verbose", action="store_true")
+    smoke_parser = commands.add_parser("stream-smoke")
+    smoke_parser.add_argument("--duration", type=float, default=60.0)
     args = parser.parse_args()
     handler = logging.StreamHandler()
     handler.addFilter(SecretRedactionFilter())
@@ -202,6 +205,10 @@ def main() -> int:
                 secrets=(client.settings.api_key, client.settings.username, client.settings.password, session.cst, session.security_token),
             )
             print("Streaming runtime completed (read-only)")
+        elif args.command == "stream-smoke":
+            result = run_stream_smoke(client, args.duration)
+            print(format_smoke_result(result))
+            return 0 if result.passed else 1
     except Exception as exc:
         safe_output = exc.safe_diagnostic() if isinstance(exc, IGHTTPError) else type(exc).__name__
         update_terminal_report(
