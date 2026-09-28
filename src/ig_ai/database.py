@@ -7,6 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from .models import Candle, Instrument, MarketObservation, as_utc
+from .technical import FEATURE_SCHEMA_VERSION, TechnicalFeatureEngine
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -15,6 +16,32 @@ CREATE TABLE IF NOT EXISTS observations (instrument_id TEXT NOT NULL, observed_a
 CREATE TABLE IF NOT EXISTS candles (instrument_id TEXT NOT NULL, timeframe TEXT NOT NULL, start_at TEXT NOT NULL, end_at TEXT NOT NULL, epic TEXT NOT NULL, open TEXT NOT NULL, high TEXT NOT NULL, low TEXT NOT NULL, close TEXT NOT NULL, volume TEXT, is_closed INTEGER NOT NULL, observation_count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (instrument_id, timeframe, start_at));
 CREATE INDEX IF NOT EXISTS observations_instrument_time ON observations (instrument_id, observed_at);
 CREATE INDEX IF NOT EXISTS candles_instrument_time ON candles (instrument_id, timeframe, start_at);
+CREATE TABLE IF NOT EXISTS technical_features (
+    instrument_id TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    candle_start TEXT NOT NULL,
+    feature_schema_version TEXT NOT NULL,
+    is_closed INTEGER NOT NULL,
+    features_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (instrument_id, timeframe, candle_start, feature_schema_version)
+);
+CREATE INDEX IF NOT EXISTS technical_features_lookup ON technical_features (instrument_id, timeframe, candle_start);
+CREATE TABLE IF NOT EXISTS technical_outcomes (
+    instrument_id TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    feature_candle_start TEXT NOT NULL,
+    horizon TEXT NOT NULL,
+    reference_price TEXT NOT NULL,
+    future_timestamp TEXT,
+    future_price TEXT,
+    absolute_move TEXT,
+    percentage_move TEXT,
+    max_favourable_move TEXT,
+    max_adverse_move TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (instrument_id, timeframe, feature_candle_start, horizon)
+);
 """
 
 
@@ -111,6 +138,52 @@ class Database:
                 int(candle.is_closed),
                 candle.observation_count,
             ),
+        )
+        self.connection.commit()
+
+    def list_candles(self, instrument_id: str, timeframe: str, *, through: str | None = None) -> list[Candle]:
+        query = (
+            "SELECT instrument_id, timeframe, start_at, end_at, epic, open, high, low, close, volume, is_closed, observation_count "
+            "FROM candles WHERE instrument_id = ? AND timeframe = ?"
+        )
+        params: list[str] = [instrument_id, timeframe]
+        if through is not None:
+            query += " AND start_at <= ?"
+            params.append(through)
+        query += " ORDER BY start_at"
+        rows = self.connection.execute(query, params).fetchall()
+        return [
+            Candle(row[0], row[4], row[1], datetime.fromisoformat(row[2]), datetime.fromisoformat(row[3]), Decimal(row[5]), Decimal(row[6]), Decimal(row[7]), Decimal(row[8]), Decimal(row[9]) if row[9] is not None else None, bool(row[10]), int(row[11]))
+            for row in rows
+        ]
+
+    def save_technical_features(self, features: dict) -> None:
+        self.connection.execute(
+            "INSERT INTO technical_features (instrument_id, timeframe, candle_start, feature_schema_version, is_closed, features_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(instrument_id, timeframe, candle_start, feature_schema_version) DO UPDATE SET is_closed=excluded.is_closed, features_json=excluded.features_json, updated_at=excluded.updated_at",
+            (features["instrument"], features["timeframe"], features["candle_timestamp"], features["schema_version"], int(features["candle_state"] == "CLOSED"), json.dumps(features, sort_keys=True, separators=(",", ":")), datetime.now(UTC).isoformat()),
+        )
+        self.connection.commit()
+
+    def save_features_for_candle(self, candle: Candle, engine: TechnicalFeatureEngine | None = None) -> dict:
+        history = self.list_candles(candle.instrument_id, candle.timeframe, through=candle.start.isoformat())
+        if not history or history[-1].start != candle.start:
+            history.append(candle)
+        features = (engine or TechnicalFeatureEngine()).calculate(history)
+        self.save_technical_features(features)
+        return features
+
+    def get_technical_features(self, instrument_id: str, timeframe: str, *, limit: int = 1) -> list[dict]:
+        rows = self.connection.execute(
+            "SELECT features_json FROM technical_features WHERE instrument_id=? AND timeframe=? AND feature_schema_version=? ORDER BY candle_start DESC LIMIT ?",
+            (instrument_id, timeframe, FEATURE_SCHEMA_VERSION, limit),
+        ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def save_outcome(self, *, instrument_id: str, timeframe: str, feature_candle_start: str, horizon: str, reference_price: str, future_timestamp: str | None = None, future_price: str | None = None, absolute_move: str | None = None, percentage_move: str | None = None, max_favourable_move: str | None = None, max_adverse_move: str | None = None) -> None:
+        self.connection.execute(
+            "INSERT INTO technical_outcomes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instrument_id, timeframe, feature_candle_start, horizon) DO UPDATE SET future_timestamp=excluded.future_timestamp, future_price=excluded.future_price, absolute_move=excluded.absolute_move, percentage_move=excluded.percentage_move, max_favourable_move=excluded.max_favourable_move, max_adverse_move=excluded.max_adverse_move",
+            (instrument_id, timeframe, feature_candle_start, horizon, reference_price, future_timestamp, future_price, absolute_move, percentage_move, max_favourable_move, max_adverse_move, datetime.now(UTC).isoformat()),
         )
         self.connection.commit()
 
