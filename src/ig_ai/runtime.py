@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import queue
 import signal
 import threading
 import time
@@ -50,6 +51,11 @@ class PersistedStream:
         self.last_update: dict[str, datetime] = {}
         self._seen_observations: set[tuple] = set()
         self.safe_skip_diagnostics: list[dict[str, str]] = []
+        self.runtime_failures: list[dict[str, str]] = []
+        # SQLite connections are deliberately owned by the thread that created
+        # them.  SDK callbacks are delivered on an SDK-owned thread, so those
+        # callbacks only enqueue immutable update dictionaries.
+        self._database_owner_thread_id = threading.get_ident()
 
     def on_update(self, update: dict) -> dict[str, str]:
         if update.get("type") in {"PROBE", "SUB", "UNSUB"}:
@@ -99,18 +105,60 @@ class PersistedStream:
                 self.candles_written[timeframe] += 1
         return {"observation_created": "true", "skip_reason": "none"}
 
+    def _record_runtime_failure(self, stage: str, update: dict, error: Exception) -> None:
+        instrument_id = str(update.get("instrument_id") or "unknown")
+        instrument = self.instruments.get(instrument_id)
+        affected = instrument.market_name if instrument is not None else instrument_id
+        self.runtime_failures.append(
+            {
+                "failure_stage": stage,
+                "exception_type": type(error).__name__,
+                "affected_market": affected,
+            }
+        )
+
+    def _process_update_safely(self, update: dict) -> None:
+        try:
+            self.on_update(update)
+        except Exception as error:
+            # Keep the stream worker alive for the other subscriptions and
+            # retain only sanitized diagnostic fields, never exception text.
+            self._record_runtime_failure("persistence/candle_pipeline", update, error)
+
     def run_for(self, stream: IGStreamService, duration: float) -> None:
-        worker = threading.Thread(target=stream.run, args=(self.on_update,), daemon=True)
+        if threading.get_ident() != self._database_owner_thread_id:
+            raise RuntimeError("PersistedStream.run_for must run on the database owner thread")
+        updates: queue.Queue[dict | None] = queue.Queue()
+
+        def enqueue_update(update: dict) -> None:
+            # This function runs on the stream/SDK service worker.  It must not
+            # touch SQLite or candle state.
+            updates.put(update)
+
+        worker = threading.Thread(target=stream.run, args=(enqueue_update,), daemon=True)
         worker.start()
         deadline = time.monotonic() + duration
-        while worker.is_alive() and time.monotonic() < deadline:
-            time.sleep(min(0.25, max(0.01, deadline - time.monotonic())))
+        while worker.is_alive() or not updates.empty():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 and worker.is_alive():
+                stream.mark_duration_expired()
+                stream.stop(reason="duration")
+                remaining = 0.5
+            try:
+                update = updates.get(timeout=min(0.25, max(0.01, remaining)))
+            except queue.Empty:
+                continue
+            self._process_update_safely(update)
         if worker.is_alive():
-            stream.mark_duration_expired()
-            stream.stop(reason="duration")
+            stream.stop(reason="runtime")
         else:
             stream.stop(reason="runtime")
         worker.join(timeout=5)
+        while True:
+            try:
+                self._process_update_safely(updates.get_nowait())
+            except queue.Empty:
+                break
         # Flush stores a forming candle as open. It deliberately does not
         # overwrite a completed candle as closed.
         for aggregator in self.aggregators.values():

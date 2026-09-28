@@ -1,3 +1,5 @@
+import sqlite3
+import threading
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -117,4 +119,102 @@ def test_persisted_stream_classifies_null_price_snapshot_as_missing_timestamp(tm
 
     assert result == {"observation_created": "false", "skip_reason": "missing_timestamp"}
     assert sink.safe_skip_diagnostics == [{"instrument_id": "EPIC", "reason": "missing_timestamp"}]
+    db.close()
+
+
+def test_sqlite_thread_ownership_reproduces_the_production_programming_error(tmp_path):
+    db = Database(tmp_path / "thread-owner.sqlite3")
+    errors = []
+
+    def wrong_thread_write():
+        try:
+            db.connection.execute("SELECT 1")
+        except Exception as error:  # noqa: BLE001 - assert the exact SQLite failure type
+            errors.append(error)
+
+    worker = threading.Thread(target=wrong_thread_write)
+    worker.start()
+    worker.join()
+    assert len(errors) == 1
+    assert isinstance(errors[0], sqlite3.ProgrammingError)
+    db.close()
+
+
+def test_stream_worker_enqueues_updates_for_the_sqlite_owner_thread(tmp_path):
+    db = Database(tmp_path / "queued-pipeline.sqlite3")
+    instruments = {
+        "US": Instrument("US", "US", "US Tech 100"),
+        "JP": Instrument("JP", "JP", "Japan 225"),
+    }
+    sink = PersistedStream(db, instruments)
+
+    class FakeStream:
+        def run(self, callback):
+            for instrument_id, timestamp in (("US", "1760000000000"), ("JP", "1760000001000")):
+                callback({
+                    "instrument_id": instrument_id,
+                    "BIDPRICE1": "100",
+                    "ASKPRICE1": "102",
+                    "TIMESTAMP": timestamp,
+                    "DLG_FLAG": "DEAL",
+                })
+
+        def mark_duration_expired(self):
+            pass
+
+        def stop(self, *, reason):
+            assert reason == "runtime"
+
+    sink.run_for(FakeStream(), 1)
+    assert sink.runtime_failures == []
+    assert sink.observations_written == 2
+    assert db.connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 2
+    db.close()
+
+
+def test_pipeline_failure_is_sanitized_and_does_not_stop_other_market(tmp_path):
+    db = Database(tmp_path / "failure-diagnostics.sqlite3")
+    instruments = {
+        "US": Instrument("US", "US", "US Tech 100"),
+        "JP": Instrument("JP", "JP", "Japan 225"),
+    }
+    sink = PersistedStream(db, instruments)
+    original_save = db.save_observation
+    calls = 0
+
+    def fail_first(observation):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.ProgrammingError("secret CST-token must never be reported")
+        original_save(observation)
+
+    db.save_observation = fail_first
+
+    class FakeStream:
+        def run(self, callback):
+            for instrument_id, timestamp in (("US", "1760000000000"), ("JP", "1760000001000")):
+                callback({
+                    "instrument_id": instrument_id,
+                    "BIDPRICE1": "100",
+                    "ASKPRICE1": "102",
+                    "TIMESTAMP": timestamp,
+                    "DLG_FLAG": "DEAL",
+                })
+
+        def mark_duration_expired(self):
+            pass
+
+        def stop(self, *, reason):
+            pass
+
+    sink.run_for(FakeStream(), 1)
+    assert sink.observations_written == 1
+    assert sink.runtime_failures == [{
+        "failure_stage": "persistence/candle_pipeline",
+        "exception_type": "ProgrammingError",
+        "affected_market": "US Tech 100",
+    }]
+    assert "CST-token" not in str(sink.runtime_failures)
+    assert db.connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
     db.close()

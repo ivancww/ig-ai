@@ -166,7 +166,20 @@ def main() -> int:
                 )
                 if candidate.requested_market == "Hong Kong HS50":
                     line += f"; selected weekday cash variant: {candidate.market_name} ({candidate.epic})"
+                if not update_ok:
+                    if sink.runtime_failures:
+                        line += "; no ItemUpdate classification: processing failure recorded"
+                    else:
+                        line += "; no ItemUpdate during window; runtime healthy/provider inactivity possible"
                 validation_lines.append(line)
+            runtime_failures = "; ".join(
+                "Failure stage={failure_stage}; Exception type={exception_type}; "
+                "Affected market/instrument={affected_market}".format(**failure)
+                for failure in sink.runtime_failures
+            )
+            warning_lines = [*stream.stats.warnings]
+            if runtime_failures:
+                warning_lines.append(runtime_failures)
             update_terminal_report(
                 command=f"ig-ai stream --duration {args.duration:g}",
                 account_type=client.settings.account_type,
@@ -221,7 +234,7 @@ def main() -> int:
                     if validation_passed
                     else "read-only Lightstreamer runtime completed; all-market validation gate failed"
                 ),
-                warnings="; ".join(stream.stats.warnings) if stream.stats.warnings else "NONE",
+                warnings="; ".join(warning_lines) if warning_lines else "NONE",
                 not_verified=(
                     "Candle validation is not claimed; this command validates live observations and pipeline capability"
                 ),

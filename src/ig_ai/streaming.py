@@ -77,6 +77,7 @@ class StreamDiagnostics:
     server_error_code: int | None = None
     server_error_message: str | None = None
     client_lifecycle_state: str = "NOT_CREATED"
+    runtime_failures: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -322,7 +323,19 @@ class IGStreamService:
                 normalized.update({"instrument_id": subscription.instrument_id, "epic": subscription.item.split(":")[-1]})
                 self.stats.updates_received[subscription.instrument_id] += 1
                 self.stats.last_update[subscription.instrument_id] = time.monotonic()
-                on_update(normalized)
+                try:
+                    on_update(normalized)
+                except Exception as exc:
+                    failure = {
+                        "failure_stage": "observation_callback",
+                        "exception_type": type(exc).__name__,
+                        "affected_market": subscription.instrument_id,
+                    }
+                    self.stats.diagnostics.runtime_failures.append(failure)
+                    self.stats.warnings.append(
+                        "Failure stage={failure_stage}; Exception type={exception_type}; "
+                        "Affected market/instrument={affected_market}".format(**failure)
+                    )
                 self._sync_transport_diagnostics()
         except Exception as exc:
             if not self._stop.is_set():
