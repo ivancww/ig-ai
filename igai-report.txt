@@ -5,7 +5,7 @@ PHASE 5A STATUS
 Repository: ivancww/ig-ai
 Branch: feat/phase5a-historical-research
 Base: origin/main / Phase 4A merge 9874f5d8c8b80ce70267807adc372b2b4c158d8d
-Commit: 7f94788608eda4424b951de546c02c4d107f815a
+Review-fix commit: 67d7c6ae9439c0fc41eed44195f4f0a0ce5d11a5
 PR: #6 — https://github.com/ivancww/ig-ai/pull/6 (OPEN; do not merge)
 
 Research Engine: PASS — versioned research_engine_v1 creates point-in-time snapshots without changing technical/direction/pattern/alert calculations.
