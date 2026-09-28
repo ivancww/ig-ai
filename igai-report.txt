@@ -1,0 +1,160 @@
+=== CODEX / DEVELOPMENT REPORT ===
+
+PHASE 5A STATUS
+
+Repository: ivancww/ig-ai
+Branch: feat/phase5a-historical-research
+Base: origin/main / Phase 4A merge 9874f5d8c8b80ce70267807adc372b2b4c158d8d
+Review-fix commit: 67d7c6ae9439c0fc41eed44195f4f0a0ce5d11a5
+PR: #6 — https://github.com/ivancww/ig-ai/pull/6 (OPEN; do not merge)
+
+Research Engine: PASS — versioned research_engine_v1 creates point-in-time snapshots without changing technical/direction/pattern/alert calculations.
+Outcome horizons: PASS — 15M, 1H, 2H, 4H, 8H, and 1D require an exact closed candle at the horizon end; incomplete future data remains PENDING/NULL.
+MFE/MAE: PASS — directional high/low excursion uses exactly (information_time, information_time+horizon], never the reference candle or data beyond the horizon; timestamps are candle-end timestamps and make no intrabar claim.
+Direction/stage/risk/holding/MTF research: PASS — 1H snapshots use the candle START as model identity and candle END as information/reference time; 15M outcomes begin only after that closed-candle time.
+Historical replay: PASS — deterministic HistoricalReplay accepts supplied closed candles, bounds each timeframe by target 1H candle END, and reuses Phase 2B/3 engines; external backfill remains a future dependency.
+Pattern/divergence/alert research: PASS — explicit jobs consume persisted Phase 2B pattern observations and Phase 4A alerts; no historical populations are claimed unless those upstream observations exist. RSI/MACD divergence indicator/direction and pattern instance/lifecycle identities are persisted separately from alert fields.
+Regime tags: PASS — deterministic trend and ATR comparison volatility tags; no news, macro, or AI inputs.
+Rolling windows: PASS — configurable 1Y/3Y/5Y filtering with default 3Y; requested and available history are reported separately.
+Sample handling: PASS — sample_count and INSUFFICIENT_SAMPLE/EARLY_SAMPLE/USABLE_SAMPLE labels; pending outcomes are excluded and no percentages are emitted for empty samples.
+Backfill readiness: PASS — replay boundary is deterministic and source identity retains IG CFD instrument/EPIC/market/type metadata; no external provider or official cash-index backfill added.
+Persistence: PASS — research_snapshots, research_outcomes, and research_regimes are SQLite owner-thread tables with idempotent upserts and restart-safe state.
+Performance: PASS — research is an explicit CLI job; LIVE monitoring does not run historical research on every tick.
+Available history: PASS — current local database reports approximately 0.17 days for each 1H CFD market versus requested 3Y, therefore INSUFFICIENT_HISTORY and zero completed samples.
+CLI: PASS — research and research-status are read-only and clearly distinguish model score/statistical sample output from calibrated probability.
+Tests: PASS — 216 pytest tests passed, including 19 Phase 5A deterministic research tests.
+Phase 1 regression: PASS — ig-ai phase1-check overall PASS.
+Phase 2A regression: PASS — technical tests pass.
+Phase 2B regression: PASS — pattern/structure tests pass.
+Phase 3 regression: PASS — direction/reversal tests pass.
+Phase 4A regression: PASS — alert/monitor tests pass.
+Checks: PASS — full pytest 216 passed; ruff check . PASS; git diff --check PASS.
+Security/read-only: PASS — no orders, positions, deals, credentials, tokens, external history provider, AI/news/macro, Telegram, or automatic trading added.
+Known limitations: existing LIVE database contains only recent candles; no historical backfill is included; pattern/divergence/alert results remain empty until Phase 2B/4A observations exist; 4H comparison is readiness-only and does not claim incremental value; regime tags use independent technical context when present and explicitly named model-state fallback otherwise; research output is descriptive sample measurement, not calibrated probability; daily session semantics remain those of existing IG CFD candles.
+
+PHASE 5A ACCEPTANCE: PASS
+
+Explicitly out of scope: calibrated probability, AI interpretation, external historical backfill, news/macro, Telegram, automatic trading, ML prediction, official cash-index data, and AVA integration.
+
+PHASE 4A STATUS
+
+Repository: ivancww/ig-ai
+Branch: feat/phase4a-alert-monitoring
+Base: origin/main / Phase 3 merge b2e99110d693e103cb8c5defa45cf025cc667361
+Commit: d4a72a7e5aefa93fb75f3951767ef8a5a155efba
+PR: #5 — https://github.com/ivancww/ig-ai/pull/5 (OPEN; do not merge)
+
+Alert Engine: PASS — versioned alert_engine_v1 compares accepted monitor states instead of raw ticks and emits only deterministic meaningful state changes.
+Alert types: PASS — direction/stage/risk changes, early warnings, reversal watch/confirmation, timeframe conflict/realignment, breakout/support/resistance breaks, false breakouts, pattern lifecycle changes, volatility expansion, and holding-window changes.
+Priority logic: PASS — INFO, WATCH, WARNING, and CRITICAL are deterministic and configurable; confirmed 1H reversal requires closed evidence.
+Early warning/escalation: PASS — 15M divergence/structure warnings remain provisional while 1H structure is intact; stage and risk transitions escalate without declaring reversal prematurely.
+Deduplication/cooldown: PASS — stable instrument/type/state event identities, SQLite uniqueness, event-specific cooldown, and priority escalation bypass.
+Restart recovery: PASS — persisted event identity and cooldown memory are restored; first post-restart comparison does not flood duplicate alerts, while a higher-priority escalation is not suppressed.
+Event identity: PASS — alert identity includes stable transition identity plus model-reference/trigger timestamps, so the same event dedupes while a later genuine transition persists.
+Directionality/confirmation: PASS — only divergences opposite to the current 1H direction enter early-warning state; 15M forming, pattern lifecycle, structure, and ATR events retain event-specific provisional/confirmed status.
+Pattern lifecycle: PASS — Phase 2B instance IDs are used when available; terminal lifecycle events do not repeat for the same instance and a new instance remains eligible.
+Threshold logic: PASS — score threshold is applied only with deterministic 1H structural change; sub-threshold or score-only changes do not alert.
+Persistence: PASS — monitor_state, alerts, and alert_delivery_state are owner-thread SQLite tables with idempotent writes and alert_engine_v1 versioning.
+Atomicity: PASS — accepted monitor state and generated alerts commit in one owner-thread SQLite transaction; rollback is covered by deterministic tests.
+CLI: PASS — monitor reuses the existing read-only stream pipeline for a positive wall-clock duration in seconds; alerts and monitor-status inspect persisted state without BUY/SELL language or fabricated process liveness.
+Tests: PASS — 197 pytest tests passed, including 22 Phase 4A deterministic alert/persistence/CLI tests.
+Phase 1 regression: PASS — ig-ai phase1-check overall PASS.
+Phase 2A regression: PASS — existing technical feature tests included in full pytest.
+Phase 2B regression: PASS — existing pattern/structure tests included in full pytest.
+Phase 3 regression: PASS — existing direction/reversal tests included in full pytest.
+Checks: PASS — full pytest 185 passed; ruff check . PASS; git diff --check PASS.
+Security/read-only: PASS — no order, position, deal, trade, credential, token, AI, news/macro, or Telegram integration added.
+Known limitations: alerts are deterministic technical evidence only; thresholds/cooldowns are initial configurable values, not empirically optimized; delivery remains pending for a later phase; market status remains provider-driven; no calibrated probabilities or automatic trading.
+
+PHASE 4A ACCEPTANCE: PASS — all First Review blockers addressed on the same branch.
+
+Explicitly out of scope: OpenAI/AI interpretation, news/macro, Telegram delivery, automatic trading, BUY/SELL recommendations, and calibrated probability.
+
+PHASE 3 STATUS
+
+Repository: ivancww/ig-ai
+Branch: feat/phase3-direction-reversal
+Base: origin/main / Phase 2B merge 98a87b3c2f1acf6231fb65049461f159370f1cb2
+Commit: 166bca2 (pushed)
+PR: #4 — https://github.com/ivancww/ig-ai/pull/4 (OPEN; do not merge)
+Files changed: README.md; src/ig_ai/direction.py; src/ig_ai/patterns.py; src/ig_ai/database.py; src/ig_ai/runtime.py; src/ig_ai/cli.py; tests/test_direction.py
+
+Direction Score: PASS — versioned/configurable direction_score_v1 produces normalized 0–100 UP/DOWN technical scores from auditable 1H/15M/4H/1D structure, EMA, MACD, RSI, patterns, divergence, breakout, ATR, and Bollinger context; sparse evidence cannot appear as 100/0.
+Evidence Ledger: PASS — every contribution retains evidence type, timeframe, direction, configured/applied weight, raw state, timestamp, and closed/forming confirmation status; coverage is exposed separately.
+Trend Stage: PASS — deterministic EARLY, CONFIRMED, MATURE, EXHAUSTION_RISK, REVERSAL_WATCH, and REVERSAL_CONFIRMED states; forming candles cannot confirm reversal.
+Reversal Risk: PASS — separate LOW/MODERATE/HIGH/VERY_HIGH risk category and internal score; direction and risk remain independent.
+Holding Window: PASS — deterministic 15–60M, 1–2H, 2–4H, and 4–8H technical estimate that shortens with maturity/risk; not empirical expectation.
+MTF Conflict: PASS — explicit AGREEMENT, PARTIAL_AGREEMENT, CONFLICT, and HIGH_CONFLICT states with contradictory timeframes exposed.
+Persistence: PASS — versioned direction_snapshots retain the 1H model/reference identity and separate trigger metadata; nullable direction_outcomes are idempotent, restart-safe, owner-thread SQLite records with no manufactured outcomes.
+CLI: PASS — direction-status is read-only and explicitly says the result is not a calibrated probability or trading recommendation.
+Tests: PASS — 175 pytest tests passed, including Phase 3 deterministic direction, reversal transitions, forming/closed discounting, score coverage, relative CLI evidence, conflict, runtime identity, no-look-ahead, persistence, restart, and NULL-outcome coverage.
+Checks: PASS — full pytest, ruff check ., git diff --check, and phase1-check.
+Phase 1 regression: PASS — phase1-check overall PASS; live/read-only streaming architecture unchanged.
+Phase 2A regression: PASS — tests/test_technical.py passed.
+Phase 2B regression: PASS — tests/test_patterns.py passed; bounded MTF/pattern architecture preserved.
+Security/read-only: PASS — no order endpoints, positions, credentials, tokens, AI/news/macro, alerts, or automatic trading added.
+Known limitations: scores and holding windows are uncalibrated technical model outputs; weights are initial and not empirically optimal; geometric structure remains conservative; outcomes remain NULL until future candles exist; Phase 4 is not started.
+
+PHASE 3 ACCEPTANCE: PASS
+
+1. Direction snapshot identity: PASS — model/reference remains 1H; trigger timeframe/timestamp/state are separate; non-1H CLI requests do not imply independent models.
+2. Evidence semantics: PASS — CLI sections are Supporting Evidence vs Opposing/Risk Evidence relative to current primary direction.
+3. Forming integrity: PASS — confirmed evidence drives headline weight; forming evidence is discounted/provisional and 15M can only provide early warning.
+4. Reversal directionality: PASS — prior/current direction and actual BOS direction are required for reversal stages; continuation is not a reversal.
+5. Structure semantics: PASS — breakout, false breakout, and BOS are distinct production fields and tests.
+6. Coverage/risk/window: PASS — sparse evidence exposes lower coverage; risk evidence is relative to primary trend; holding window follows the 1H model timestamp.
+7. No-look-ahead: PASS — integration test proves unavailable forming/future 4H/1D candles do not affect the 1H decision snapshot.
+
+Final checks: pytest 175 passed; Phase 1 `phase1-check` PASS; Phase 2A 18 passed; Phase 2B 58 passed; Phase 3 20 passed; `ruff check .` PASS; `git diff --check` PASS; security/read-only PASS.
+
+FINAL MERGEABILITY CHECK: PASS — latest origin/main is 98a87b3c2f1acf6231fb65049461f159370f1cb2 and is an ancestor of head 166bca29fa727a80192ccec19c3743f56fffe928; no conflict resolution was required. GitHub PR #4 reports mergeable=true and mergeStateStatus=CLEAN. No Phase 1/2A/2B/3 files were rewritten for an unnecessary rebase.
+
+PHASE 1 FINAL ACCEPTANCE: PASS
+
+1. HS50 discovery root cause and fix
+The prior status treated two provider-verified weekday HS50 cash/rolling CFD denominations as generic ambiguity. Discovery now classifies structurally valid weekday cash variants as VERIFIED_VARIANTS, excludes futures/forwards, weekend instruments, options, ETFs, shares, leveraged products, HSTECH, and H-shares, preserves each variant's metadata, and reports the selected default without hardcoding an EPIC.
+
+2. Restart/recovery implementation verification
+Controlled shutdown persists forming 15M, 1H, 4H, and 1D candles with is_closed=false. Restart restores each timeframe, continues same-bucket candles without changing open or identity, and finalizes exactly once when the first observation is in a later bucket. Volume remains absent.
+
+3. Database/thread-safety verification
+Observations are idempotent on instrument_id plus observed_at. Candle identity is instrument_id plus timeframe plus start_at; forming and finalized writes are upserts. SQLite WAL remains enabled and the connection stays owner-thread-only. SDK callbacks enqueue immutable updates; SQLite work runs on the database-owner thread, avoiding the prior ProgrammingError regression.
+
+4. Reconnect architecture/status
+The official Lightstreamer SDK remains the reconnect owner. The service now tolerates transient SDK-managed disconnect states and reports RECONNECT: VERIFIED only after a real recovery event, FAILED after an unexpected terminal failure, or NOT OBSERVED otherwise. The successful 3600-second run observed no reconnect; deterministic fake-SDK recovery is covered by tests.
+
+5. Tests/results
+79 pytest tests passed. ruff check . passed. git diff --check passed. No new LIVE run was started.
+
+6. phase1-check behavior
+ig-ai phase1-check performs offline configuration, discovery-variant, persistence, candle, restart, security, and evidence checks. It reads the persisted 3600-second runtime evidence and does not recreate LIVE evidence from unit tests.
+
+7. Security review
+Read-only IG scope is preserved. No credentials, session values, auth-header values, generated SQLite database, or raw debug dumps are tracked; .env and .igai runtime state remain ignored.
+
+8. New remote commit SHA
+fe09e05ec65a4dd580348ea8a6484f824f079fb8 (pushed to origin/feat/ig-market-data-foundation)
+
+9. PR #1 readiness
+Technically ready for final review after the same-branch commit and push. PR #1 is not merged and Phase 2 was not started.
+
+=== TERMINAL / RUNTIME REPORT ===
+
+Command executed: ig-ai stream --duration 3600
+Timestamp (UTC): 2026-09-28T09:28:32.499251+00:00
+IG account environment: LIVE
+Authentication: PASS
+Market discovery: PASS — provider-verified weekday cash instruments selected
+Streaming: OFFICIAL LIGHTSTREAMER SDK; connection VERIFIED; subscriptions accepted 3/3; US Tech 100 ItemUpdate YES; Japan 225 ItemUpdate YES; Hong Kong HS50 ItemUpdate YES; selected weekday cash variant 香港HS50 現貨 ($1) (IX.D.HANGSENG.BMU.IP); received/normalized/persisted: US 16426/16426/16426, Japan 6781/6781/6781, HK 3643/3643/3643; persistence failures=0; reconnect/recovery=NOT OBSERVED; reconnects=0
+Runtime outcome: COMPLETED
+Connection established: VERIFIED
+Session established: VERIFIED
+Subscriptions accepted: VERIFIED (3/3)
+Real price updates received: VERIFIED (ALL MARKETS)
+Final state: LIVE MULTI-MARKET VALIDATION PASS
+Tests/runtime checks: STREAMING PASS; PERSISTENCE PASS; CANDLE PIPELINE PASS; LONG-RUN PASS; RECONNECT NOT OBSERVED
+Warnings/errors: NONE
+Anything not verified: Candle validation is not claimed; this command validates live observations and pipeline capability
+Requested duration: 3600s
+Actual elapsed: 3600.154s
+Exit reason: DURATION_COMPLETE
