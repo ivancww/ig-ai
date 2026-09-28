@@ -7,6 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from .models import Candle, Instrument, MarketObservation, as_utc
+from .patterns import PATTERN_SCHEMA_VERSION
 from .technical import FEATURE_SCHEMA_VERSION, TechnicalFeatureEngine
 
 SCHEMA = """
@@ -42,6 +43,69 @@ CREATE TABLE IF NOT EXISTS technical_outcomes (
     created_at TEXT NOT NULL,
     PRIMARY KEY (instrument_id, timeframe, feature_candle_start, horizon)
 );
+CREATE TABLE IF NOT EXISTS pattern_observations (
+    instrument_id TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    candle_start TEXT NOT NULL,
+    pattern_name TEXT NOT NULL,
+    pattern_instance_id TEXT NOT NULL,
+    pattern_schema_version TEXT NOT NULL,
+    lifecycle TEXT NOT NULL,
+    is_closed INTEGER NOT NULL,
+    observation_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (instrument_id, timeframe, pattern_instance_id, candle_start, pattern_schema_version)
+);
+CREATE TABLE IF NOT EXISTS pattern_current (
+    instrument_id TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    pattern_instance_id TEXT NOT NULL,
+    pattern_name TEXT NOT NULL,
+    pattern_schema_version TEXT NOT NULL,
+    candle_start TEXT NOT NULL,
+    lifecycle TEXT NOT NULL,
+    is_closed INTEGER NOT NULL,
+    observation_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (instrument_id, timeframe, pattern_instance_id, pattern_schema_version)
+);
+CREATE TABLE IF NOT EXISTS structure_states (
+    instrument_id TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    candle_start TEXT NOT NULL,
+    pattern_schema_version TEXT NOT NULL,
+    is_closed INTEGER NOT NULL,
+    state_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (instrument_id, timeframe, candle_start, pattern_schema_version)
+);
+CREATE TABLE IF NOT EXISTS direction_evidence (
+    instrument_id TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    candle_start TEXT NOT NULL,
+    pattern_schema_version TEXT NOT NULL,
+    is_closed INTEGER NOT NULL,
+    evidence_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (instrument_id, timeframe, candle_start, pattern_schema_version)
+);
+CREATE TABLE IF NOT EXISTS pattern_outcomes (
+    instrument_id TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    pattern_name TEXT NOT NULL,
+    pattern_start TEXT NOT NULL,
+    horizon TEXT NOT NULL,
+    reference_price TEXT NOT NULL,
+    future_timestamp TEXT,
+    future_price TEXT,
+    absolute_move TEXT,
+    percentage_move TEXT,
+    max_favourable_move TEXT,
+    max_adverse_move TEXT,
+    time_to_reversal TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (instrument_id, timeframe, pattern_name, pattern_start, horizon)
+);
 """
 
 
@@ -52,6 +116,26 @@ class Database:
         self.connection = sqlite3.connect(self.path)
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.executescript(SCHEMA)
+        pattern_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(pattern_observations)")}
+        if pattern_columns and "pattern_instance_id" not in pattern_columns:
+            self.connection.execute("BEGIN")
+            try:
+                self.connection.execute("ALTER TABLE pattern_observations RENAME TO pattern_observations_legacy")
+                self.connection.execute("""CREATE TABLE pattern_observations (
+                    instrument_id TEXT NOT NULL, timeframe TEXT NOT NULL, candle_start TEXT NOT NULL,
+                    pattern_name TEXT NOT NULL, pattern_instance_id TEXT NOT NULL,
+                    pattern_schema_version TEXT NOT NULL, lifecycle TEXT NOT NULL, is_closed INTEGER NOT NULL,
+                    observation_json TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    PRIMARY KEY (instrument_id, timeframe, pattern_instance_id, candle_start, pattern_schema_version)
+                )""")
+                self.connection.execute(
+                    "INSERT INTO pattern_observations SELECT instrument_id, timeframe, candle_start, pattern_name, pattern_name || ':' || candle_start, pattern_schema_version, lifecycle, is_closed, observation_json, updated_at FROM pattern_observations_legacy"
+                )
+                self.connection.execute("DROP TABLE pattern_observations_legacy")
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
         version = self.connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version").fetchone()[0]
         if version < 2:
             columns = {row[1] for row in self.connection.execute("PRAGMA table_info(candles)")}
@@ -141,7 +225,7 @@ class Database:
         )
         self.connection.commit()
 
-    def list_candles(self, instrument_id: str, timeframe: str, *, through: str | None = None) -> list[Candle]:
+    def list_candles(self, instrument_id: str, timeframe: str, *, through: str | None = None, limit: int | None = None) -> list[Candle]:
         query = (
             "SELECT instrument_id, timeframe, start_at, end_at, epic, open, high, low, close, volume, is_closed, observation_count "
             "FROM candles WHERE instrument_id = ? AND timeframe = ?"
@@ -150,8 +234,15 @@ class Database:
         if through is not None:
             query += " AND start_at <= ?"
             params.append(through)
-        query += " ORDER BY start_at"
-        rows = self.connection.execute(query, params).fetchall()
+        if limit is not None:
+            if limit <= 0:
+                return []
+            query += " ORDER BY start_at DESC LIMIT ?"
+            params.append(str(limit))
+            rows = list(reversed(self.connection.execute(query, params).fetchall()))
+        else:
+            query += " ORDER BY start_at"
+            rows = self.connection.execute(query, params).fetchall()
         return [
             Candle(row[0], row[4], row[1], datetime.fromisoformat(row[2]), datetime.fromisoformat(row[3]), Decimal(row[5]), Decimal(row[6]), Decimal(row[7]), Decimal(row[8]), Decimal(row[9]) if row[9] is not None else None, bool(row[10]), int(row[11]))
             for row in rows
@@ -184,6 +275,64 @@ class Database:
         self.connection.execute(
             "INSERT INTO technical_outcomes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instrument_id, timeframe, feature_candle_start, horizon) DO UPDATE SET future_timestamp=excluded.future_timestamp, future_price=excluded.future_price, absolute_move=excluded.absolute_move, percentage_move=excluded.percentage_move, max_favourable_move=excluded.max_favourable_move, max_adverse_move=excluded.max_adverse_move",
             (instrument_id, timeframe, feature_candle_start, horizon, reference_price, future_timestamp, future_price, absolute_move, percentage_move, max_favourable_move, max_adverse_move, datetime.now(UTC).isoformat()),
+        )
+        self.connection.commit()
+
+    def save_phase2b_analysis(self, analysis: dict) -> None:
+        instrument = analysis["instrument"]
+        timeframe = analysis["timeframe"]
+        candle_start = analysis["candle_timestamp"]
+        is_closed = int(analysis["candle_state"] == "CLOSED")
+        now = datetime.now(UTC).isoformat()
+        for observation in analysis.get("candlestick_patterns", []) + analysis.get("chart_patterns", []) + analysis.get("divergences", []):
+            name = observation["pattern"]
+            instance_id = observation.get("instance_id") or f"{name}:{observation['start']}"
+            self.connection.execute(
+                "INSERT INTO pattern_observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instrument_id, timeframe, pattern_instance_id, candle_start, pattern_schema_version) DO UPDATE SET lifecycle=excluded.lifecycle, is_closed=excluded.is_closed, observation_json=excluded.observation_json, updated_at=excluded.updated_at",
+                (instrument, timeframe, candle_start, name, instance_id, PATTERN_SCHEMA_VERSION, observation.get("lifecycle", "FORMING"), is_closed, json.dumps(observation, sort_keys=True, separators=(",", ":")), now),
+            )
+            existing = self.connection.execute(
+                "SELECT lifecycle FROM pattern_current WHERE instrument_id=? AND timeframe=? AND pattern_instance_id=? AND pattern_schema_version=?",
+                (instrument, timeframe, instance_id, PATTERN_SCHEMA_VERSION),
+            ).fetchone()
+            lifecycle = observation.get("lifecycle", "FORMING")
+            if not existing or existing[0] not in {"CONFIRMED", "FAILED"} or lifecycle in {"CONFIRMED", "FAILED"}:
+                self.connection.execute(
+                    "INSERT INTO pattern_current VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instrument_id, timeframe, pattern_instance_id, pattern_schema_version) DO UPDATE SET candle_start=excluded.candle_start, lifecycle=excluded.lifecycle, is_closed=excluded.is_closed, observation_json=excluded.observation_json, updated_at=excluded.updated_at",
+                    (instrument, timeframe, instance_id, name, PATTERN_SCHEMA_VERSION, candle_start, lifecycle, is_closed, json.dumps(observation, sort_keys=True, separators=(",", ":")), now),
+                )
+        structure = analysis.get("structure", {})
+        self.connection.execute(
+            "INSERT INTO structure_states VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instrument_id, timeframe, candle_start, pattern_schema_version) DO UPDATE SET is_closed=excluded.is_closed, state_json=excluded.state_json, updated_at=excluded.updated_at",
+            (instrument, timeframe, candle_start, PATTERN_SCHEMA_VERSION, is_closed, json.dumps(structure, sort_keys=True, separators=(",", ":")), now),
+        )
+        direction = analysis.get("direction_reversal")
+        if direction is not None:
+            self.connection.execute(
+                "INSERT INTO direction_evidence VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instrument_id, timeframe, candle_start, pattern_schema_version) DO UPDATE SET is_closed=excluded.is_closed, evidence_json=excluded.evidence_json, updated_at=excluded.updated_at",
+                (instrument, timeframe, candle_start, PATTERN_SCHEMA_VERSION, is_closed, json.dumps(direction, sort_keys=True, separators=(",", ":")), now),
+            )
+        self.connection.commit()
+
+    def get_phase2b_status(self, instrument_id: str, timeframe: str) -> dict:
+        structure = self.connection.execute(
+            "SELECT state_json FROM structure_states WHERE instrument_id=? AND timeframe=? AND pattern_schema_version=? ORDER BY candle_start DESC LIMIT 1",
+            (instrument_id, timeframe, PATTERN_SCHEMA_VERSION),
+        ).fetchone()
+        patterns = self.connection.execute(
+            "SELECT observation_json FROM pattern_current WHERE instrument_id=? AND timeframe=? AND pattern_schema_version=? ORDER BY candle_start DESC, pattern_name LIMIT 50",
+            (instrument_id, timeframe, PATTERN_SCHEMA_VERSION),
+        ).fetchall()
+        direction = self.connection.execute(
+            "SELECT evidence_json FROM direction_evidence WHERE instrument_id=? AND timeframe=? AND pattern_schema_version=? ORDER BY candle_start DESC LIMIT 1",
+            (instrument_id, timeframe, PATTERN_SCHEMA_VERSION),
+        ).fetchone()
+        return {"structure": json.loads(structure[0]) if structure else None, "patterns": [json.loads(row[0]) for row in patterns], "direction_reversal": json.loads(direction[0]) if direction else None}
+
+    def save_pattern_outcome(self, *, instrument_id: str, timeframe: str, pattern_name: str, pattern_start: str, horizon: str, reference_price: str, future_timestamp: str | None = None, future_price: str | None = None, absolute_move: str | None = None, percentage_move: str | None = None, max_favourable_move: str | None = None, max_adverse_move: str | None = None, time_to_reversal: str | None = None) -> None:
+        self.connection.execute(
+            "INSERT INTO pattern_outcomes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instrument_id, timeframe, pattern_name, pattern_start, horizon) DO UPDATE SET future_timestamp=excluded.future_timestamp, future_price=excluded.future_price, absolute_move=excluded.absolute_move, percentage_move=excluded.percentage_move, max_favourable_move=excluded.max_favourable_move, max_adverse_move=excluded.max_adverse_move, time_to_reversal=excluded.time_to_reversal",
+            (instrument_id, timeframe, pattern_name, pattern_start, horizon, reference_price, future_timestamp, future_price, absolute_move, percentage_move, max_favourable_move, max_adverse_move, time_to_reversal, datetime.now(UTC).isoformat()),
         )
         self.connection.commit()
 

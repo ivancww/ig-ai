@@ -13,6 +13,7 @@ from .candles import CandleAggregator
 from .database import Database
 from .models import Instrument
 from .normalization import normalize_price_update
+from .patterns import MultiTimeframeCoordinator, Phase2BEngine
 from .streaming import IGStreamService
 from .technical import TechnicalFeatureEngine
 
@@ -48,6 +49,10 @@ class PersistedStream:
     def __post_init__(self) -> None:
         self.timeframes = ("15M", "1H", "4H", "1D")
         self.feature_engine = TechnicalFeatureEngine()
+        self.phase2b_engine = Phase2BEngine(self.feature_engine)
+        self.mtf_coordinator = MultiTimeframeCoordinator(self.phase2b_engine, max_history=600)
+        self.phase2b_runs = 0
+        self.phase2b_skipped_forming = 0
         self.aggregators = {
             timeframe: CandleAggregator(timeframe, market_timezone=self.market_timezone)
             for timeframe in self.timeframes
@@ -134,6 +139,7 @@ class PersistedStream:
             for candle in aggregator.update(observation):
                 self.database.save_candle(candle)
                 self.database.save_features_for_candle(candle, self.feature_engine)
+                self._save_phase2b_for_candle(candle)
                 self._record_candle_upsert(candle)
                 self.finalized_candles_by_instrument[instrument_id][timeframe] += 1
             forming = aggregator.forming(observation)
@@ -141,6 +147,7 @@ class PersistedStream:
                 self._forming_keys.add((instrument_id, timeframe, forming.start.isoformat()))
                 self.database.save_candle(forming)
                 self.database.save_features_for_candle(forming, self.feature_engine)
+                self._save_phase2b_for_candle(forming)
                 self._record_candle_upsert(forming)
                 self._refresh_forming_count(instrument_id, timeframe)
         return {"observation_created": "true", "skip_reason": "none"}
@@ -183,6 +190,26 @@ class PersistedStream:
         self.forming_candles_by_instrument[instrument_id][timeframe] = sum(
             1 for key in self._forming_keys if key[:2] == (instrument_id, timeframe)
         )
+
+    def _save_phase2b_for_candle(self, candle) -> None:
+        if not candle.is_closed and candle.observation_count > 1 and candle.observation_count % 10 != 0:
+            self.phase2b_skipped_forming += 1
+            return
+        histories = {
+            timeframe: self.database.list_candles(
+                candle.instrument_id,
+                timeframe,
+                through=candle.start.isoformat(),
+                limit=self.mtf_coordinator.max_history,
+            )
+            for timeframe in self.timeframes
+        }
+        coordinated = self.mtf_coordinator.analyze(histories, target_time=candle.start, target_timeframe=candle.timeframe)
+        self.phase2b_runs += 1
+        analysis = coordinated["timeframes"].get(candle.timeframe)
+        if analysis is not None:
+            analysis["direction_reversal"] = coordinated["direction_reversal"]
+            self.database.save_phase2b_analysis(analysis)
 
     @staticmethod
     def _exit_reason(stream: IGStreamService) -> str | None:
@@ -241,6 +268,7 @@ class PersistedStream:
             for candle in aggregator.flush():
                 self.database.save_candle(candle)
                 self.database.save_features_for_candle(candle, self.feature_engine)
+                self._save_phase2b_for_candle(candle)
                 self._forming_keys.add((candle.instrument_id, candle.timeframe, candle.start.isoformat()))
                 self._record_candle_upsert(candle)
                 self._refresh_forming_count(candle.instrument_id, candle.timeframe)

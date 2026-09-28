@@ -35,6 +35,9 @@ def main() -> int:
     technical_parser = commands.add_parser("technical-status")
     technical_parser.add_argument("--instrument", default=None)
     technical_parser.add_argument("--timeframe", choices=("15M", "1H", "4H", "1D"), default="1H")
+    pattern_parser = commands.add_parser("pattern-status")
+    pattern_parser.add_argument("--instrument", default=None)
+    pattern_parser.add_argument("--timeframe", choices=("15M", "1H", "4H", "1D"), default="1H")
     stream_parser = commands.add_parser("stream")
     stream_parser.add_argument("--duration", type=float, default=300.0)
     stream_parser.add_argument("--markets", default="US Tech 100,Japan 225,Hong Kong HS50")
@@ -86,6 +89,26 @@ def main() -> int:
                 print(f"BB Position: {feature['bollinger']['zone']}")
                 print(f"Structure: {feature['structure']}")
                 print(f"Candle state: {feature['candle_state']}")
+            finally:
+                database.close()
+            return 0
+        if args.command == "pattern-status":
+            settings = Settings.from_env(require_credentials=False)
+            database = Database(settings.database_path)
+            try:
+                instruments = database.list_instruments()
+                selected = args.instrument or (instruments[0][0] if instruments else None)
+                if selected is None:
+                    print("No instruments or Phase 2B observations available.")
+                    return 0
+                status = database.get_phase2b_status(selected, args.timeframe)
+                print(f"{selected} {args.timeframe}")
+                print(f"Structure: {status['structure']}")
+                print("Patterns:")
+                for pattern in status["patterns"]:
+                    print(f"  {pattern['pattern']}: {pattern.get('lifecycle')} ({pattern.get('candle_state')})")
+                print(f"Direction/reversal evidence: {status['direction_reversal']}")
+                print("Inspection only; no trading recommendation.")
             finally:
                 database.close()
             return 0
