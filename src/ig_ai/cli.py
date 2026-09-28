@@ -182,6 +182,13 @@ def main() -> int:
                             f"SUBSCRIPTION_ESTABLISHED={len(stream.stats.diagnostics.subscriptions_accepted)}/{len(stream.stats.diagnostics.control_requests)}",
                             f"DATA_OBSERVED={len(stream.stats.diagnostics.first_updates_received)}/{len(stream.stats.diagnostics.control_requests)}",
                             f"decode_diagnostics={len(stream.stats.diagnostics.safe_update_diagnostics)}",
+                            "decode_details="
+                            + " || ".join(
+                                ",".join(f"{key}={value}" for key, value in diagnostic.items())
+                                for diagnostic in stream.stats.diagnostics.safe_update_diagnostics
+                            )
+                            if stream.stats.diagnostics.safe_update_diagnostics
+                            else "NONE",
                             f"server_messages={','.join(stream.stats.diagnostics.server_messages) or 'NONE'}",
                             f"protocol_errors={','.join(stream.stats.diagnostics.protocol_errors) or 'NONE'}",
                             f"close_code={stream.stats.diagnostics.socket_close_code or 'NONE'}",

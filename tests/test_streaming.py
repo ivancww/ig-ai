@@ -308,7 +308,39 @@ def test_realistic_u_decoder_resolves_item_index_delta_and_null_empty_values():
     assert transport.diagnostics.u_messages_received == {"1"}
     diagnostic = transport.diagnostics.safe_update_diagnostics[-1]
     assert diagnostic["subscription_id"] == "1"
-    assert diagnostic["bid_decoded"] == "False"
+    assert diagnostic["item_index"] == "1"
+    assert diagnostic["schema_fields_expected"] == "BIDPRICE1,ASKPRICE1,TIMESTAMP,DLG_FLAG"
+    assert diagnostic["field_count_received"] == "4"
+    assert diagnostic["bid_present"] == "false"
+    assert diagnostic["ask_present"] == "true"
+    assert diagnostic["timestamp_present"] == "true"
+    assert diagnostic["previous_state_available"] == "true"
+    assert diagnostic["observation_created"] == "false"
+    assert diagnostic["skip_reason"] == "missing_bid_or_ask"
+    assert "100" not in str(diagnostic)
+
+
+def test_realistic_price_schema_diagnostic_marks_decoded_fields_without_values():
+    transport = object.__new__(WebSocketLightstreamerTransport)
+    transport._field_names = ["BIDPRICE1", "ASKPRICE1", "TIMESTAMP", "DLG_FLAG"]
+    transport._field_names_by_subscription = {"1": tuple(transport._field_names)}
+    transport._market_identity_by_subscription = {"1": "EPIC"}
+    transport._field_state = {}
+    transport._secrets = ()
+    transport.diagnostics = StreamDiagnostics()
+    transport.diagnostics.subscription_requests_sent["1"] = "PRICE:ACCOUNT:EPIC"
+
+    update = transport._parse("U,1,1,100|102|1760000000000|DEAL")
+
+    assert update["BIDPRICE1"] == "100" and update["ASKPRICE1"] == "102"
+    diagnostic = transport.diagnostics.safe_update_diagnostics[-1]
+    assert diagnostic["market_identity"] == "EPIC"
+    assert diagnostic["decoded_field_names_present"] == "BIDPRICE1,ASKPRICE1,TIMESTAMP,DLG_FLAG"
+    assert diagnostic["bid_present"] == "true"
+    assert diagnostic["ask_present"] == "true"
+    assert diagnostic["timestamp_present"] == "true"
+    assert diagnostic["previous_state_available"] == "false"
+    assert diagnostic["skip_reason"] == "none"
     assert "100" not in str(diagnostic)
 
 

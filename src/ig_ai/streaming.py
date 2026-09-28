@@ -214,7 +214,17 @@ class IGStreamService:
                         self.stats.diagnostics.first_updates_received.add(str(index))
                         self.stats.diagnostics.subscription_states[subscription_id] = "DATA_OBSERVED"
                     self.stats.last_update[subscription.instrument_id] = time.monotonic()
-                    on_update(update)
+                    result = on_update(update)
+                    self._sync_transport_diagnostics()
+                    for diagnostic in reversed(self.stats.diagnostics.safe_update_diagnostics):
+                        if (
+                            diagnostic.get("subscription_id") == subscription_id
+                            and diagnostic.get("item_index") == item
+                            and diagnostic.get("observation_created") == "false"
+                        ):
+                            if isinstance(result, dict):
+                                diagnostic.update(result)
+                            break
             except Exception as exc:
                 self._sync_transport_diagnostics()
                 if not self._stop.is_set():
@@ -284,6 +294,7 @@ class WebSocketLightstreamerTransport:
         self._socket = None
         self._field_names: list[str] = []
         self._field_names_by_subscription: dict[str, tuple[str, ...]] = {}
+        self._market_identity_by_subscription: dict[str, str] = {}
         self._field_state: dict[tuple[str, str], dict[str, Any]] = {}
         self._endpoint = ""
         self._session_id: str | None = None
@@ -298,6 +309,7 @@ class WebSocketLightstreamerTransport:
         self._session_id = None
         self._next_request_id = 1
         self._field_names_by_subscription = {}
+        self._market_identity_by_subscription = {}
         self._field_state = {}
         self.diagnostics = StreamDiagnostics()
         self._secrets = (username, password)
@@ -358,6 +370,7 @@ class WebSocketLightstreamerTransport:
             request_id = self._request_id()
             subscription_id = params["LS_subId"]
             self._field_names_by_subscription[subscription_id] = tuple(self._field_names)
+            self._market_identity_by_subscription[subscription_id] = params["item"].split(":")[-1]
             params = {
                 "LS_op": "add",
                 "LS_reqId": request_id,
@@ -391,6 +404,8 @@ class WebSocketLightstreamerTransport:
         self._ensure_diagnostics()
         if not hasattr(self, "_field_names_by_subscription"):
             self._field_names_by_subscription = {}
+        if not hasattr(self, "_market_identity_by_subscription"):
+            self._market_identity_by_subscription = {}
         if not hasattr(self, "_field_state"):
             self._field_state = {}
         line = raw.strip("\r\n")
@@ -433,6 +448,16 @@ class WebSocketLightstreamerTransport:
             return {"type": "UNSUB"}
         if tag == "U":
             if len(args) < 3:
+                subscription_id = args[0] if args else ""
+                self._record_update_diagnostic(
+                    subscription_id,
+                    args[1] if len(args) > 1 else "",
+                    (),
+                    {},
+                    "malformed_u_frame",
+                    field_count_received=max(0, len(args) - 2),
+                    previous_state_available=False,
+                )
                 return {"type": "U"}
             subscription_id = args[0]
             if subscription_id in self.diagnostics.subscription_requests_sent:
@@ -454,9 +479,11 @@ class WebSocketLightstreamerTransport:
         field_names = getattr(self, "_field_names_by_subscription", {}).get(subscription_id, tuple(self._field_names))
         field_state = getattr(self, "_field_state", {})
         state = field_state.setdefault((subscription_id, item), {})
+        previous_state_available = bool(state)
+        received_values = values.split("|")
         changed_fields: list[str] = []
         field_index = 0
-        for value in values.split("|"):
+        for value in received_values:
             if field_index >= len(field_names):
                 break
             if value == "":
@@ -471,7 +498,15 @@ class WebSocketLightstreamerTransport:
             elif value == "$":
                 state[field_name] = ""
             elif value.startswith("^"):
-                self._record_update_diagnostic(subscription_id, item, changed_fields, state, "unsupported_field_diff")
+                self._record_update_diagnostic(
+                    subscription_id,
+                    item,
+                    changed_fields,
+                    state,
+                    "unsupported_field_diff",
+                    field_count_received=len(received_values),
+                    previous_state_available=previous_state_available,
+                )
                 return {"type": "U", "subscription_id": subscription_id, "item": item}
             else:
                 state[field_name] = value
@@ -482,7 +517,13 @@ class WebSocketLightstreamerTransport:
         ask = state.get("OFFER") or state.get("ASKPRICE1")
         sufficient = bid not in (None, "") and ask not in (None, "")
         self._record_update_diagnostic(
-            subscription_id, item, changed_fields, state, "none" if sufficient else "missing_bid_or_ask"
+            subscription_id,
+            item,
+            changed_fields,
+            state,
+            "none" if sufficient else "missing_bid_or_ask",
+            field_count_received=len(received_values),
+            previous_state_available=previous_state_available,
         )
         return update
 
@@ -493,15 +534,33 @@ class WebSocketLightstreamerTransport:
         fields: list[str],
         state: dict[str, Any],
         skip_reason: str,
+        *,
+        field_count_received: int = 0,
+        previous_state_available: bool = False,
     ) -> None:
+        field_names = getattr(self, "_field_names_by_subscription", {}).get(subscription_id, tuple(self._field_names))
+        decoded_names = [name for name in field_names if state.get(name) not in (None, "")]
+        bid_present = state.get("BIDPRICE1") not in (None, "") or state.get("BID") not in (None, "")
+        ask_present = state.get("ASKPRICE1") not in (None, "") or state.get("OFFER") not in (None, "")
+        timestamp_present = any(
+            state.get(name) not in (None, "") for name in ("TIMESTAMP", "UPDATE_TIME", "UTM")
+        )
         self.diagnostics.safe_update_diagnostics.append(
             {
+                "market_identity": getattr(self, "_market_identity_by_subscription", {}).get(
+                    subscription_id, item
+                ),
                 "subscription_id": subscription_id,
-                "item": item,
-                "fields_present": ",".join(fields),
-                "bid_decoded": str((state.get("BID") or state.get("BIDPRICE1")) not in (None, "")),
-                "ask_decoded": str((state.get("OFFER") or state.get("ASKPRICE1")) not in (None, "")),
-                "sufficient_fields": str(skip_reason == "none"),
+                "item_index": item,
+                "schema_fields_expected": ",".join(field_names),
+                "field_count_received": str(field_count_received),
+                "decoded_field_names_present": ",".join(decoded_names),
+                "fields_changed": ",".join(fields),
+                "bid_present": str(bid_present).lower(),
+                "ask_present": str(ask_present).lower(),
+                "timestamp_present": str(timestamp_present).lower(),
+                "previous_state_available": str(previous_state_available).lower(),
+                "observation_created": "false",
                 "skip_reason": skip_reason,
             }
         )

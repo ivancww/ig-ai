@@ -51,14 +51,24 @@ class PersistedStream:
         self._seen_observations: set[tuple] = set()
         self.safe_skip_diagnostics: list[dict[str, str]] = []
 
-    def on_update(self, update: dict) -> None:
+    def on_update(self, update: dict) -> dict[str, str]:
         if update.get("type") in {"PROBE", "SUB", "UNSUB"}:
-            return
+            return {"observation_created": "false", "skip_reason": "lifecycle_message"}
         instrument_id = str(update.get("instrument_id") or "")
         instrument = self.instruments.get(instrument_id)
         if instrument is None:
             self.safe_skip_diagnostics.append({"reason": "unknown_instrument"})
-            return
+            return {"observation_created": "false", "skip_reason": "unknown_instrument"}
+        timestamp_value = (
+            update.get("UPDATE_TIME")
+            or update.get("UPDATE_TIMESTAMP")
+            or update.get("PROVIDER_TIMESTAMP")
+            or update.get("TIMESTAMP")
+            or update.get("timestamp")
+        )
+        if timestamp_value in (None, ""):
+            self.safe_skip_diagnostics.append({"instrument_id": instrument_id, "reason": "missing_timestamp"})
+            return {"observation_created": "false", "skip_reason": "missing_timestamp"}
         try:
             observation = normalize_price_update(
                 update,
@@ -68,13 +78,13 @@ class PersistedStream:
             )
         except (TypeError, ValueError):
             self.safe_skip_diagnostics.append({"instrument_id": instrument_id, "reason": "invalid_timestamp_or_price"})
-            return
+            return {"observation_created": "false", "skip_reason": "invalid_timestamp_or_price"}
         if observation.mid is None:
             self.safe_skip_diagnostics.append({"instrument_id": instrument_id, "reason": "missing_bid_or_ask"})
-            return
+            return {"observation_created": "false", "skip_reason": "missing_bid_or_ask"}
         signature = (observation.instrument_id, observation.timestamp, observation.bid, observation.offer)
         if signature in self._seen_observations:
-            return
+            return {"observation_created": "false", "skip_reason": "duplicate_observation"}
         self._seen_observations.add(signature)
         self.database.save_observation(observation)
         self.observations_written += 1
@@ -87,6 +97,7 @@ class PersistedStream:
             if forming:
                 self.database.save_candle(forming)
                 self.candles_written[timeframe] += 1
+        return {"observation_created": "true", "skip_reason": "none"}
 
     def run_for(self, stream: IGStreamService, duration: float) -> None:
         worker = threading.Thread(target=stream.run, args=(self.on_update,), daemon=True)

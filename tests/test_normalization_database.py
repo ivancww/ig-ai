@@ -73,6 +73,14 @@ def test_persisted_stream_writes_observation_and_both_forming_candles(tmp_path):
     assert db.connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
     assert db.connection.execute("SELECT COUNT(*) FROM candles WHERE timeframe = '15M'").fetchone()[0] == 1
     assert db.connection.execute("SELECT COUNT(*) FROM candles WHERE timeframe = '1H'").fetchone()[0] == 1
+    assert sink.on_update(
+        {
+            "instrument_id": "EPIC",
+            "BIDPRICE1": "bad-price",
+            "ASKPRICE1": "102",
+            "TIMESTAMP": "1760000000000",
+        }
+    ) == {"observation_created": "false", "skip_reason": "invalid_timestamp_or_price"}
     db.close()
 
 
@@ -90,4 +98,23 @@ def test_persisted_stream_records_safe_skip_reason_without_update_values(tmp_pat
     )
     assert sink.safe_skip_diagnostics == [{"instrument_id": "EPIC", "reason": "missing_bid_or_ask"}]
     assert "CST-private-token" not in str(sink.safe_skip_diagnostics)
+    db.close()
+
+
+def test_persisted_stream_classifies_null_price_snapshot_as_missing_timestamp(tmp_path):
+    db = Database(tmp_path / "null-snapshot.sqlite3")
+    instrument = Instrument("EPIC", "EPIC", "Market")
+    sink = PersistedStream(db, {instrument.instrument_id: instrument})
+
+    result = sink.on_update(
+        {
+            "instrument_id": "EPIC",
+            "item": "1",
+            "subscription_id": "1",
+            "BIDPRICE1": None,
+        }
+    )
+
+    assert result == {"observation_created": "false", "skip_reason": "missing_timestamp"}
+    assert sink.safe_skip_diagnostics == [{"instrument_id": "EPIC", "reason": "missing_timestamp"}]
     db.close()
