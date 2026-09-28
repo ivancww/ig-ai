@@ -385,6 +385,33 @@ def test_u_parser_decodes_each_pipe_field_without_decoding_field_boundaries():
     assert update["ASKPRICE1"] == "102|50"
 
 
+def test_u_parser_decodes_an_additionally_encoded_final_field_argument():
+    transport = object.__new__(WebSocketLightstreamerTransport)
+    transport._field_names = ["BIDPRICE1", "ASKPRICE1", "TIMESTAMP", "DLG_FLAG"]
+    transport._field_names_by_subscription = {"1": tuple(transport._field_names)}
+    transport._market_identity_by_subscription = {"1": "EPIC"}
+    transport._field_state = {}
+    transport._secrets = ()
+    transport.diagnostics = StreamDiagnostics()
+    transport.diagnostics.subscription_requests_sent["1"] = "PRICE:ACCOUNT:EPIC"
+
+    update = transport._parse(
+        "U,1,1,100%257C102%257C1760000000000%257CTRADEABLE"
+    )
+
+    assert update["BIDPRICE1"] == "100"
+    assert update["ASKPRICE1"] == "102"
+    assert update["TIMESTAMP"] == "1760000000000"
+    assert update["DLG_FLAG"] == "TRADEABLE"
+    diagnostic = transport.diagnostics.safe_update_diagnostics[-1]
+    assert diagnostic["u_argument_count"] == "3"
+    assert diagnostic["encoded_field_token_count"] == "1"
+    assert diagnostic["decoded_field_count"] == "4"
+    assert diagnostic["percent_escape_count"] == "3"
+    assert diagnostic["compression_marker_count"] == "0"
+    assert "100" not in str(diagnostic)
+
+
 def test_decoder_keeps_subscription_and_item_state_isolated():
     transport = object.__new__(WebSocketLightstreamerTransport)
     transport._field_names = []

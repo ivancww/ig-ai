@@ -480,18 +480,9 @@ class WebSocketLightstreamerTransport:
         field_state = getattr(self, "_field_state", {})
         state = field_state.setdefault((subscription_id, item), {})
         previous_state_available = bool(state)
-        encoded_values_list = encoded_values.split("|")
-        # TLCP keeps the final U argument intact during first-pass parsing and
-        # percent-decodes each field value during second-level decoding. Some
-        # IG runtime frames URL-encode the whole field list, including its
-        # pipes; accept that provider form when no literal field separator is
-        # present, without changing the standard handling of encoded pipes in
-        # an individual field value.
-        if len(encoded_values_list) == 1 and "%7c" in encoded_values.lower():
-            decoded_values = unquote(encoded_values)
-            received_values = decoded_values.split("|")
-        else:
-            received_values = [unquote(value) for value in encoded_values_list]
+        encoded_values_list, received_values, percent_escape_count, compression_marker_count = (
+            self._decode_u_field_list(encoded_values, len(field_names))
+        )
         changed_fields: list[str] = []
         field_index = 0
         for value in received_values:
@@ -538,6 +529,9 @@ class WebSocketLightstreamerTransport:
             u_argument_count=len(args),
             encoded_field_token_count=len(encoded_values_list),
             decoded_field_count=len(received_values),
+            final_argument_length=len(encoded_values),
+            percent_escape_count=percent_escape_count,
+            compression_marker_count=compression_marker_count,
         )
         return update
 
@@ -554,6 +548,9 @@ class WebSocketLightstreamerTransport:
         u_argument_count: int = 0,
         encoded_field_token_count: int = 0,
         decoded_field_count: int = 0,
+        final_argument_length: int = 0,
+        percent_escape_count: int = 0,
+        compression_marker_count: int = 0,
     ) -> None:
         field_names = getattr(self, "_field_names_by_subscription", {}).get(subscription_id, tuple(self._field_names))
         decoded_names = [name for name in field_names if state.get(name) not in (None, "")]
@@ -574,6 +571,9 @@ class WebSocketLightstreamerTransport:
                 "encoded_field_token_count": str(encoded_field_token_count),
                 "decoded_field_count": str(decoded_field_count),
                 "field_count_received": str(field_count_received),
+                "final_argument_length": str(final_argument_length),
+                "percent_escape_count": str(percent_escape_count),
+                "compression_marker_count": str(compression_marker_count),
                 "decoded_field_names_present": ",".join(decoded_names),
                 "fields_changed": ",".join(fields),
                 "bid_present": str(bid_present).lower(),
@@ -583,6 +583,48 @@ class WebSocketLightstreamerTransport:
                 "observation_created": "false",
                 "skip_reason": skip_reason,
             }
+        )
+
+    @staticmethod
+    def _decode_u_field_list(
+        encoded_values: str, expected_field_count: int
+    ) -> tuple[list[str], list[str], int, int]:
+        """Decode TLCP's variable-length final U argument safely.
+
+        The normal TLCP form contains literal pipes. Some IG websocket paths
+        apply an additional URL-encoding layer to the complete final argument,
+        so a structural pipe can arrive as ``%257C``. Decode only enough layers
+        to expose separators, and use the subscribed schema cardinality to
+        avoid mistaking a percent-encoded pipe inside one field for a boundary.
+        """
+        encoded_field_tokens = encoded_values.split("|")
+        candidate = encoded_values
+        candidate_tokens = encoded_field_tokens
+        for _ in range(3):
+            if "|" in candidate:
+                break
+            decoded_candidate = unquote(candidate)
+            if decoded_candidate == candidate:
+                break
+            candidate = decoded_candidate
+            candidate_tokens = candidate.split("|")
+            if len(candidate_tokens) > 1 and len(candidate_tokens) <= expected_field_count:
+                break
+
+        if len(candidate_tokens) > expected_field_count and len(encoded_field_tokens) == 1:
+            candidate = encoded_values
+            candidate_tokens = encoded_field_tokens
+
+        received_values = [unquote(value) for value in candidate_tokens]
+        percent_escape_count = len(re.findall(r"%[0-9A-Fa-f]{2}", encoded_values))
+        compression_marker_count = sum(
+            1 for value in received_values if value.startswith("^")
+        )
+        return (
+            encoded_field_tokens,
+            received_values,
+            percent_escape_count,
+            compression_marker_count,
         )
 
     def _send_request(self, name: str, params: dict[str, str] | None = None) -> None:
