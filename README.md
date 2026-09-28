@@ -37,6 +37,7 @@ ig-ai discover         # searches US Tech 100, Japan 225, Hong Kong HS50
 ig-ai stream --duration 300  # three-market LIVE read-only Lightstreamer validation
 ig-ai phase1-check      # offline final acceptance; does not start a LIVE run
 ig-ai technical-status  # inspect the latest persisted feature record (no BUY/SELL output)
+ig-ai pattern-status    # inspect structure, patterns, and evidence states (read-only)
 igai-report            # prints and refreshes the unified Codex/runtime report
 igai-report --run pytest -q
 igai-report --run ruff check .
@@ -67,4 +68,4 @@ Real IG verification status is recorded only from read-only runtime evidence. Ru
 
 ## Phase 1 limitations and next phase
 
-Phase 2A implements deterministic EMA, RSI, MACD, Bollinger Bands, ATR, candle geometry, objective gaps, confirmed/candidate swing primitives, rolling support/resistance inputs, synchronized divergence inputs, versioned SQLite feature upserts, and an outcome schema that stays empty until future candles exist. Gap detection compares adjacent completed candles within the same 15M, 1H, 4H, or 1D timeframe; session-boundary interpretation and breakaway, runaway, exhaustion, and island-reversal classifications are deferred. It does not implement candlestick libraries, chart-pattern lifecycles, direction scores, probabilities, alerts, news/macro regimes, backtesting, model calibration, automatic trading, or a production daemon supervisor. The automated suite does not claim LIVE streaming PASS: that status requires running `ig-ai stream --duration 300` against the real read-only LIVE account and reviewing the Terminal / Runtime Report. All current operations remain read-only.
+Phase 2A implements deterministic EMA, RSI, MACD, Bollinger Bands, ATR, candle geometry, objective gaps, confirmed/candidate swing primitives, rolling support/resistance inputs, synchronized divergence inputs, versioned SQLite feature upserts, and an outcome schema that stays empty until future candles exist. Phase 2B adds deterministic candlestick, structure, chart-pattern, divergence, and multi-timeframe evidence foundations. Lifecycle states are FORMING, POTENTIAL, NEAR_CONFIRMATION, CONFIRMED, or FAILED; evidence is not a probability and does not produce BUY/SELL recommendations. Gap detection compares adjacent completed candles within the same 15M, 1H, 4H, or 1D timeframe; session-boundary interpretation and breakaway, runaway, exhaustion, and island-reversal classifications are deferred. News, macro, AI APIs, alerts, backtesting, automatic trading, and a production daemon supervisor remain out of scope. All current operations remain read-only.

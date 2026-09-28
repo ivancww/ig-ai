@@ -13,6 +13,7 @@ from .candles import CandleAggregator
 from .database import Database
 from .models import Instrument
 from .normalization import normalize_price_update
+from .patterns import Phase2BEngine
 from .streaming import IGStreamService
 from .technical import TechnicalFeatureEngine
 
@@ -48,6 +49,7 @@ class PersistedStream:
     def __post_init__(self) -> None:
         self.timeframes = ("15M", "1H", "4H", "1D")
         self.feature_engine = TechnicalFeatureEngine()
+        self.phase2b_engine = Phase2BEngine(self.feature_engine)
         self.aggregators = {
             timeframe: CandleAggregator(timeframe, market_timezone=self.market_timezone)
             for timeframe in self.timeframes
@@ -134,6 +136,7 @@ class PersistedStream:
             for candle in aggregator.update(observation):
                 self.database.save_candle(candle)
                 self.database.save_features_for_candle(candle, self.feature_engine)
+                self.database.save_phase2b_analysis(self.phase2b_engine.analyze(self.database.list_candles(candle.instrument_id, candle.timeframe, through=candle.start.isoformat())))
                 self._record_candle_upsert(candle)
                 self.finalized_candles_by_instrument[instrument_id][timeframe] += 1
             forming = aggregator.forming(observation)
@@ -141,6 +144,7 @@ class PersistedStream:
                 self._forming_keys.add((instrument_id, timeframe, forming.start.isoformat()))
                 self.database.save_candle(forming)
                 self.database.save_features_for_candle(forming, self.feature_engine)
+                self.database.save_phase2b_analysis(self.phase2b_engine.analyze(self.database.list_candles(forming.instrument_id, forming.timeframe, through=forming.start.isoformat())))
                 self._record_candle_upsert(forming)
                 self._refresh_forming_count(instrument_id, timeframe)
         return {"observation_created": "true", "skip_reason": "none"}
@@ -241,6 +245,7 @@ class PersistedStream:
             for candle in aggregator.flush():
                 self.database.save_candle(candle)
                 self.database.save_features_for_candle(candle, self.feature_engine)
+                self.database.save_phase2b_analysis(self.phase2b_engine.analyze(self.database.list_candles(candle.instrument_id, candle.timeframe, through=candle.start.isoformat())))
                 self._forming_keys.add((candle.instrument_id, candle.timeframe, candle.start.isoformat()))
                 self._record_candle_upsert(candle)
                 self._refresh_forming_count(candle.instrument_id, candle.timeframe)
