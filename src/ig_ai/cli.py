@@ -49,10 +49,20 @@ def main() -> int:
     direction_parser = commands.add_parser("direction-status")
     direction_parser.add_argument("--instrument", default=None)
     direction_parser.add_argument("--timeframe", choices=("15M", "1H", "4H", "1D"), default="1H")
+    alerts_parser = commands.add_parser("alerts")
+    alerts_parser.add_argument("--instrument", default=None)
+    alerts_parser.add_argument("--priority", choices=("INFO", "WATCH", "WARNING", "CRITICAL"), default=None)
+    alerts_parser.add_argument("--limit", type=int, default=20)
+    monitor_status_parser = commands.add_parser("monitor-status")
+    monitor_status_parser.add_argument("--instrument", default=None)
     stream_parser = commands.add_parser("stream")
     stream_parser.add_argument("--duration", type=float, default=300.0)
     stream_parser.add_argument("--markets", default="US Tech 100,Japan 225,Hong Kong HS50")
     stream_parser.add_argument("--verbose", action="store_true")
+    monitor_parser = commands.add_parser("monitor", help="run the read-only monitor for a wall-clock duration in seconds")
+    monitor_parser.add_argument("--duration", type=float, default=3600.0)
+    monitor_parser.add_argument("--markets", default="US Tech 100,Japan 225,Hong Kong HS50")
+    monitor_parser.add_argument("--verbose", action="store_true")
     smoke_parser = commands.add_parser("stream-smoke")
     smoke_parser.add_argument("--duration", type=float, default=60.0)
     args = parser.parse_args()
@@ -160,6 +170,32 @@ def main() -> int:
             finally:
                 database.close()
             return 0
+        if args.command == "alerts":
+            settings = Settings.from_env(require_credentials=False)
+            database = Database(settings.database_path)
+            try:
+                for alert in database.list_alerts(args.instrument, args.priority, max(1, args.limit)):
+                    print(f"[{alert['priority']}] {alert['instrument']} {alert['alert_type']} {alert['created_at']}")
+                    print(alert["message"])
+                    print()
+            finally:
+                database.close()
+            return 0
+        if args.command == "monitor-status":
+            settings = Settings.from_env(require_credentials=False)
+            database = Database(settings.database_path)
+            try:
+                status = database.get_monitor_status(args.instrument)
+                print(f"Accepted monitor states: {len(status['states'])}")
+                print(f"Alert count: {status['alert_count']}")
+                for state in status["states"]:
+                    print(f"{state.get('instrument')}: {state.get('model_reference')} direction={state.get('direction')} stage={state.get('trend_stage')} risk={(state.get('reversal_risk') or {}).get('category')}")
+                if status["last_alert"]:
+                    print(f"Last alert: {status['last_alert']['alert_type']} ({status['last_alert']['priority']}) at {status['last_alert']['created_at']}")
+                print("Process liveness is not reported unless an external monitor provides it.")
+            finally:
+                database.close()
+            return 0
         client = IGRestClient(Settings.from_env())
         if args.command == "rest-check":
             client.authenticate()
@@ -220,7 +256,7 @@ def main() -> int:
                 output="\n".join(safe_results),
                 secrets=(client.settings.api_key, client.settings.username, client.settings.password),
             )
-        elif args.command == "stream":
+        elif args.command in {"stream", "monitor"}:
             if args.duration <= 0:
                 raise ValueError("--duration must be positive")
             groups = discover_market_groups(client)
