@@ -29,6 +29,7 @@ class DirectionWeights:
     divergence: float = 5.0
     support_breakout: float = 4.0
     volatility: float = 3.0
+    forming_discount: float = 0.5
 
     def as_dict(self) -> dict[str, float | str]:
         return {key: value for key, value in self.__dict__.items()}
@@ -53,13 +54,16 @@ class DirectionScoreEngine:
         return "NEUTRAL"
 
     @staticmethod
-    def _add(ledger: list[dict[str, Any]], *, evidence_type: str, timeframe: str, direction: str, weight: float, raw_state: Any, timestamp: str | None, confirmed: bool) -> None:
-        if direction not in {"UP", "DOWN"} or not weight:
+    def _add(ledger: list[dict[str, Any]], *, evidence_type: str, timeframe: str, direction: str, weight: float, raw_state: Any, timestamp: str | None, confirmed: bool, forming_discount: float) -> None:
+        if not weight:
             return
-        ledger.append({"evidence_type": evidence_type, "timeframe": timeframe, "direction": direction, "weight": round(weight, 4), "raw_state": raw_state, "timestamp": timestamp, "confirmed": confirmed})
+        applied = weight if confirmed else weight * forming_discount
+        if direction not in {"UP", "DOWN"}:
+            applied = 0.0
+        ledger.append({"evidence_type": evidence_type, "timeframe": timeframe, "direction": direction, "weight": round(weight, 4), "applied_weight": round(applied, 4), "raw_state": raw_state, "timestamp": timestamp, "confirmed": confirmed, "provisional": not confirmed})
 
     def _score_component(self, ledger: list[dict[str, Any]], evidence_type: str, timeframe: str, state: str, weight: float, timestamp: str | None, confirmed: bool) -> None:
-        self._add(ledger, evidence_type=evidence_type, timeframe=timeframe, direction=state, weight=weight, raw_state=state, timestamp=timestamp, confirmed=confirmed)
+        self._add(ledger, evidence_type=evidence_type, timeframe=timeframe, direction=state, weight=weight, raw_state=state, timestamp=timestamp, confirmed=confirmed, forming_discount=self.weights.forming_discount)
 
     def _patterns_direction(self, analysis: dict[str, Any]) -> str:
         up = down = 0
@@ -122,22 +126,29 @@ class DirectionScoreEngine:
         volatility = technical.get("atr14", {})
         bollinger = technical.get("bollinger", {})
         ledger.extend([
-            {"evidence_type": "ATR_VOLATILITY", "timeframe": "1H", "direction": "NEUTRAL", "weight": weights.volatility, "raw_state": volatility.get("recent_comparison"), "timestamp": timestamp or primary.get("candle_timestamp"), "confirmed": primary.get("candle_state") == "CLOSED"},
-            {"evidence_type": "BOLLINGER_CONTEXT", "timeframe": "1H", "direction": "NEUTRAL", "weight": 0.0, "raw_state": bollinger.get("zone"), "timestamp": timestamp or primary.get("candle_timestamp"), "confirmed": primary.get("candle_state") == "CLOSED"},
+            {"evidence_type": "ATR_VOLATILITY", "timeframe": "1H", "direction": "NEUTRAL", "weight": weights.volatility, "applied_weight": 0.0, "raw_state": volatility.get("recent_comparison"), "timestamp": timestamp or primary.get("candle_timestamp"), "confirmed": primary.get("candle_state") == "CLOSED", "provisional": primary.get("candle_state") != "CLOSED"},
+            {"evidence_type": "BOLLINGER_CONTEXT", "timeframe": "1H", "direction": "NEUTRAL", "weight": 0.0, "applied_weight": 0.0, "raw_state": bollinger.get("zone"), "timestamp": timestamp or primary.get("candle_timestamp"), "confirmed": primary.get("candle_state") == "CLOSED", "provisional": primary.get("candle_state") != "CLOSED"},
         ])
-        up = sum(item["weight"] for item in ledger if item["direction"] == "UP")
-        down = sum(item["weight"] for item in ledger if item["direction"] == "DOWN")
-        evidence_total = up + down
-        up_score = round(50.0 if evidence_total == 0 else 100 * up / evidence_total, 2)
-        down_score = round(50.0 if evidence_total == 0 else 100 * down / evidence_total, 2)
-        direction = "UP" if up_score > down_score else "DOWN" if down_score > up_score else "NEUTRAL"
+        up = sum(item["applied_weight"] for item in ledger if item["direction"] == "UP")
+        down = sum(item["applied_weight"] for item in ledger if item["direction"] == "DOWN")
+        total_weight = sum((weights.primary_structure, weights.higher_structure, weights.broader_structure, weights.early_confirmation, weights.ema_structure, weights.macd, weights.rsi, weights.patterns, weights.divergence, weights.support_breakout))
+        confirmed_weight = sum(item["applied_weight"] for item in ledger if item["confirmed"] and item["direction"] in {"UP", "DOWN"})
+        forming_weight = sum(item["applied_weight"] for item in ledger if item["provisional"] and item["direction"] in {"UP", "DOWN"})
+        directional_weight = up + down
+        up_score = round(100 * up / total_weight, 2) if total_weight else 0.0
+        down_score = round(100 * down / total_weight, 2) if total_weight else 0.0
+        coverage = {"available_weight": round(directional_weight, 4), "total_weight": round(total_weight, 4), "ratio": round(directional_weight / total_weight, 4) if total_weight else 0.0, "confirmed_weight": round(confirmed_weight, 4), "forming_weight": round(forming_weight, 4)}
+        direction = primary_trend if primary_trend != "NEUTRAL" else "UP" if up_score > down_score else "DOWN" if down_score > up_score else "NEUTRAL"
 
         warning = self._warning_evidence(timeframes, primary_trend)
         closed_primary = primary.get("candle_state") == "CLOSED"
-        labels = {point.get("classification") for point in primary_structure.get("confirmed_highs", [])[-2:] + primary_structure.get("confirmed_lows", [])[-2:]}
-        if closed_primary and {"LH", "LL"} <= labels:
+        current_direction = primary_structure.get("current_direction") or primary_trend
+        prior_direction = self._prior_direction(primary_structure)
+        reversal = prior_direction in {"UP", "DOWN"} and current_direction in {"UP", "DOWN"} and prior_direction != current_direction
+        bos_against_prior = primary_structure.get("break_of_structure") and primary_structure.get("breakout_direction") in {"UP", "DOWN"} and prior_direction in {"UP", "DOWN"} and primary_structure.get("breakout_direction") != prior_direction
+        if closed_primary and reversal:
             stage = "REVERSAL_CONFIRMED"
-        elif closed_primary and primary_structure.get("break_of_structure"):
+        elif closed_primary and bos_against_prior:
             stage = "REVERSAL_WATCH"
         elif warning["strong"]:
             stage = "EXHAUSTION_RISK"
@@ -152,7 +163,20 @@ class DirectionScoreEngine:
         risk = "VERY_HIGH" if risk_score >= 75 else "HIGH" if risk_score >= 50 else "MODERATE" if risk_score >= 25 else "LOW"
         agreement = self._agreement(timeframes, primary_trend)
         holding = self._holding_window(stage, risk, agreement, technical.get("atr14", {}))
-        return {"schema_version": DIRECTION_SCHEMA_VERSION, "score_version": self.weights.version, "instrument": primary.get("instrument"), "timeframe": "1H", "candle_timestamp": primary.get("candle_timestamp"), "candle_state": primary.get("candle_state", "FORMING"), "direction": direction, "up_score": up_score, "down_score": down_score, "trend_stage": stage, "holding_window": holding, "reversal_risk": {"category": risk, "score": risk_score, "evidence": warning["items"]}, "timeframe_agreement": agreement, "evidence_ledger": ledger, "technical_score_only": True, "calibrated_probability": None, "recommendation": None}
+        reference_timestamp = primary.get("candle_timestamp")
+        return {"schema_version": DIRECTION_SCHEMA_VERSION, "score_version": self.weights.version, "instrument": primary.get("instrument"), "timeframe": "1H", "candle_timestamp": reference_timestamp, "model_reference": {"timeframe": "1H", "candle_timestamp": reference_timestamp, "candle_state": primary.get("candle_state", "FORMING")}, "candle_state": primary.get("candle_state", "FORMING"), "direction": direction, "up_score": up_score, "down_score": down_score, "coverage": coverage, "trend_stage": stage, "holding_window": holding, "reversal_risk": {"category": risk, "score": risk_score, "evidence": warning["items"]}, "timeframe_agreement": agreement, "evidence_ledger": ledger, "technical_score_only": True, "calibrated_probability": None, "recommendation": None}
+
+    def _prior_direction(self, structure: dict[str, Any]) -> str:
+        explicit = structure.get("prior_direction")
+        if explicit in {"UP", "DOWN"}:
+            return explicit
+        prior_points = structure.get("confirmed_highs", [])[-3:-1] + structure.get("confirmed_lows", [])[-3:-1]
+        labels = {point.get("classification") for point in prior_points}
+        if {"HH", "HL"} <= labels:
+            return "UP"
+        if {"LH", "LL"} <= labels:
+            return "DOWN"
+        return "NEUTRAL"
 
     def _warning_evidence(self, timeframes: dict[str, dict[str, Any]], primary_trend: str) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
@@ -161,17 +185,19 @@ class DirectionScoreEngine:
         opposite = "DOWN" if primary_trend == "UP" else "UP" if primary_trend == "DOWN" else "NEUTRAL"
         if self._trend(early.get("structure")) == opposite:
             items.append({"type": "15M_STRUCTURE_OPPOSITE", "timeframe": "15M", "confirmed": early.get("candle_state") == "CLOSED"})
-            warning_score += 20
+            warning_score += 20 if early.get("candle_state") == "CLOSED" else 10
         if any(("Bearish" if primary_trend == "UP" else "Bullish") in item.get("pattern", "") for item in early.get("divergences", [])):
             items.append({"type": "15M_DIVERGENCE", "timeframe": "15M", "confirmed": all(item.get("lifecycle") == "CONFIRMED" for item in early.get("divergences", []))})
-            warning_score += 20
+            warning_score += 20 if early.get("candle_state") == "CLOSED" else 10
         macd = timeframes.get("1H", {}).get("context", {}).get("macd", {})
-        if macd.get("histogram_state") == "weakening":
+        macd_aligned = (primary_trend == "UP" and macd.get("polarity") == "positive") or (primary_trend == "DOWN" and macd.get("polarity") == "negative")
+        if macd.get("histogram_state") == "weakening" and macd_aligned:
             items.append({"type": "1H_MACD_WEAKENING", "timeframe": "1H", "confirmed": timeframes.get("1H", {}).get("candle_state") == "CLOSED"})
-            warning_score += 15
-        if timeframes.get("1H", {}).get("structure", {}).get("false_breakout"):
-            items.append({"type": "1H_FAILED_BREAKOUT", "timeframe": "1H", "confirmed": timeframes.get("1H", {}).get("candle_state") == "CLOSED"})
-            warning_score += 25
+            warning_score += 15 if timeframes.get("1H", {}).get("candle_state") == "CLOSED" else 8
+        failed_direction = timeframes.get("1H", {}).get("structure", {}).get("false_breakout_direction")
+        if timeframes.get("1H", {}).get("structure", {}).get("false_breakout") and failed_direction == primary_trend:
+            items.append({"type": "1H_FAILED_BREAKOUT", "timeframe": "1H", "direction": failed_direction, "confirmed": timeframes.get("1H", {}).get("candle_state") == "CLOSED"})
+            warning_score += 25 if timeframes.get("1H", {}).get("candle_state") == "CLOSED" else 12
         return {"score": warning_score, "items": items, "moderate": warning_score >= 15, "strong": warning_score >= 40}
 
     def _agreement(self, timeframes: dict[str, dict[str, Any]], primary: str) -> dict[str, Any]:

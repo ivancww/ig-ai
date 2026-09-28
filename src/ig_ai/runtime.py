@@ -211,8 +211,12 @@ class PersistedStream:
             analysis["direction_reversal"] = coordinated["direction_reversal"]
             self.database.save_phase2b_analysis(analysis)
             direction = dict(coordinated["direction_score"])
-            direction.update({"instrument": candle.instrument_id, "timeframe": candle.timeframe, "candle_timestamp": candle.start.isoformat(), "candle_state": "CLOSED" if candle.is_closed else "FORMING"})
-            self.database.save_direction_snapshot(direction)
+            # A direction snapshot is a primary 1H model record.  Early
+            # runtime ticks may not yet have a usable 1H analysis; those
+            # Phase 2B records remain valid without inventing a snapshot.
+            if direction.get("instrument") and direction.get("candle_timestamp"):
+                direction["trigger"] = {"timeframe": candle.timeframe, "candle_timestamp": candle.start.isoformat(), "candle_state": "CLOSED" if candle.is_closed else "FORMING"}
+                self.database.save_direction_snapshot(direction)
 
     @staticmethod
     def _exit_reason(stream: IGStreamService) -> str | None:
