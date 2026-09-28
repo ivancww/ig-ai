@@ -48,9 +48,18 @@ def _bear(candle: Candle) -> bool:
     return candle.close < candle.open
 
 
+def _prior_trend(candles: list[Candle], index: int, direction: str, length: int = 3) -> bool:
+    if index < length:
+        return False
+    closes = [float(c.close) for c in candles[index - length:index]]
+    pairs = zip(closes, closes[1:], strict=False)
+    return all(left < right for left, right in pairs) if direction == "up" else all(left > right for left, right in pairs)
+
+
 def _record(name: str, candle: Candle, lifecycle: str, evidence: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "schema_version": PATTERN_SCHEMA_VERSION, "pattern": name,
+        "instance_id": f"{name}:{candle.start.isoformat()}",
         "instrument": candle.instrument_id, "timeframe": candle.timeframe,
         "start": candle.start.isoformat(), "end": candle.end.isoformat(),
         "lifecycle": lifecycle, "candle_state": "CLOSED" if candle.is_closed else "FORMING",
@@ -94,13 +103,15 @@ class CandlestickPatternEngine:
         if current["range"] and current["upper"] / current["range"] <= self.config.marubozu_wick_ratio and current["lower"] / current["range"] <= self.config.marubozu_wick_ratio:
             add("Marubozu", direction="bullish" if _bull(target) else "bearish" if _bear(target) else "neutral")
         if current["body"] and current["lower"] >= 2 * current["body"] and current["upper"] <= current["body"] * 0.5:
-            add("Hammer")
-            if index > 0 and _bear(candles[index - 1]):
-                add("Hanging Man")
+            if _prior_trend(candles, index, "down"):
+                add("Hammer", prior_trend="down")
+            if _prior_trend(candles, index, "up"):
+                add("Hanging Man", prior_trend="up")
         if current["body"] and current["upper"] >= 2 * current["body"] and current["lower"] <= current["body"] * 0.5:
-            add("Inverted Hammer")
-            if index > 0 and _bull(candles[index - 1]):
-                add("Shooting Star")
+            if _prior_trend(candles, index, "down"):
+                add("Inverted Hammer", prior_trend="down")
+            if _prior_trend(candles, index, "up"):
+                add("Shooting Star", prior_trend="up")
 
         if index >= 1:
             previous = candles[index - 1]
@@ -209,41 +220,45 @@ class ChartPatternEngine:
         output: list[dict[str, Any]] = []
         tolerance = 0.03
 
-        def emit(name: str, points: list[dict[str, Any]], level: float | None = None, lifecycle: str = "POTENTIAL") -> None:
-            output.append({"schema_version": PATTERN_SCHEMA_VERSION, "pattern": name, "instrument": target.instrument_id, "timeframe": target.timeframe, "start": points[0]["timestamp"], "end": target.end.isoformat(), "swing_points": points, "lifecycle": lifecycle if target.is_closed else "FORMING", "confirmation_level": level, "invalidation_level": None if level is None else level, "context": {"candle_state": "CLOSED" if target.is_closed else "FORMING"}})
+        def emit(name: str, points: list[dict[str, Any]], level: float | None = None, lifecycle: str = "POTENTIAL", invalidation: float | None = None) -> None:
+            output.append({"schema_version": PATTERN_SCHEMA_VERSION, "pattern": name, "instance_id": f"{name}:{points[0]['timestamp']}", "instrument": target.instrument_id, "timeframe": target.timeframe, "start": points[0]["timestamp"], "end": target.end.isoformat(), "swing_points": points, "lifecycle": lifecycle if target.is_closed else "FORMING", "confirmation_level": level, "invalidation_level": invalidation, "context": {"candle_state": "CLOSED" if target.is_closed else "FORMING"}})
 
         if len(highs) >= 2:
             pair = highs[-2:]
             level = min((float(p["price"]) for p in lows if pair[0]["timestamp"] < p["timestamp"] < pair[1]["timestamp"]), default=None)
             if abs(float(pair[0]["price"]) - float(pair[1]["price"])) <= tolerance * max(float(pair[0]["price"]), 1):
                 lifecycle = "FAILED" if float(target.close) > max(float(p["price"]) for p in pair) else "CONFIRMED" if level is not None and float(target.close) < level else "NEAR_CONFIRMATION" if level is not None else "POTENTIAL"
-                emit("Double Top", pair, level, lifecycle)
+                emit("Double Top", pair, level, lifecycle, max(float(p["price"]) for p in pair))
         if len(lows) >= 2:
             pair = lows[-2:]
             level = max((float(p["price"]) for p in highs if pair[0]["timestamp"] < p["timestamp"] < pair[1]["timestamp"]), default=None)
             if abs(float(pair[0]["price"]) - float(pair[1]["price"])) <= tolerance * max(float(pair[0]["price"]), 1):
                 lifecycle = "FAILED" if float(target.close) < min(float(p["price"]) for p in pair) else "CONFIRMED" if level is not None and float(target.close) > level else "NEAR_CONFIRMATION" if level is not None else "POTENTIAL"
-                emit("Double Bottom", pair, level, lifecycle)
+                emit("Double Bottom", pair, level, lifecycle, min(float(p["price"]) for p in pair))
         if len(highs) >= 3:
             trio = highs[-3:]
             level = min((float(p["price"]) for p in lows if trio[0]["timestamp"] < p["timestamp"] < trio[2]["timestamp"]), default=None)
             if max(float(p["price"]) for p in trio) - min(float(p["price"]) for p in trio) <= tolerance * max(float(trio[0]["price"]), 1):
-                emit("Triple Top", trio, level, "CONFIRMED" if level and float(target.close) < level else "POTENTIAL")
+                lifecycle = "FAILED" if float(target.close) > max(float(p["price"]) for p in trio) else "CONFIRMED" if level and float(target.close) < level else "POTENTIAL"
+                emit("Triple Top", trio, level, lifecycle, max(float(p["price"]) for p in trio))
         if len(lows) >= 3:
             trio = lows[-3:]
             level = max((float(p["price"]) for p in highs if trio[0]["timestamp"] < p["timestamp"] < trio[2]["timestamp"]), default=None)
             if max(float(p["price"]) for p in trio) - min(float(p["price"]) for p in trio) <= tolerance * max(float(trio[0]["price"]), 1):
-                emit("Triple Bottom", trio, level, "CONFIRMED" if level and float(target.close) > level else "POTENTIAL")
+                lifecycle = "FAILED" if float(target.close) < min(float(p["price"]) for p in trio) else "CONFIRMED" if level and float(target.close) > level else "POTENTIAL"
+                emit("Triple Bottom", trio, level, lifecycle, min(float(p["price"]) for p in trio))
         if len(highs) >= 3:
             trio = highs[-3:]
             if float(trio[1]["price"]) > float(trio[0]["price"]) and float(trio[1]["price"]) > float(trio[2]["price"]):
                 neckline = min((float(p["price"]) for p in lows if trio[0]["timestamp"] < p["timestamp"] < trio[2]["timestamp"]), default=None)
-                emit("Head & Shoulders", trio, neckline, "CONFIRMED" if neckline and float(target.close) < neckline else "POTENTIAL")
+                lifecycle = "FAILED" if float(target.close) > max(float(p["price"]) for p in (trio[0], trio[2])) else "CONFIRMED" if neckline and float(target.close) < neckline else "POTENTIAL"
+                emit("Head & Shoulders", trio, neckline, lifecycle, max(float(p["price"]) for p in (trio[0], trio[2])))
         if len(lows) >= 3:
             trio = lows[-3:]
             if float(trio[1]["price"]) < float(trio[0]["price"]) and float(trio[1]["price"]) < float(trio[2]["price"]):
                 neckline = max((float(p["price"]) for p in highs if trio[0]["timestamp"] < p["timestamp"] < trio[2]["timestamp"]), default=None)
-                emit("Inverse Head & Shoulders", trio, neckline, "CONFIRMED" if neckline and float(target.close) > neckline else "POTENTIAL")
+                lifecycle = "FAILED" if float(target.close) < min(float(p["price"]) for p in (trio[0], trio[2])) else "CONFIRMED" if neckline and float(target.close) > neckline else "POTENTIAL"
+                emit("Inverse Head & Shoulders", trio, neckline, lifecycle, min(float(p["price"]) for p in (trio[0], trio[2])))
         if len(highs) >= 3 and len(lows) >= 3:
             high_values = [float(p["price"]) for p in highs[-3:]]
             low_values = [float(p["price"]) for p in lows[-3:]]
@@ -252,17 +267,29 @@ class ChartPatternEngine:
             elif high_values[-1] > high_values[0] and low_values[-1] > low_values[0]:
                 emit("Rising Wedge", highs[-3:] + lows[-3:])
             elif high_values[-1] < high_values[0] and low_values[-1] < low_values[0]:
-                emit("Falling Wedge", highs[-3:] + lows[-3:])
-            elif high_values[-1] < high_values[0] and low_values[-1] < low_values[0]:
-                emit("Flag", highs[-3:] + lows[-3:])
+                high_slope = high_values[-1] - high_values[0]
+                low_slope = low_values[-1] - low_values[0]
+                emit("Flag" if abs(high_slope - low_slope) <= tolerance * max(high_values) else "Falling Wedge", highs[-3:] + lows[-3:])
             elif max(high_values) - min(high_values) <= tolerance * max(high_values) and max(low_values) - min(low_values) <= tolerance * max(low_values):
                 emit("Rectangle", highs[-3:] + lows[-3:])
             elif high_values[0] > high_values[1] < high_values[2] and low_values[0] > low_values[1] < low_values[2]:
-                emit("Cup & Handle", highs[-3:] + lows[-3:])
+                emit("Pennant", highs[-3:] + lows[-3:])
+        if len(lows) >= 3:
+            low_values = [float(p["price"]) for p in lows[-3:]]
+            if low_values[1] < low_values[0] and low_values[1] < low_values[2]:
+                emit("Cup & Handle", lows[-3:])
+            if low_values[1] > low_values[0] and low_values[1] > low_values[2]:
+                emit("Rounded Bottom", lows[-3:])
+        if len(highs) >= 3:
+            high_values = [float(p["price"]) for p in highs[-3:]]
+            if high_values[1] < high_values[0] and high_values[1] < high_values[2]:
+                emit("Rounded Top", highs[-3:])
         if len(history) >= 3:
-            first_gap = float(history[-2].low) > float(history[-3].high) or float(history[-2].high) < float(history[-3].low)
-            second_gap = float(target.low) > float(history[-2].high) or float(target.high) < float(history[-2].low)
-            if first_gap and second_gap:
+            first_up = float(history[-2].low) > float(history[-3].high)
+            first_down = float(history[-2].high) < float(history[-3].low)
+            second_up = float(target.low) > float(history[-2].high)
+            second_down = float(target.high) < float(history[-2].low)
+            if target.is_closed and ((first_up and second_down) or (first_down and second_up)):
                 emit("Island Reversal", [{"timestamp": history[-2].start.isoformat(), "price": float(history[-2].close)}], None, "POTENTIAL")
         return output
 
@@ -297,6 +324,11 @@ class DirectionReversalEngine:
         lows = structure.get("confirmed_lows", [])
         labels = [point.get("classification") for point in highs[-2:] + lows[-2:]]
         one_hour_trend = "UP_STRUCTURE" if "HH" in labels and "HL" in labels else "DOWN_STRUCTURE" if "LH" in labels and "LL" in labels else "RANGE"
+        higher_context = {}
+        for timeframe in ("4H", "1D"):
+            context_structure = features_by_timeframe.get(timeframe, {}).get("structure", {})
+            context_labels = [point.get("classification") for point in context_structure.get("confirmed_highs", [])[-2:] + context_structure.get("confirmed_lows", [])[-2:]]
+            higher_context[timeframe] = "UP_STRUCTURE" if "HH" in context_labels and "HL" in context_labels else "DOWN_STRUCTURE" if "LH" in context_labels and "LL" in context_labels else "RANGE"
         evidence = []
         if divergences_by_timeframe.get("15M") and one_hour_trend in {"UP_STRUCTURE", "DOWN_STRUCTURE"}:
             evidence.append("15M_DIVERGENCE_EARLY_WARNING")
@@ -304,10 +336,10 @@ class DirectionReversalEngine:
         if macd.get("histogram_state") == "weakening":
             evidence.append("1H_MOMENTUM_WEAKENING")
         primary_structure = primary.get("structure", {})
-        if primary_structure.get("break_of_structure"):
-            state = "REVERSAL_WATCH"
-        elif "LH" in labels and "LL" in labels:
+        if "LH" in labels and "LL" in labels:
             state = "REVERSAL_CONFIRMED"
+        elif primary_structure.get("break_of_structure"):
+            state = "REVERSAL_WATCH"
         elif "15M_DIVERGENCE_EARLY_WARNING" in evidence and "1H_MOMENTUM_WEAKENING" in evidence:
             state = "EXHAUSTION_RISK"
         elif "15M_DIVERGENCE_EARLY_WARNING" in evidence:
@@ -316,7 +348,27 @@ class DirectionReversalEngine:
             state = "MATURE"
         else:
             state = "CONFIRMED" if one_hour_trend != "RANGE" else "EARLY"
-        return {"schema_version": PATTERN_SCHEMA_VERSION, "primary_timeframe": "1H", "timeframe_roles": {"15M": "EARLY_WARNING", "1H": "PRIMARY_DIRECTION", "4H": "HIGHER_CONTEXT", "1D": "BROADER_CONTEXT"}, "direction_structure": one_hour_trend, "state": state, "evidence": evidence, "probability": None, "recommendation": None}
+        return {"schema_version": PATTERN_SCHEMA_VERSION, "primary_timeframe": "1H", "timeframe_roles": {"15M": "EARLY_WARNING", "1H": "PRIMARY_DIRECTION", "4H": "HIGHER_CONTEXT", "1D": "BROADER_CONTEXT"}, "direction_structure": one_hour_trend, "higher_timeframe_context": higher_context, "state": state, "evidence": evidence, "probability": None, "recommendation": None}
+
+
+class MultiTimeframeCoordinator:
+    """Coordinate distinct target-bounded histories without mixing candles."""
+
+    def __init__(self, engine: Phase2BEngine | None = None, max_history: int = 600):
+        self.engine = engine or Phase2BEngine()
+        self.max_history = max_history
+
+    def analyze(self, histories: dict[str, list[Candle]]) -> dict[str, Any]:
+        bounded = {timeframe: candles[-self.max_history:] for timeframe, candles in histories.items() if candles}
+        analyses = {timeframe: self.engine.analyze(candles) for timeframe, candles in bounded.items()}
+        features = {}
+        divergences = {}
+        for timeframe, analysis in analyses.items():
+            technical = analysis["context"]
+            features[timeframe] = {"structure": analysis["structure"], "macd": technical["macd"], "rsi14": technical["rsi"]}
+            divergences[timeframe] = analysis["divergences"]
+        direction = DirectionReversalEngine().classify(features, divergences)
+        return {"schema_version": PATTERN_SCHEMA_VERSION, "timeframes": analyses, "direction_reversal": direction, "history_lengths": {timeframe: len(candles) for timeframe, candles in bounded.items()}}
 
 
 class Phase2BEngine:
