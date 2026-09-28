@@ -13,6 +13,7 @@ from .exceptions import IGHTTPError
 from .models import Instrument
 from .phase1 import run_phase1_check
 from .reporting import update_terminal_report, write_runtime_record
+from .research import ResearchConfig, ResearchEngine
 from .rest import IGRestClient
 from .runtime import PersistedStream
 from .security import SecretRedactionFilter
@@ -55,6 +56,18 @@ def main() -> int:
     alerts_parser.add_argument("--limit", type=int, default=20)
     monitor_status_parser = commands.add_parser("monitor-status")
     monitor_status_parser.add_argument("--instrument", default=None)
+    research_filters = {
+        "--instrument": {"default": None}, "--window": {"choices": ("1Y", "3Y", "5Y"), "default": "3Y"},
+        "--timeframe": {"choices": ("15M", "1H", "4H", "1D"), "default": "1H"}, "--direction": {"choices": ("UP", "DOWN"), "default": None},
+        "--score-bucket": {"default": None}, "--trend-stage": {"default": None}, "--reversal-risk": {"default": None},
+        "--agreement": {"default": None}, "--four-hour-alignment": {"default": None}, "--pattern": {"default": None}, "--alert-type": {"default": None}, "--horizon": {"default": None},
+    }
+    research_parser = commands.add_parser("research", help="run an explicit local historical research job")
+    for option, kwargs in research_filters.items():
+        research_parser.add_argument(option, **kwargs)
+    research_status_parser = commands.add_parser("research-status", help="inspect available historical research samples")
+    for option, kwargs in research_filters.items():
+        research_status_parser.add_argument(option, **kwargs)
     stream_parser = commands.add_parser("stream")
     stream_parser.add_argument("--duration", type=float, default=300.0)
     stream_parser.add_argument("--markets", default="US Tech 100,Japan 225,Hong Kong HS50")
@@ -193,6 +206,33 @@ def main() -> int:
                 if status["last_alert"]:
                     print(f"Last alert: {status['last_alert']['alert_type']} ({status['last_alert']['priority']}) at {status['last_alert']['created_at']}")
                 print("Process liveness is not reported unless an external monitor provides it.")
+            finally:
+                database.close()
+            return 0
+        if args.command in {"research", "research-status"}:
+            settings = Settings.from_env(require_credentials=False)
+            database = Database(settings.database_path)
+            try:
+                engine = ResearchEngine(database, ResearchConfig(default_window=args.window))
+                instruments = [args.instrument] if args.instrument else [row[0] for row in database.list_instruments()]
+                if args.command == "research" and not args.pattern and not args.alert_type:
+                    for instrument in instruments:
+                        result = engine.run_direction_research(instrument_id=instrument, window=args.window)
+                        available = result["available_history"]
+                        print(f"{instrument}: recorded={result['recorded_snapshots']} outcomes={result['outcomes_written']} requested={args.window} available_days={available['days']}")
+                if args.command == "research-status":
+                    for instrument in instruments:
+                        available = database.available_history(instrument, args.timeframe, requested_window=args.window)
+                        print(f"{instrument} {args.timeframe}: requested={args.window} available_days={available['days']} status={available['status']}")
+                summary = engine.summary(window=args.window, instrument_id=args.instrument, timeframe=args.timeframe, direction=args.direction, score_bucket=args.score_bucket, trend_stage=args.trend_stage, reversal_risk=args.reversal_risk, agreement=args.agreement, four_hour_alignment=args.four_hour_alignment, pattern_name=args.pattern, alert_type=args.alert_type, horizon=args.horizon)
+                print(f"Research Engine: {summary['research_version']}")
+                print(f"Samples: {summary['sample_count']}")
+                print(f"Status: {summary['quality']}")
+                for row in summary["rows"]:
+                    count = row["sample_count"]
+                    print(f"Future {row['horizon']}: samples={count} UP={row['up_count']} DOWN={row['down_count']} FLAT={row['flat_count']} average_move={row['average_move']}")
+                if not summary["rows"]:
+                    print("No completed historical outcomes are available; pending outcomes are not counted as samples.")
             finally:
                 database.close()
             return 0

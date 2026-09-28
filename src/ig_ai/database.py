@@ -5,6 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from statistics import median
 
 from .alerts import ALERT_ENGINE_VERSION
 from .direction import DIRECTION_SCHEMA_VERSION
@@ -177,6 +178,67 @@ CREATE TABLE IF NOT EXISTS alert_delivery_state (
     delivered_at TEXT,
     error_code TEXT,
     FOREIGN KEY (alert_id) REFERENCES alerts(alert_id)
+);
+CREATE TABLE IF NOT EXISTS research_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    instrument_id TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    snapshot_timestamp TEXT NOT NULL,
+    snapshot_type TEXT NOT NULL,
+    source_identity TEXT NOT NULL,
+    reference_price REAL NOT NULL,
+    direction TEXT,
+    up_score REAL,
+    down_score REAL,
+    coverage_json TEXT,
+    trend_stage TEXT,
+    reversal_risk TEXT,
+    holding_window TEXT,
+    agreement TEXT,
+    four_hour_alignment TEXT,
+    pattern_name TEXT,
+    pattern_lifecycle TEXT,
+    alert_type TEXT,
+    score_bucket TEXT,
+    trend_regime TEXT NOT NULL,
+    volatility_regime TEXT NOT NULL,
+    context_json TEXT NOT NULL,
+    feature_version TEXT,
+    pattern_version TEXT,
+    direction_version TEXT,
+    alert_version TEXT,
+    research_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (instrument_id, timeframe, snapshot_timestamp, snapshot_type, pattern_name, alert_type, research_version)
+);
+CREATE INDEX IF NOT EXISTS research_snapshots_query ON research_snapshots (instrument_id, timeframe, snapshot_timestamp, snapshot_type);
+CREATE TABLE IF NOT EXISTS research_outcomes (
+    snapshot_id TEXT NOT NULL,
+    horizon TEXT NOT NULL,
+    status TEXT NOT NULL,
+    future_timestamp TEXT,
+    future_price REAL,
+    absolute_move REAL,
+    percentage_move REAL,
+    direction_outcome TEXT,
+    mfe REAL,
+    mae REAL,
+    time_to_mfe REAL,
+    time_to_mae REAL,
+    time_to_reversal REAL,
+    continuation_duration REAL,
+    original_direction_valid INTEGER,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, horizon),
+    FOREIGN KEY (snapshot_id) REFERENCES research_snapshots(snapshot_id)
+);
+CREATE INDEX IF NOT EXISTS research_outcomes_query ON research_outcomes (horizon, status, direction_outcome);
+CREATE TABLE IF NOT EXISTS research_regimes (
+    snapshot_id TEXT PRIMARY KEY,
+    trend_regime TEXT NOT NULL,
+    volatility_regime TEXT NOT NULL,
+    methodology_version TEXT NOT NULL,
+    FOREIGN KEY (snapshot_id) REFERENCES research_snapshots(snapshot_id)
 );
 """
 
@@ -415,6 +477,13 @@ class Database:
         ).fetchone()
         return json.loads(row[0]) if row else None
 
+    def get_direction_snapshots(self, instrument_id: str, start_at: str) -> list[dict]:
+        rows = self.connection.execute(
+            "SELECT snapshot_json FROM direction_snapshots WHERE instrument_id=? AND timeframe='1H' AND candle_start>=? ORDER BY candle_start",
+            (instrument_id, start_at),
+        ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
     def save_direction_outcome(self, *, instrument_id: str, timeframe: str, snapshot_candle_start: str, horizon: str, reference_price: str, future_timestamp: str | None = None, future_price: str | None = None, absolute_move: str | None = None, percentage_move: str | None = None, max_favourable_move: str | None = None, max_adverse_move: str | None = None, time_to_reversal: str | None = None) -> None:
         self.connection.execute(
             "INSERT INTO direction_outcomes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instrument_id, timeframe, snapshot_candle_start, horizon) DO UPDATE SET future_timestamp=excluded.future_timestamp, future_price=excluded.future_price, absolute_move=excluded.absolute_move, percentage_move=excluded.percentage_move, max_favourable_move=excluded.max_favourable_move, max_adverse_move=excluded.max_adverse_move, time_to_reversal=excluded.time_to_reversal",
@@ -483,6 +552,86 @@ class Database:
             count = self.connection.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
             last = self.connection.execute("SELECT payload_json FROM alerts ORDER BY created_at DESC LIMIT 1").fetchone()
         return {"states": [json.loads(row[0]) for row in states], "alert_count": count, "last_alert": json.loads(last[0]) if last else None}
+
+    def save_research_snapshot(self, snapshot: dict) -> None:
+        self.connection.execute(
+            """INSERT INTO research_snapshots
+            (snapshot_id, instrument_id, timeframe, snapshot_timestamp, snapshot_type, source_identity, reference_price,
+             direction, up_score, down_score, coverage_json, trend_stage, reversal_risk, holding_window, agreement,
+             four_hour_alignment, pattern_name, pattern_lifecycle, alert_type, score_bucket, trend_regime, volatility_regime, context_json,
+             feature_version, pattern_version, direction_version, alert_version, research_version, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_id) DO UPDATE SET reference_price=excluded.reference_price, context_json=excluded.context_json,
+            trend_regime=excluded.trend_regime, volatility_regime=excluded.volatility_regime""",
+            (snapshot["snapshot_id"], snapshot["instrument_id"], snapshot["timeframe"], snapshot["snapshot_timestamp"], snapshot["snapshot_type"], snapshot["source_identity"], snapshot["reference_price"], snapshot.get("direction"), snapshot.get("up_score"), snapshot.get("down_score"), json.dumps(snapshot.get("coverage"), sort_keys=True, separators=(",", ":")), snapshot.get("trend_stage"), snapshot.get("reversal_risk"), snapshot.get("holding_window"), snapshot.get("agreement"), snapshot.get("four_hour_alignment"), snapshot.get("pattern_name"), snapshot.get("pattern_lifecycle"), snapshot.get("alert_type"), snapshot.get("score_bucket"), snapshot["trend_regime"], snapshot["volatility_regime"], snapshot["context_json"], snapshot.get("feature_version"), snapshot.get("pattern_version"), snapshot.get("direction_version"), snapshot.get("alert_version"), snapshot["research_version"], datetime.now(UTC).isoformat()),
+        )
+        self.connection.execute(
+            "INSERT INTO research_regimes VALUES (?, ?, ?, ?) ON CONFLICT(snapshot_id) DO UPDATE SET trend_regime=excluded.trend_regime, volatility_regime=excluded.volatility_regime, methodology_version=excluded.methodology_version",
+            (snapshot["snapshot_id"], snapshot["trend_regime"], snapshot["volatility_regime"], snapshot["research_version"]),
+        )
+        self.connection.commit()
+
+    def save_research_outcome(self, snapshot_id: str, horizon: str, outcome: dict) -> None:
+        self.connection.execute(
+            """INSERT INTO research_outcomes
+            (snapshot_id, horizon, status, future_timestamp, future_price, absolute_move, percentage_move,
+             direction_outcome, mfe, mae, time_to_mfe, time_to_mae, time_to_reversal, continuation_duration, original_direction_valid, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_id, horizon) DO UPDATE SET status=excluded.status, future_timestamp=excluded.future_timestamp,
+            future_price=excluded.future_price, absolute_move=excluded.absolute_move, percentage_move=excluded.percentage_move,
+            direction_outcome=excluded.direction_outcome, mfe=excluded.mfe, mae=excluded.mae, time_to_mfe=excluded.time_to_mfe,
+            time_to_mae=excluded.time_to_mae, time_to_reversal=excluded.time_to_reversal, continuation_duration=excluded.continuation_duration,
+            original_direction_valid=excluded.original_direction_valid, updated_at=excluded.updated_at""",
+            (snapshot_id, horizon, outcome.get("status", "PENDING"), outcome.get("future_timestamp"), outcome.get("future_price"), outcome.get("absolute_move"), outcome.get("percentage_move"), outcome.get("direction_outcome"), outcome.get("mfe"), outcome.get("mae"), outcome.get("time_to_mfe"), outcome.get("time_to_mae"), outcome.get("time_to_reversal"), outcome.get("continuation_duration"), None if outcome.get("original_direction_valid") is None else int(outcome["original_direction_valid"]), datetime.now(UTC).isoformat()),
+        )
+        self.connection.commit()
+
+    def get_research_snapshots(self, *, instrument_id: str | None = None, timeframe: str | None = None, snapshot_type: str | None = None, window_start: str | None = None, direction: str | None = None, score_bucket: str | None = None, trend_stage: str | None = None, reversal_risk: str | None = None, agreement: str | None = None, four_hour_alignment: str | None = None, pattern_name: str | None = None, alert_type: str | None = None) -> list[dict]:
+        query = "SELECT * FROM research_snapshots WHERE 1=1"
+        params: list[object] = []
+        for column, value in (("instrument_id", instrument_id), ("timeframe", timeframe), ("snapshot_type", snapshot_type), ("direction", direction), ("score_bucket", score_bucket), ("trend_stage", trend_stage), ("reversal_risk", reversal_risk), ("agreement", agreement), ("four_hour_alignment", four_hour_alignment), ("pattern_name", pattern_name), ("alert_type", alert_type)):
+            if value is not None:
+                query += f" AND {column}=?"
+                params.append(value)
+        if window_start is not None:
+            query += " AND snapshot_timestamp>=?"
+            params.append(window_start)
+        query += " ORDER BY snapshot_timestamp"
+        rows = self.connection.execute(query, params).fetchall()
+        columns = [column[1] for column in self.connection.execute("PRAGMA table_info(research_snapshots)")]
+        return [dict(zip(columns, row, strict=True)) for row in rows]
+
+    def research_summary(self, *, instrument_id: str | None = None, timeframe: str | None = None, direction: str | None = None, score_bucket: str | None = None, trend_stage: str | None = None, reversal_risk: str | None = None, agreement: str | None = None, four_hour_alignment: str | None = None, pattern_name: str | None = None, alert_type: str | None = None, horizon: str | None = None, window_start: str | None = None) -> list[dict]:
+        snapshots = self.get_research_snapshots(instrument_id=instrument_id, timeframe=timeframe, direction=direction, score_bucket=score_bucket, trend_stage=trend_stage, reversal_risk=reversal_risk, agreement=agreement, four_hour_alignment=four_hour_alignment, pattern_name=pattern_name, alert_type=alert_type, window_start=window_start)
+        if not snapshots:
+            return []
+        snapshot_ids = [row["snapshot_id"] for row in snapshots]
+        placeholders = ",".join("?" for _ in snapshot_ids)
+        query = f"SELECT horizon, direction_outcome, percentage_move, mfe, mae FROM research_outcomes WHERE snapshot_id IN ({placeholders})"
+        params: list[object] = snapshot_ids
+        if horizon:
+            query += " AND horizon=?"
+            params.append(horizon)
+        rows = self.connection.execute(query, params).fetchall()
+        grouped: dict[str, list[tuple]] = {}
+        for row in rows:
+            grouped.setdefault(row[0], []).append(row[1:])
+        output = []
+        for key, values in sorted(grouped.items()):
+            complete = [value for value in values if value[0] is not None]
+            count = len(complete)
+            output.append({"horizon": key, "sample_count": count, "up_count": sum(value[0] == "UP" for value in complete), "down_count": sum(value[0] == "DOWN" for value in complete), "flat_count": sum(value[0] == "FLAT" for value in complete), "average_move": sum(value[1] for value in complete) / count if count else None, "median_mfe": median([value[2] for value in complete if value[2] is not None]) if complete and any(value[2] is not None for value in complete) else None, "median_mae": median([value[3] for value in complete if value[3] is not None]) if complete and any(value[3] is not None for value in complete) else None})
+        return output
+
+    def available_history(self, instrument_id: str, timeframe: str, requested_window: str | None = None) -> dict:
+        row = self.connection.execute("SELECT MIN(start_at), MAX(start_at), COUNT(*) FROM candles WHERE instrument_id=? AND timeframe=? AND is_closed=1", (instrument_id, timeframe)).fetchone()
+        if not row or row[0] is None:
+            return {"first": None, "last": None, "candle_count": 0, "days": 0.0, "status": "INSUFFICIENT_HISTORY"}
+        first, last = datetime.fromisoformat(row[0]), datetime.fromisoformat(row[1])
+        days = max(0.0, (last - first).total_seconds() / 86400)
+        required_days = int(requested_window[:-1]) * 365 if requested_window and requested_window.endswith("Y") and requested_window[:-1].isdigit() else None
+        status = "INSUFFICIENT_HISTORY" if required_days is not None and days < required_days else "AVAILABLE"
+        return {"first": row[0], "last": row[1], "candle_count": row[2], "days": days, "requested_days": required_days, "status": status}
 
     def save_pattern_outcome(self, *, instrument_id: str, timeframe: str, pattern_name: str, pattern_start: str, horizon: str, reference_price: str, future_timestamp: str | None = None, future_price: str | None = None, absolute_move: str | None = None, percentage_move: str | None = None, max_favourable_move: str | None = None, max_adverse_move: str | None = None, time_to_reversal: str | None = None) -> None:
         self.connection.execute(
