@@ -208,6 +208,8 @@ def test_runtime_persists_primary_1h_model_with_separate_trigger_metadata(tmp_pa
     assert row[0] == "1H"
     assert row[1] == score["candle_timestamp"]
     assert '"trigger":{"candle_state":"FORMING","candle_timestamp":"2025-01-01T00:00:00+00:00","timeframe":"15M"}' in row[2]
+    assert database.get_monitor_state("TEST.EPIC")["direction"] == score["direction"]
+    assert database.get_monitor_status("TEST.EPIC")["alert_count"] == 0
     database.close()
 
 

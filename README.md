@@ -39,7 +39,7 @@ ig-ai phase1-check      # offline final acceptance; does not start a LIVE run
 ig-ai technical-status  # inspect the latest persisted feature record (no BUY/SELL output)
 ig-ai pattern-status    # inspect structure, patterns, and evidence states (read-only)
 ig-ai direction-status  # inspect technical direction score and reversal evidence (read-only)
-ig-ai monitor --duration 3600  # long-running LIVE read-only analysis and alert monitoring
+ig-ai monitor --duration 3600  # LIVE read-only monitoring for 3600 wall-clock seconds
 ig-ai alerts --limit 20       # inspect persisted deterministic alerts
 ig-ai monitor-status           # inspect accepted monitor states and alert count
 igai-report            # prints and refreshes the unified Codex/runtime report
@@ -48,6 +48,8 @@ igai-report --run ruff check .
 ```
 
 The unified report is also saved as `igai-report.txt` for Cloud Shell Editor copy/paste. Runtime commands update only the Terminal section; Codex updates update only the Codex section. Report state is local and ignored by Git.
+
+`monitor --duration N` uses the same duration semantics as `stream`: `N` is a positive wall-clock number of seconds. It authenticates read-only, discovers the provider-verified three-market set, and sends the same single Lightstreamer stream through candle, technical, pattern, direction, and alert persistence. It does not create a second market-data pipeline. A closed market may produce no updates and therefore no fabricated alerts.
 
 Discovery searches provider-name variants, cheaply filters and ranks search metadata, then fetches details only for a small configurable shortlist (`IG_DISCOVERY_DETAIL_BUDGET`, default 3) and classifies candidates as `CASH/ROLLING CFD`, `FUTURES/FORWARD`, `OTHER`, or `UNKNOWN`. Structural verification requires provider metadata to identify the requested normal weekday cash/rolling index; it does not require the current market status to be `TRADEABLE`. Weekend instruments, futures, options, ETFs, shares, knockouts, leveraged products, HSTECH, and China H-shares are excluded from primary verification. Hong Kong HS50 preserves distinct legitimate cash denominations as `VERIFIED_VARIANTS`. IG CFD labels do not represent official Nasdaq-100, Nikkei, or Hang Seng cash indexes. The streaming extra is optional:
 

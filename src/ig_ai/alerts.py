@@ -20,6 +20,30 @@ class AlertConfig:
     cooldown_seconds: int = 300
 
 
+def _warning_key(item: Any) -> str:
+    if isinstance(item, dict):
+        return str(item.get("instance_id") or f"{item.get('pattern')}:{item.get('start')}")
+    return str(item)
+
+
+def _warning_label(item: Any) -> str:
+    if isinstance(item, dict):
+        return str(item.get("pattern") or item.get("instance_id"))
+    return str(item)
+
+
+def _is_opposite_warning(item: Any, direction: str | None) -> bool:
+    label = _warning_label(item).lower()
+    return (direction == "UP" and "bearish" in label) or (direction == "DOWN" and "bullish" in label)
+
+
+def _structure_changed(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    old = previous.get("structures", {}).get("1H", {})
+    new = current.get("structures", {}).get("1H", {})
+    fields = ("breakout", "break_of_structure", "false_breakout", "current_direction", "prior_direction")
+    return any(old.get(field) != new.get(field) for field in fields)
+
+
 def monitor_state(direction: dict[str, Any], coordinated: dict[str, Any]) -> dict[str, Any]:
     """Build the accepted comparison state without copying unbounded history."""
     analyses = coordinated.get("timeframes", {})
@@ -28,6 +52,7 @@ def monitor_state(direction: dict[str, Any], coordinated: dict[str, Any]) -> dic
     structures = {}
     volatility = {}
     early_warning = []
+    primary_direction = direction.get("direction")
     for timeframe, analysis in analyses.items():
         structures[timeframe] = {
             "direction": analysis.get("structure", {}).get("direction"),
@@ -40,17 +65,25 @@ def monitor_state(direction: dict[str, Any], coordinated: dict[str, Any]) -> dic
             "false_breakout_direction": analysis.get("structure", {}).get("false_breakout_direction"),
             "candle_state": analysis.get("candle_state"),
         }
-        volatility[timeframe] = analysis.get("context", {}).get("atr", {}).get("recent_comparison")
+        atr = analysis.get("context", {}).get("atr") or analysis.get("context", {}).get("atr14") or {}
+        volatility[timeframe] = {
+            "comparison": atr.get("recent_comparison"),
+            "candle_state": analysis.get("candle_state"),
+        }
         for pattern in analysis.get("candlestick_patterns", []) + analysis.get("chart_patterns", []):
             identity = pattern.get("instance_id") or f"{pattern.get('pattern')}:{pattern.get('start')}"
-            patterns[f"{timeframe}:{identity}"] = {"pattern": pattern.get("pattern"), "lifecycle": pattern.get("lifecycle"), "confirmed": pattern.get("candle_state") == "CLOSED"}
+            patterns[f"{timeframe}:{identity}"] = {"pattern": pattern.get("pattern"), "lifecycle": pattern.get("lifecycle"), "confirmed": pattern.get("candle_state") == "CLOSED", "candle_state": pattern.get("candle_state")}
         divergences[timeframe] = [{"pattern": item.get("pattern"), "start": item.get("start"), "end": item.get("end"), "lifecycle": item.get("lifecycle")} for item in analysis.get("divergences", [])]
         if timeframe == "15M":
-            early_warning.extend(item.get("pattern") for item in analysis.get("divergences", []) if item.get("lifecycle") in {"FORMING", "CONFIRMED"})
+            for item in analysis.get("divergences", []):
+                pattern = item.get("pattern") or ""
+                opposite = (primary_direction == "UP" and "bearish" in pattern.lower()) or (primary_direction == "DOWN" and "bullish" in pattern.lower())
+                if opposite and item.get("lifecycle") in {"FORMING", "CONFIRMED"}:
+                    early_warning.append({"pattern": pattern, "instance_id": item.get("instance_id") or f"{pattern}:{item.get('start')}", "candle_state": item.get("candle_state", analysis.get("candle_state")), "lifecycle": item.get("lifecycle")})
     return {
         "schema_version": ALERT_ENGINE_VERSION,
         "instrument": direction.get("instrument"),
-        "model_reference": direction.get("model_reference", {"timeframe": "1H", "candle_timestamp": direction.get("candle_timestamp"), "candle_state": direction.get("candle_state")} ),
+        "model_reference": direction.get("model_reference", {"timeframe": "1H", "candle_timestamp": direction.get("candle_timestamp"), "candle_state": direction.get("candle_state")}),
         "trigger": direction.get("trigger"),
         "direction": direction.get("direction"),
         "up_score": direction.get("up_score"),
@@ -65,7 +98,7 @@ def monitor_state(direction: dict[str, Any], coordinated: dict[str, Any]) -> dic
         "patterns": patterns,
         "divergences": divergences,
         "volatility": volatility,
-        "early_warning": sorted(set(early_warning)),
+        "early_warning": list({item["instance_id"]: item for item in early_warning}.values()),
         "score_version": direction.get("score_version"),
     }
 
@@ -75,12 +108,29 @@ class AlertEngine:
         self.config = config or AlertConfig()
         self._last_emitted: dict[str, tuple[datetime, int]] = {}
 
+    def restore(self, alerts: list[dict[str, Any]]) -> None:
+        """Restore cooldown memory from persisted alerts after process restart."""
+        for alert in alerts:
+            if alert.get("alert_engine_version") != self.config.version:
+                continue
+            try:
+                created = datetime.fromisoformat(alert["created_at"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            identity = alert.get("event_identity")
+            if identity:
+                priority = self._priority_rank(alert.get("priority", "INFO"))
+                prior = self._last_emitted.get(identity)
+                if prior is None or created > prior[0]:
+                    self._last_emitted[identity] = (created, priority)
+
     @staticmethod
     def _priority_rank(priority: str) -> int:
         return PRIORITIES.index(priority)
 
     def _event(self, instrument: str, alert_type: str, priority: str, previous: dict[str, Any], current: dict[str, Any], identity: Any, evidence: list[str], confirmed: bool, now: datetime) -> dict[str, Any]:
-        event_identity = f"{instrument}:{alert_type}:{json.dumps(identity, sort_keys=True, separators=(',', ':'))}"
+        reference = {"model_reference": current.get("model_reference"), "trigger": current.get("trigger")}
+        event_identity = f"{instrument}:{alert_type}:{json.dumps({'identity': identity, 'reference': reference}, sort_keys=True, separators=(',', ':'))}"
         alert_id = hashlib.sha256(event_identity.encode()).hexdigest()
         previous_risk = (previous.get("reversal_risk") or {}).get("category")
         current_risk = (current.get("reversal_risk") or {}).get("category")
@@ -128,10 +178,13 @@ class AlertEngine:
             alert_type = "REVERSAL_RISK_INCREASE" if new_risk > old_risk else "REVERSAL_RISK_DECREASE"
             priority = "WARNING" if new_risk >= 2 else "WATCH" if new_risk > old_risk else "INFO"
             self._emit(output, instrument=instrument, alert_type=alert_type, priority=priority, previous=previous, current=current, identity=[old_risk, new_risk], evidence=[f"Reversal risk {(previous.get('reversal_risk') or {}).get('category')} -> {(current.get('reversal_risk') or {}).get('category')}"], confirmed=confirmed, now=now)
-        previous_warning = set(previous.get("early_warning", []))
-        current_warning = set(current.get("early_warning", [])) - previous_warning
+        previous_warning = {_warning_key(item) for item in previous.get("early_warning", []) if _is_opposite_warning(item, current.get("direction"))}
+        current_warning = {_warning_key(item): item for item in current.get("early_warning", []) if _is_opposite_warning(item, current.get("direction")) and _warning_key(item) not in previous_warning}
         if current_warning and current.get("direction") in {"UP", "DOWN"} and current.get("trend_stage") not in {"REVERSAL_CONFIRMED"}:
-            self._emit(output, instrument=instrument, alert_type="EARLY_REVERSAL_WARNING", priority="WATCH", previous=previous, current=current, identity=sorted(current_warning), evidence=sorted(current_warning) + ["1H structure remains primary"], confirmed=confirmed, now=now)
+            warning_items = list(current_warning.values())
+            evidence = [_warning_label(item) for item in warning_items] + ["1H structure remains primary"]
+            warning_confirmed = bool(warning_items) and all(isinstance(item, dict) and item.get("candle_state") == "CLOSED" for item in warning_items)
+            self._emit(output, instrument=instrument, alert_type="EARLY_REVERSAL_WARNING", priority="WATCH", previous=previous, current=current, identity=sorted(current_warning), evidence=evidence, confirmed=warning_confirmed, now=now)
         previous_agreement = (previous.get("timeframe_agreement") or {}).get("status")
         current_agreement = (current.get("timeframe_agreement") or {}).get("status")
         if previous and previous_agreement != current_agreement:
@@ -140,17 +193,18 @@ class AlertEngine:
             self._emit(output, instrument=instrument, alert_type=alert_type, priority=priority, previous=previous, current=current, identity=[previous_agreement, current_agreement], evidence=[f"Timeframe agreement {previous_agreement} -> {current_agreement}"], confirmed=confirmed, now=now)
         if previous:
             score_delta = abs(float(current.get("up_score") or 0) - float(previous.get("up_score") or 0)) if current.get("direction") == "UP" else abs(float(current.get("down_score") or 0) - float(previous.get("down_score") or 0))
-            if score_delta >= self.config.score_change_threshold and current.get("direction") == previous.get("direction") and current.get("trend_stage") != previous.get("trend_stage"):
+            if score_delta >= self.config.score_change_threshold and current.get("direction") == previous.get("direction") and _structure_changed(previous, current):
                 self._emit(output, instrument=instrument, alert_type="DIRECTION_SHIFT", priority="WARNING", previous=previous, current=current, identity=["material", round(score_delta, 2)], evidence=[f"Score delta {round(score_delta, 2)} with structural state change"], confirmed=confirmed, now=now)
         old_structures, new_structures = previous.get("structures", {}), current.get("structures", {})
         primary = new_structures.get("1H", {})
         if primary.get("false_breakout") and not old_structures.get("1H", {}).get("false_breakout"):
             self._emit(output, instrument=instrument, alert_type="FALSE_BREAKOUT", priority="WARNING", previous=previous, current=current, identity=["1H", primary.get("false_breakout_direction")], evidence=["1H false breakout"], confirmed=confirmed, now=now)
         if primary.get("breakout") and not primary.get("false_breakout") and primary.get("breakout") != old_structures.get("1H", {}).get("breakout"):
-            self._emit(output, instrument=instrument, alert_type="BREAKOUT_CONFIRMED", priority="WATCH", previous=previous, current=current, identity=["1H", primary.get("breakout_direction")], evidence=["1H breakout confirmed"], confirmed=confirmed, now=now)
+            structure_confirmed = primary.get("candle_state") == "CLOSED"
+            self._emit(output, instrument=instrument, alert_type="BREAKOUT_CONFIRMED", priority="WATCH", previous=previous, current=current, identity=["1H", primary.get("breakout_direction")], evidence=["1H breakout confirmed"], confirmed=structure_confirmed, now=now)
             boundary_type = "RESISTANCE_BREAK" if primary.get("breakout_direction") == "UP" else "SUPPORT_BREAK" if primary.get("breakout_direction") == "DOWN" else None
             if boundary_type:
-                self._emit(output, instrument=instrument, alert_type=boundary_type, priority="WATCH", previous=previous, current=current, identity=["1H", primary.get("breakout_direction")], evidence=[f"1H {boundary_type.replace('_', ' ').lower()}"], confirmed=confirmed, now=now)
+                self._emit(output, instrument=instrument, alert_type=boundary_type, priority="WATCH", previous=previous, current=current, identity=["1H", primary.get("breakout_direction")], evidence=[f"1H {boundary_type.replace('_', ' ').lower()}"], confirmed=structure_confirmed, now=now)
         old_patterns, new_patterns = previous.get("patterns", {}), current.get("patterns", {})
         for identity, pattern in new_patterns.items():
             old_lifecycle = old_patterns.get(identity, {}).get("lifecycle")
@@ -160,8 +214,12 @@ class AlertEngine:
                 priority = "WATCH" if lifecycle == "NEAR_CONFIRMATION" else "WARNING" if lifecycle == "FAILED" else "INFO"
                 self._emit(output, instrument=instrument, alert_type=alert_type, priority=priority, previous=previous, current=current, identity=[identity, lifecycle], evidence=[f"{pattern.get('pattern')} {old_lifecycle} -> {lifecycle}"], confirmed=bool(pattern.get("confirmed")), now=now)
         for timeframe, value in current.get("volatility", {}).items():
-            if value == "higher_than_recent" and previous.get("volatility", {}).get(timeframe) != value:
-                self._emit(output, instrument=instrument, alert_type="VOLATILITY_EXPANSION", priority="WATCH", previous=previous, current=current, identity=[timeframe, value], evidence=[f"{timeframe} ATR higher than recent history"], confirmed=timeframe == "1H" and confirmed, now=now)
+            comparison = value.get("comparison") if isinstance(value, dict) else value
+            old_value = previous.get("volatility", {}).get(timeframe)
+            old_comparison = old_value.get("comparison") if isinstance(old_value, dict) else old_value
+            if comparison == "higher_than_recent" and old_comparison != comparison:
+                volatility_confirmed = isinstance(value, dict) and value.get("candle_state") == "CLOSED"
+                self._emit(output, instrument=instrument, alert_type="VOLATILITY_EXPANSION", priority="WATCH", previous=previous, current=current, identity=[timeframe, comparison], evidence=[f"{timeframe} ATR higher than recent history"], confirmed=volatility_confirmed, now=now)
         if previous and previous.get("holding_window") != current.get("holding_window"):
             window_rank = {"15–60M": 0, "1–2H": 1, "2–4H": 2, "4–8H": 3, "8H+": 4}
             shorter = window_rank.get(current.get("holding_window"), 2) < window_rank.get(previous.get("holding_window"), 2)

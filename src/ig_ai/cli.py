@@ -59,7 +59,7 @@ def main() -> int:
     stream_parser.add_argument("--duration", type=float, default=300.0)
     stream_parser.add_argument("--markets", default="US Tech 100,Japan 225,Hong Kong HS50")
     stream_parser.add_argument("--verbose", action="store_true")
-    monitor_parser = commands.add_parser("monitor")
+    monitor_parser = commands.add_parser("monitor", help="run the read-only monitor for a wall-clock duration in seconds")
     monitor_parser.add_argument("--duration", type=float, default=3600.0)
     monitor_parser.add_argument("--markets", default="US Tech 100,Japan 225,Hong Kong HS50")
     monitor_parser.add_argument("--verbose", action="store_true")

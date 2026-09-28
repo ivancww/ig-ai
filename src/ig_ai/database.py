@@ -430,20 +430,35 @@ class Database:
         return json.loads(row[0]) if row else None
 
     def save_monitor_state(self, state: dict) -> None:
-        self.connection.execute(
+        self._save_monitor_state(self.connection, state)
+        self.connection.commit()
+
+    @staticmethod
+    def _save_monitor_state(connection: sqlite3.Connection, state: dict) -> None:
+        connection.execute(
             "INSERT INTO monitor_state VALUES (?, ?, ?, ?) ON CONFLICT(instrument_id, alert_engine_version) DO UPDATE SET state_json=excluded.state_json, updated_at=excluded.updated_at",
             (state["instrument"], state.get("schema_version", ALERT_ENGINE_VERSION), json.dumps(state, sort_keys=True, separators=(",", ":")), datetime.now(UTC).isoformat()),
         )
-        self.connection.commit()
 
-    def save_alert(self, alert: dict) -> bool:
-        cursor = self.connection.execute(
+    @staticmethod
+    def _insert_alert(connection: sqlite3.Connection, alert: dict) -> bool:
+        cursor = connection.execute(
             "INSERT OR IGNORE INTO alerts (alert_id, instrument_id, alert_type, priority, event_identity, created_at, model_reference_time, trigger_time, previous_direction, current_direction, previous_score, current_score, previous_trend_stage, current_trend_stage, previous_reversal_risk, current_reversal_risk, previous_holding_window, current_holding_window, timeframe_agreement_json, trigger_evidence_json, confirmed, score_version, alert_engine_version, message, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (alert["alert_id"], alert["instrument"], alert["alert_type"], alert["priority"], alert["event_identity"], alert["created_at"], alert.get("model_reference_time"), alert.get("trigger_time"), alert.get("previous_direction"), alert.get("current_direction"), alert.get("previous_score"), alert.get("current_score"), alert.get("previous_trend_stage"), alert.get("current_trend_stage"), alert.get("previous_reversal_risk"), alert.get("current_reversal_risk"), alert.get("previous_holding_window"), alert.get("current_holding_window"), json.dumps(alert.get("timeframe_agreement"), sort_keys=True, separators=(",", ":")), json.dumps(alert.get("trigger_evidence", []), sort_keys=True, separators=(",", ":")), int(alert.get("confirmed", False)), alert.get("score_version"), alert.get("alert_engine_version", ALERT_ENGINE_VERSION), alert["message"], json.dumps(alert, sort_keys=True, separators=(",", ":"))),
         )
-        self.connection.execute("INSERT OR IGNORE INTO alert_delivery_state (alert_id) VALUES (?)", (alert["alert_id"],))
-        self.connection.commit()
+        connection.execute("INSERT OR IGNORE INTO alert_delivery_state (alert_id) VALUES (?)", (alert["alert_id"],))
         return cursor.rowcount == 1
+
+    def save_alert(self, alert: dict) -> bool:
+        with self.connection:
+            return self._insert_alert(self.connection, alert)
+
+    def save_monitor_evaluation(self, state: dict, alerts: list[dict]) -> int:
+        """Atomically accept monitor state and all alerts from that evaluation."""
+        with self.connection:
+            inserted = sum(self._insert_alert(self.connection, alert) for alert in alerts)
+            self._save_monitor_state(self.connection, state)
+        return inserted
 
     def list_alerts(self, instrument_id: str | None = None, priority: str | None = None, limit: int = 20) -> list[dict]:
         query = "SELECT payload_json FROM alerts WHERE 1=1"

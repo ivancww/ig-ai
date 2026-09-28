@@ -55,6 +55,7 @@ class PersistedStream:
         self.phase2b_runs = 0
         self.phase2b_skipped_forming = 0
         self.alert_engine = AlertEngine()
+        self.alert_engine.restore(self.database.list_alerts(limit=100000))
         self.alerts_emitted = 0
         self.aggregators = {
             timeframe: CandleAggregator(timeframe, market_timezone=self.market_timezone)
@@ -222,10 +223,8 @@ class PersistedStream:
                 self.database.save_direction_snapshot(direction)
                 state = monitor_state(direction, coordinated)
                 previous = self.database.get_monitor_state(state["instrument"])
-                for alert in self.alert_engine.evaluate(previous, state):
-                    if self.database.save_alert(alert):
-                        self.alerts_emitted += 1
-                self.database.save_monitor_state(state)
+                alerts = self.alert_engine.evaluate(previous, state)
+                self.alerts_emitted += self.database.save_monitor_evaluation(state, alerts)
 
     @staticmethod
     def _exit_reason(stream: IGStreamService) -> str | None:
