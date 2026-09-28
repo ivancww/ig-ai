@@ -8,6 +8,7 @@ swings and divergence always use closed candles and closed right-side pivots.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from .models import Candle
@@ -358,8 +359,19 @@ class MultiTimeframeCoordinator:
         self.engine = engine or Phase2BEngine()
         self.max_history = max_history
 
-    def analyze(self, histories: dict[str, list[Candle]]) -> dict[str, Any]:
-        bounded = {timeframe: candles[-self.max_history:] for timeframe, candles in histories.items() if candles}
+    def analyze(self, histories: dict[str, list[Candle]], *, target_time: datetime | None = None, target_timeframe: str | None = None) -> dict[str, Any]:
+        aligned: dict[str, list[Candle]] = {}
+        for timeframe, candles in histories.items():
+            if target_time is None:
+                available = candles
+            elif timeframe == target_timeframe:
+                available = [c for c in candles if c.start <= target_time]
+            else:
+                # A higher-timeframe candle is usable only after its closed
+                # end, never merely because its start precedes the target.
+                available = [c for c in candles if c.end <= target_time and c.is_closed]
+            aligned[timeframe] = available[-self.max_history:]
+        bounded = {timeframe: candles for timeframe, candles in aligned.items() if candles}
         analyses = {timeframe: self.engine.analyze(candles) for timeframe, candles in bounded.items()}
         features = {}
         divergences = {}
@@ -368,7 +380,7 @@ class MultiTimeframeCoordinator:
             features[timeframe] = {"structure": analysis["structure"], "macd": technical["macd"], "rsi14": technical["rsi"]}
             divergences[timeframe] = analysis["divergences"]
         direction = DirectionReversalEngine().classify(features, divergences)
-        return {"schema_version": PATTERN_SCHEMA_VERSION, "timeframes": analyses, "direction_reversal": direction, "history_lengths": {timeframe: len(candles) for timeframe, candles in bounded.items()}}
+        return {"schema_version": PATTERN_SCHEMA_VERSION, "timeframes": analyses, "direction_reversal": direction, "history_lengths": {timeframe: len(candles) for timeframe, candles in aligned.items()}}
 
 
 class Phase2BEngine:

@@ -118,11 +118,24 @@ class Database:
         self.connection.executescript(SCHEMA)
         pattern_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(pattern_observations)")}
         if pattern_columns and "pattern_instance_id" not in pattern_columns:
-            self.connection.execute("ALTER TABLE pattern_observations RENAME TO pattern_observations_legacy")
-            self.connection.executescript(SCHEMA)
-            self.connection.execute(
-                "INSERT OR IGNORE INTO pattern_observations (instrument_id, timeframe, candle_start, pattern_name, pattern_instance_id, pattern_schema_version, lifecycle, is_closed, observation_json, updated_at) SELECT instrument_id, timeframe, candle_start, pattern_name, pattern_name || ':' || candle_start, pattern_schema_version, lifecycle, is_closed, observation_json, updated_at FROM pattern_observations_legacy"
-            )
+            self.connection.execute("BEGIN")
+            try:
+                self.connection.execute("ALTER TABLE pattern_observations RENAME TO pattern_observations_legacy")
+                self.connection.execute("""CREATE TABLE pattern_observations (
+                    instrument_id TEXT NOT NULL, timeframe TEXT NOT NULL, candle_start TEXT NOT NULL,
+                    pattern_name TEXT NOT NULL, pattern_instance_id TEXT NOT NULL,
+                    pattern_schema_version TEXT NOT NULL, lifecycle TEXT NOT NULL, is_closed INTEGER NOT NULL,
+                    observation_json TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    PRIMARY KEY (instrument_id, timeframe, pattern_instance_id, candle_start, pattern_schema_version)
+                )""")
+                self.connection.execute(
+                    "INSERT INTO pattern_observations SELECT instrument_id, timeframe, candle_start, pattern_name, pattern_name || ':' || candle_start, pattern_schema_version, lifecycle, is_closed, observation_json, updated_at FROM pattern_observations_legacy"
+                )
+                self.connection.execute("DROP TABLE pattern_observations_legacy")
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
         version = self.connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version").fetchone()[0]
         if version < 2:
             columns = {row[1] for row in self.connection.execute("PRAGMA table_info(candles)")}
@@ -278,10 +291,16 @@ class Database:
                 "INSERT INTO pattern_observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instrument_id, timeframe, pattern_instance_id, candle_start, pattern_schema_version) DO UPDATE SET lifecycle=excluded.lifecycle, is_closed=excluded.is_closed, observation_json=excluded.observation_json, updated_at=excluded.updated_at",
                 (instrument, timeframe, candle_start, name, instance_id, PATTERN_SCHEMA_VERSION, observation.get("lifecycle", "FORMING"), is_closed, json.dumps(observation, sort_keys=True, separators=(",", ":")), now),
             )
-            self.connection.execute(
-                "INSERT INTO pattern_current VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instrument_id, timeframe, pattern_instance_id, pattern_schema_version) DO UPDATE SET candle_start=excluded.candle_start, lifecycle=excluded.lifecycle, is_closed=excluded.is_closed, observation_json=excluded.observation_json, updated_at=excluded.updated_at",
-                (instrument, timeframe, instance_id, name, PATTERN_SCHEMA_VERSION, candle_start, observation.get("lifecycle", "FORMING"), is_closed, json.dumps(observation, sort_keys=True, separators=(",", ":")), now),
-            )
+            existing = self.connection.execute(
+                "SELECT lifecycle FROM pattern_current WHERE instrument_id=? AND timeframe=? AND pattern_instance_id=? AND pattern_schema_version=?",
+                (instrument, timeframe, instance_id, PATTERN_SCHEMA_VERSION),
+            ).fetchone()
+            lifecycle = observation.get("lifecycle", "FORMING")
+            if not existing or existing[0] not in {"CONFIRMED", "FAILED"} or lifecycle in {"CONFIRMED", "FAILED"}:
+                self.connection.execute(
+                    "INSERT INTO pattern_current VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instrument_id, timeframe, pattern_instance_id, pattern_schema_version) DO UPDATE SET candle_start=excluded.candle_start, lifecycle=excluded.lifecycle, is_closed=excluded.is_closed, observation_json=excluded.observation_json, updated_at=excluded.updated_at",
+                    (instrument, timeframe, instance_id, name, PATTERN_SCHEMA_VERSION, candle_start, lifecycle, is_closed, json.dumps(observation, sort_keys=True, separators=(",", ":")), now),
+                )
         structure = analysis.get("structure", {})
         self.connection.execute(
             "INSERT INTO structure_states VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instrument_id, timeframe, candle_start, pattern_schema_version) DO UPDATE SET is_closed=excluded.is_closed, state_json=excluded.state_json, updated_at=excluded.updated_at",

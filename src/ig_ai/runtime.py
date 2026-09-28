@@ -51,6 +51,8 @@ class PersistedStream:
         self.feature_engine = TechnicalFeatureEngine()
         self.phase2b_engine = Phase2BEngine(self.feature_engine)
         self.mtf_coordinator = MultiTimeframeCoordinator(self.phase2b_engine, max_history=600)
+        self.phase2b_runs = 0
+        self.phase2b_skipped_forming = 0
         self.aggregators = {
             timeframe: CandleAggregator(timeframe, market_timezone=self.market_timezone)
             for timeframe in self.timeframes
@@ -190,6 +192,9 @@ class PersistedStream:
         )
 
     def _save_phase2b_for_candle(self, candle) -> None:
+        if not candle.is_closed and candle.observation_count > 1 and candle.observation_count % 10 != 0:
+            self.phase2b_skipped_forming += 1
+            return
         histories = {
             timeframe: self.database.list_candles(
                 candle.instrument_id,
@@ -199,7 +204,8 @@ class PersistedStream:
             )
             for timeframe in self.timeframes
         }
-        coordinated = self.mtf_coordinator.analyze(histories)
+        coordinated = self.mtf_coordinator.analyze(histories, target_time=candle.start, target_timeframe=candle.timeframe)
+        self.phase2b_runs += 1
         analysis = coordinated["timeframes"].get(candle.timeframe)
         if analysis is not None:
             analysis["direction_reversal"] = coordinated["direction_reversal"]
