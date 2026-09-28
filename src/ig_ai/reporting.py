@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -11,6 +12,7 @@ PROJECT_DIR = Path(__file__).resolve().parents[2]
 STATE_DIR = PROJECT_DIR / ".igai"
 CODEX_REPORT = STATE_DIR / "codex-report.txt"
 TERMINAL_REPORT = STATE_DIR / "terminal-report.txt"
+RUNTIME_RECORD = STATE_DIR / "stream-runtime.json"
 UNIFIED_REPORT = PROJECT_DIR / "igai-report.txt"
 
 
@@ -84,6 +86,12 @@ def update_terminal_report(
 
 def update_codex_report(text: str) -> None:
     _write(CODEX_REPORT, _safe_text(text))
+
+
+def write_runtime_record(record: dict) -> None:
+    """Persist a safe lifecycle marker; RUNNING remains if the VM dies externally."""
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    RUNTIME_RECORD.write_text(json.dumps(record, sort_keys=True, default=str) + "\n", encoding="utf-8")
 
 
 def render_report() -> str:

@@ -78,6 +78,7 @@ class StreamDiagnostics:
     server_error_message: str | None = None
     client_lifecycle_state: str = "NOT_CREATED"
     runtime_failures: list[dict[str, str]] = field(default_factory=list)
+    exit_reason: str | None = None
 
 
 @dataclass
@@ -211,6 +212,13 @@ class OfficialLightstreamerTransport:
         self.diagnostics.connection_state = "DISCONNECTED"
         self.diagnostics.client_lifecycle_state = "CLOSED"
 
+    def is_connection_terminated(self) -> bool:
+        """Return true only when the SDK has reported a real terminal disconnect."""
+        return self._client is None or (
+            self.diagnostics.connection_state.startswith("DISCONNECTED")
+            and not self.diagnostics.intentional_shutdown
+        )
+
     def _on_item_update(self, subscription_id: str, update: Any) -> None:
         spec = self._subscription_specs[subscription_id]
         values = {field: update.getValue(field) for field in spec["fields"].split(",")}
@@ -289,6 +297,13 @@ class IGStreamService:
     def stop(self, *, reason: str = "requested") -> None:
         self._stop.set()
         self.stats.diagnostics.intentional_shutdown = reason in {"duration", "signal", "requested", "runtime"}
+        self.stats.diagnostics.exit_reason = {
+            "duration": "DURATION_COMPLETE",
+            "signal": "USER_INTERRUPT",
+            "requested": "USER_INTERRUPT",
+            "runtime": "RUNTIME_FAILURE",
+            "connection": "CONNECTION_TERMINATED",
+        }.get(reason, reason.upper())
         self.transport.close()
 
     def mark_duration_expired(self) -> None:
@@ -309,7 +324,13 @@ class IGStreamService:
             while not self._stop.is_set():
                 update = self.transport.receive()
                 if update is None:
-                    raise ConnectionError("stream disconnected")
+                    if getattr(self.transport, "is_connection_terminated", lambda: False)():
+                        raise ConnectionError("stream disconnected")
+                    # A quiet provider or an empty test queue is not a terminal
+                    # condition.  OfficialLightstreamerTransport normally emits
+                    # SDK_HEARTBEAT, but this guard keeps the service contract
+                    # correct for any transport implementation.
+                    continue
                 if update.get("type") == "SDK_HEARTBEAT":
                     self._sync_transport_diagnostics()
                     continue
@@ -344,6 +365,10 @@ class IGStreamService:
                 if transport_diagnostics is not None:
                     transport_diagnostics.unexpected_disconnect = True
                 self.stats.connection_state = "FAILED"
+                if isinstance(exc, LightstreamerError):
+                    self.stats.diagnostics.exit_reason = "SDK_FATAL_ERROR"
+                else:
+                    self.stats.diagnostics.exit_reason = "CONNECTION_TERMINATED"
                 diagnostic = exc.safe_diagnostic() if isinstance(exc, LightstreamerError) else type(exc).__name__
                 self.stats.warnings.append(diagnostic)
                 log.warning("IG Lightstreamer stopped: %s", diagnostic)

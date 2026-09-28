@@ -51,11 +51,23 @@ class PersistedStream:
             for timeframe in self.timeframes
         }
         self.observations_written = 0
+        # Legacy 15M/1H write counters remain available; the complete metric
+        # is candle_upserts, which covers all supported timeframes.
         self.candles_written = {"15M": 0, "1H": 0}
-        self.candle_counts = {timeframe: 0 for timeframe in self.timeframes}
-        self.candle_counts_by_instrument = {
+        self.candle_upserts = {timeframe: 0 for timeframe in self.timeframes}
+        self.candle_counts = self.candle_upserts
+        self.candle_upserts_by_instrument = {
             key: {timeframe: 0 for timeframe in self.timeframes} for key in self.instruments
         }
+        # Compatibility alias for callers that used the old write-count name.
+        self.candle_counts_by_instrument = self.candle_upserts_by_instrument
+        self.finalized_candles_by_instrument = {
+            key: {timeframe: 0 for timeframe in self.timeframes} for key in self.instruments
+        }
+        self.forming_candles_by_instrument = {
+            key: {timeframe: 0 for timeframe in self.timeframes} for key in self.instruments
+        }
+        self._forming_keys: set[tuple[str, str, str]] = set()
         self.received_item_updates = {key: 0 for key in self.instruments}
         self.normalized_observations = {key: 0 for key in self.instruments}
         self.observations_persisted = {key: 0 for key in self.instruments}
@@ -72,6 +84,8 @@ class PersistedStream:
             aggregator = self.aggregators.get(candle.timeframe)
             if aggregator is not None and candle.instrument_id in self.instruments:
                 aggregator.restore(candle)
+                self._forming_keys.add((candle.instrument_id, candle.timeframe, candle.start.isoformat()))
+                self._refresh_forming_count(candle.instrument_id, candle.timeframe)
 
     def on_update(self, update: dict) -> dict[str, str]:
         if update.get("type") in {"PROBE", "SUB", "UNSUB"}:
@@ -117,17 +131,14 @@ class PersistedStream:
         for timeframe, aggregator in self.aggregators.items():
             for candle in aggregator.update(observation):
                 self.database.save_candle(candle)
-                self.candle_counts[timeframe] += 1
-                self.candle_counts_by_instrument[instrument_id][timeframe] += 1
-                if timeframe in self.candles_written:
-                    self.candles_written[timeframe] += 1
+                self._record_candle_upsert(candle)
+                self.finalized_candles_by_instrument[instrument_id][timeframe] += 1
             forming = aggregator.forming(observation)
             if forming:
+                self._forming_keys.add((instrument_id, timeframe, forming.start.isoformat()))
                 self.database.save_candle(forming)
-                self.candle_counts[timeframe] += 1
-                self.candle_counts_by_instrument[instrument_id][timeframe] += 1
-                if timeframe in self.candles_written:
-                    self.candles_written[timeframe] += 1
+                self._record_candle_upsert(forming)
+                self._refresh_forming_count(instrument_id, timeframe)
         return {"observation_created": "true", "skip_reason": "none"}
 
     def _record_runtime_failure(self, stage: str, update: dict, error: Exception) -> None:
@@ -155,6 +166,26 @@ class PersistedStream:
             if instrument_id in self.persistence_failures:
                 self.persistence_failures[instrument_id] += 1
 
+    def _record_candle_upsert(self, candle) -> None:
+        self.candle_upserts[candle.timeframe] += 1
+        if candle.timeframe in self.candles_written:
+            self.candles_written[candle.timeframe] += 1
+        self.candle_upserts_by_instrument[candle.instrument_id][candle.timeframe] += 1
+        if candle.is_closed:
+            self._forming_keys.discard((candle.instrument_id, candle.timeframe, candle.start.isoformat()))
+            self._refresh_forming_count(candle.instrument_id, candle.timeframe)
+
+    def _refresh_forming_count(self, instrument_id: str, timeframe: str) -> None:
+        self.forming_candles_by_instrument[instrument_id][timeframe] = sum(
+            1 for key in self._forming_keys if key[:2] == (instrument_id, timeframe)
+        )
+
+    @staticmethod
+    def _exit_reason(stream: IGStreamService) -> str | None:
+        stats = getattr(stream, "stats", None)
+        diagnostics = getattr(stats, "diagnostics", None)
+        return getattr(diagnostics, "exit_reason", None)
+
     def run_for(self, stream: IGStreamService, duration: float) -> None:
         if threading.get_ident() != self._database_owner_thread_id:
             raise RuntimeError("PersistedStream.run_for must run on the database owner thread")
@@ -166,23 +197,34 @@ class PersistedStream:
             updates.put(update)
 
         worker = threading.Thread(target=stream.run, args=(enqueue_update,), daemon=True)
+        started = time.monotonic()
+        deadline = started + duration
         worker.start()
-        deadline = time.monotonic() + duration
-        while worker.is_alive() or not updates.empty():
+        while time.monotonic() < deadline or not updates.empty():
             remaining = deadline - time.monotonic()
-            if remaining <= 0 and worker.is_alive():
-                stream.mark_duration_expired()
-                stream.stop(reason="duration")
+            if remaining <= 0:
+                diagnostics = getattr(getattr(stream, "stats", None), "diagnostics", None)
+                if not getattr(diagnostics, "duration_expired", False):
+                    stream.mark_duration_expired()
+                    stream.stop(reason="duration")
                 remaining = 0.5
+            if not worker.is_alive() and not updates.empty():
+                remaining = min(0.25, max(0.01, remaining))
             try:
                 update = updates.get(timeout=min(0.25, max(0.01, remaining)))
             except queue.Empty:
                 continue
             self._process_update_safely(update)
-        if worker.is_alive():
-            stream.stop(reason="runtime")
-        else:
-            stream.stop(reason="runtime")
+            if self._exit_reason(stream) in {"USER_INTERRUPT", "CONNECTION_TERMINATED", "SDK_FATAL_ERROR", "RUNTIME_FAILURE"}:
+                break
+        if self._exit_reason(stream) is None:
+            diagnostics = getattr(getattr(stream, "stats", None), "diagnostics", None)
+            if diagnostics is None:
+                stream.stop(reason="runtime")
+            elif worker.is_alive() or getattr(diagnostics, "duration_expired", False) or time.monotonic() >= deadline:
+                if time.monotonic() >= deadline:
+                    stream.mark_duration_expired()
+                stream.stop(reason="duration" if time.monotonic() >= deadline else "runtime")
         worker.join(timeout=5)
         while True:
             try:
@@ -194,7 +236,20 @@ class PersistedStream:
         for aggregator in self.aggregators.values():
             for candle in aggregator.flush():
                 self.database.save_candle(candle)
-                self.candle_counts[candle.timeframe] += 1
-                self.candle_counts_by_instrument[candle.instrument_id][candle.timeframe] += 1
-                if candle.timeframe in self.candles_written:
-                    self.candles_written[candle.timeframe] += 1
+                self._forming_keys.add((candle.instrument_id, candle.timeframe, candle.start.isoformat()))
+                self._record_candle_upsert(candle)
+                self._refresh_forming_count(candle.instrument_id, candle.timeframe)
+        elapsed = time.monotonic() - started
+        if self._exit_reason(stream) is None:
+            diagnostics = getattr(getattr(stream, "stats", None), "diagnostics", None)
+            if diagnostics is not None:
+                diagnostics.exit_reason = "DURATION_COMPLETE" if elapsed >= duration else "CONNECTION_TERMINATED"
+        self.runtime_audit = {
+            "requested_duration": duration,
+            "actual_elapsed": elapsed,
+            "exit_reason": self._exit_reason(stream) or ("DURATION_COMPLETE" if elapsed >= duration else "CONNECTION_TERMINATED"),
+            "last_successful_item_update": max(
+                getattr(getattr(stream, "stats", None), "last_update", {}).values(), default=None
+            ),
+            "last_persistence_success": max(self.last_update.values(), default=None),
+        }

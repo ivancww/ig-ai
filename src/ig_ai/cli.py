@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import time
 
 from .config import Settings
 from .database import Database
 from .discovery import discover_market_groups, select_stream_instruments
 from .exceptions import IGHTTPError
 from .models import Instrument
-from .reporting import update_terminal_report
+from .reporting import update_terminal_report, write_runtime_record
 from .rest import IGRestClient
 from .runtime import PersistedStream
 from .security import SecretRedactionFilter
@@ -147,10 +148,17 @@ def main() -> int:
                     )
                 )
             sink = PersistedStream(database, instruments, client.settings.market_timezone)
+            write_runtime_record({
+                "status": "RUNNING",
+                "requested_duration": args.duration,
+                "started_monotonic": time.monotonic(),
+            })
             try:
                 sink.run_for(stream, args.duration)
             finally:
                 database.close()
+            audit = sink.runtime_audit
+            write_runtime_record({"status": "COMPLETED", **audit})
             instrument_ids = [instrument.instrument_id for instrument in instruments.values()]
             validation_passed = stream.stats.live_validation_passed(instrument_ids)
             reconnect_outcome = (
@@ -177,7 +185,9 @@ def main() -> int:
                     f"; persisted={sink.observations_persisted.get(candidate.epic, 0)}"
                     f"; persistence_failures={sink.persistence_failures.get(candidate.epic, 0)}"
                     + "; " + ", ".join(
-                        f"{timeframe} candles={sink.candle_counts_by_instrument[candidate.epic][timeframe]}"
+                        f"{timeframe}: forming={sink.forming_candles_by_instrument[candidate.epic][timeframe]}"
+                        f", finalized={sink.finalized_candles_by_instrument[candidate.epic][timeframe]}"
+                        f", upserts={sink.candle_upserts_by_instrument[candidate.epic][timeframe]}"
                         for timeframe in sink.timeframes
                     )
                 )
@@ -195,6 +205,19 @@ def main() -> int:
             warning_lines = [*stream.stats.warnings]
             if runtime_failures:
                 warning_lines.append(runtime_failures)
+            persistence_passed = sum(sink.persistence_failures.values()) == 0 and sum(sink.observations_persisted.values()) > 0
+            candle_pipeline_passed = all(
+                sink.candle_upserts_by_instrument[instrument.instrument_id][timeframe] > 0
+                for instrument in instruments.values()
+                for timeframe in sink.timeframes
+            )
+            duration_complete = audit["exit_reason"] == "DURATION_COMPLETE"
+            elapsed_tolerance = max(2.0, args.duration * 0.05)
+            long_run_passed = (
+                duration_complete
+                and abs(audit["actual_elapsed"] - args.duration) <= elapsed_tolerance
+                and not sum(sink.persistence_failures.values())
+            )
             update_terminal_report(
                 command=f"ig-ai stream --duration {args.duration:g}",
                 account_type=client.settings.account_type,
@@ -216,7 +239,13 @@ def main() -> int:
                     + f"observations normalized={sum(sink.normalized_observations.values())}; "
                     + f"observations persisted={sum(sink.observations_persisted.values())}; "
                     + f"persistence failures={sum(sink.persistence_failures.values())}; "
-                    + ", ".join(f"{timeframe} candles={sink.candle_counts[timeframe]}" for timeframe in sink.timeframes) + "; "
+                    + ", ".join(
+                        f"{timeframe}: forming={sum(sink.forming_candles_by_instrument[i.instrument_id][timeframe] for i in instruments.values())}"
+                        f", finalized={sum(sink.finalized_candles_by_instrument[i.instrument_id][timeframe] for i in instruments.values())}"
+                        f", upserts={sink.candle_upserts[timeframe]}"
+                        for timeframe in sink.timeframes
+                    ) + "; "
+                    + f"requested duration={args.duration:g}s; actual elapsed={audit['actual_elapsed']:.3f}s; exit reason={audit['exit_reason']}; "
                     + f"reconnect/recovery={reconnect_outcome}; reconnects={stream.stats.reconnect_count}; "
                     + f"; SDK statuses={','.join(stream.stats.diagnostics.sdk_statuses) or 'NONE'}; "
                     + f"SDK client created={str(stream.stats.diagnostics.sdk_client_created).lower()}; "
@@ -250,11 +279,9 @@ def main() -> int:
                 checks=(
                     "read-only Lightstreamer runtime completed; observations entered persistence/candle pipeline; "
                     f"STREAMING {'PASS' if validation_passed else 'FAIL'}; "
-                    f"PERSISTENCE {'PASS' if sum(sink.persistence_failures.values()) == 0 and sum(sink.observations_persisted.values()) > 0 else 'FAIL'}; "
-                    f"CANDLE PIPELINE {'PASS' if all(sink.candle_counts.values()) else 'NOT VERIFIED'}; "
-                    f"RECONNECT {reconnect_outcome}; LONG-RUN {'PASS' if validation_passed and not sum(sink.persistence_failures.values()) else 'FAIL'}"
-                    if validation_passed
-                    else "read-only Lightstreamer runtime completed; all-market validation gate failed"
+                    f"PERSISTENCE {'PASS' if persistence_passed else 'FAIL'}; "
+                    f"CANDLE PIPELINE {'PASS' if candle_pipeline_passed else 'NOT VERIFIED'}; "
+                    f"LONG-RUN {'PASS' if long_run_passed else 'FAIL'}; RECONNECT {reconnect_outcome}"
                 ),
                 warnings="; ".join(warning_lines) if warning_lines else "NONE",
                 not_verified=(
@@ -267,8 +294,15 @@ def main() -> int:
             )
             for line in validation_lines:
                 print(line)
+            print(f"Requested duration: {args.duration:g}s")
+            print(f"Actual elapsed: {audit['actual_elapsed']:.3f}s")
+            print(f"Exit reason: {audit['exit_reason']}")
+            print(f"STREAMING: {'PASS' if validation_passed else 'FAIL'}")
+            print(f"PERSISTENCE: {'PASS' if persistence_passed else 'FAIL'}")
+            print(f"CANDLE PIPELINE: {'PASS' if candle_pipeline_passed else 'NOT VERIFIED'}")
+            print(f"LONG-RUN: {'PASS' if long_run_passed else 'FAIL'}")
             print(f"LIVE MULTI-MARKET STREAM VALIDATION: {'PASS' if validation_passed else 'FAIL'}")
-            return 0 if validation_passed else 1
+            return 0 if validation_passed and long_run_passed else 1
         elif args.command == "stream-smoke":
             result = run_stream_smoke(client, args.duration)
             print(format_smoke_result(result))
