@@ -32,6 +32,9 @@ def main() -> int:
     commands.add_parser("discover")
     commands.add_parser("rest-check")
     commands.add_parser("phase1-check")
+    technical_parser = commands.add_parser("technical-status")
+    technical_parser.add_argument("--instrument", default=None)
+    technical_parser.add_argument("--timeframe", choices=("15M", "1H", "4H", "1D"), default="1H")
     stream_parser = commands.add_parser("stream")
     stream_parser.add_argument("--duration", type=float, default=300.0)
     stream_parser.add_argument("--markets", default="US Tech 100,Japan 225,Hong Kong HS50")
@@ -58,6 +61,33 @@ def main() -> int:
                 not_verified="IG authentication, market discovery, and streaming were not run",
             )
             print(f"Database initialized at {settings.database_path}")
+            return 0
+        if args.command == "technical-status":
+            settings = Settings.from_env(require_credentials=False)
+            database = Database(settings.database_path)
+            try:
+                instruments = database.list_instruments()
+                selected = args.instrument or (instruments[0][0] if instruments else None)
+                if selected is None:
+                    print("No instruments or technical features available.")
+                    return 0
+                records = database.get_technical_features(selected, args.timeframe)
+                if not records:
+                    print(f"No technical features for {selected} {args.timeframe}.")
+                    return 0
+                feature = records[0]
+                ma = feature["moving_averages"]
+                print(f"{selected} {args.timeframe}")
+                for name in ("ema10", "ema20", "ema50", "ema100", "ema200"):
+                    print(f"{name.upper()}: {ma[name]['value']}")
+                print(f"RSI14: {feature['rsi14']['value']} ({feature['rsi14']['state']})")
+                print(f"MACD: {feature['macd']['line']} / signal {feature['macd']['signal']} / histogram {feature['macd']['histogram']}")
+                print(f"ATR14: {feature['atr14']['value']}")
+                print(f"BB Position: {feature['bollinger']['zone']}")
+                print(f"Structure: {feature['structure']}")
+                print(f"Candle state: {feature['candle_state']}")
+            finally:
+                database.close()
             return 0
         client = IGRestClient(Settings.from_env())
         if args.command == "rest-check":
