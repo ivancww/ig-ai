@@ -49,6 +49,7 @@ class PersistedStream:
         self.candles_written = {timeframe: 0 for timeframe in self.aggregators}
         self.last_update: dict[str, datetime] = {}
         self._seen_observations: set[tuple] = set()
+        self.safe_skip_diagnostics: list[dict[str, str]] = []
 
     def on_update(self, update: dict) -> None:
         if update.get("type") in {"PROBE", "SUB", "UNSUB"}:
@@ -56,6 +57,7 @@ class PersistedStream:
         instrument_id = str(update.get("instrument_id") or "")
         instrument = self.instruments.get(instrument_id)
         if instrument is None:
+            self.safe_skip_diagnostics.append({"reason": "unknown_instrument"})
             return
         try:
             observation = normalize_price_update(
@@ -65,8 +67,10 @@ class PersistedStream:
                 market_name=instrument.market_name,
             )
         except (TypeError, ValueError):
+            self.safe_skip_diagnostics.append({"instrument_id": instrument_id, "reason": "invalid_timestamp_or_price"})
             return
         if observation.mid is None:
+            self.safe_skip_diagnostics.append({"instrument_id": instrument_id, "reason": "missing_bid_or_ask"})
             return
         signature = (observation.instrument_id, observation.timestamp, observation.bid, observation.offer)
         if signature in self._seen_observations:

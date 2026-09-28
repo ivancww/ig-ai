@@ -26,8 +26,11 @@ def parse_timestamp(value: Any) -> datetime:
         try:
             result = datetime.fromisoformat(text)
         except ValueError:
-            # Lightstreamer commonly sends UPDATE_TIME as HH:MM:SS.
-            result = datetime.combine(datetime.now(UTC).date(), datetime.strptime(text, "%H:%M:%S").time(), UTC)
+            try:
+                result = datetime.fromtimestamp(float(text) / 1000, UTC)
+            except (OverflowError, ValueError):
+                # Lightstreamer commonly sends UPDATE_TIME as HH:MM:SS.
+                result = datetime.combine(datetime.now(UTC).date(), datetime.strptime(text, "%H:%M:%S").time(), UTC)
     if result.tzinfo is None:
         result = result.replace(tzinfo=UTC)
     return result.astimezone(UTC)

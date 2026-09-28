@@ -6,7 +6,6 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import Any, Protocol
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
@@ -104,6 +103,8 @@ class StreamDiagnostics:
     subcmd_subscription_ids: set[str] = field(default_factory=set)
     subscriptions_accepted: set[str] = field(default_factory=set)
     first_updates_received: set[str] = field(default_factory=set)
+    u_messages_received: set[str] = field(default_factory=set)
+    safe_update_diagnostics: list[dict[str, str]] = field(default_factory=list)
     subscription_states: dict[str, str] = field(default_factory=dict)
     server_messages: list[str] = field(default_factory=list)
     protocol_errors: list[str] = field(default_factory=list)
@@ -183,20 +184,36 @@ class IGStreamService:
                     }:
                         continue
                     item = str(update.get("item") or update.get("epic") or "")
-                    for index, subscription in enumerate(self.subscriptions, 1):
-                        if item in {subscription.item, subscription.instrument_id, subscription.item.split(":")[-1], f"ITEM{index}"}:
-                            merged = self._latest_updates.setdefault(subscription.instrument_id, {})
-                            merged.update({key: value for key, value in update.items() if value not in (None, "")})
-                            if not any(key in update for key in ("UPDATE_TIME", "UPDATE_TIMESTAMP", "PROVIDER_TIMESTAMP", "timestamp")):
-                                merged["timestamp"] = datetime.now(UTC).isoformat()
-                            update = dict(merged)
-                            update["item"] = item
-                            self.stats.updates_received[subscription.instrument_id] += 1
-                            self.stats.diagnostics.first_updates_received.add(str(index))
-                            self.stats.last_update[subscription.instrument_id] = time.monotonic()
-                            update.setdefault("instrument_id", subscription.instrument_id)
-                            update.setdefault("epic", subscription.item.split(":")[-1])
-                            break
+                    subscription_id = str(update.get("subscription_id") or "")
+                    matched = None
+                    if subscription_id.isdigit():
+                        subscription_index = int(subscription_id)
+                        item_is_valid = not item.isdigit() or item == "1"
+                        if item_is_valid and 1 <= subscription_index <= len(self.subscriptions):
+                            matched = (subscription_index, self.subscriptions[subscription_index - 1])
+                    if matched is None:
+                        for index, subscription in enumerate(self.subscriptions, 1):
+                            if item in {subscription.item, subscription.instrument_id, subscription.item.split(":")[-1], f"ITEM{index}"}:
+                                matched = (index, subscription)
+                                break
+                    if matched is None:
+                        on_update(update)
+                        continue
+                    index, subscription = matched
+                    merged = self._latest_updates.setdefault(subscription.instrument_id, {})
+                    merged.update({key: value for key, value in update.items() if key not in {"item", "subscription_id"}})
+                    update = dict(merged)
+                    update["item"] = item
+                    update["subscription_id"] = subscription_id
+                    update["instrument_id"] = subscription.instrument_id
+                    update["epic"] = subscription.item.split(":")[-1]
+                    self.stats.updates_received[subscription.instrument_id] += 1
+                    bid = update.get("BID") or update.get("BIDPRICE1")
+                    ask = update.get("OFFER") or update.get("ASKPRICE1")
+                    if bid not in (None, "") and ask not in (None, ""):
+                        self.stats.diagnostics.first_updates_received.add(str(index))
+                        self.stats.diagnostics.subscription_states[subscription_id] = "DATA_OBSERVED"
+                    self.stats.last_update[subscription.instrument_id] = time.monotonic()
                     on_update(update)
             except Exception as exc:
                 self._sync_transport_diagnostics()
@@ -244,6 +261,10 @@ class IGStreamService:
         current.subcmd_subscription_ids.update(diagnostics.subcmd_subscription_ids)
         current.subscriptions_accepted.update(diagnostics.subscriptions_accepted)
         current.first_updates_received.update(diagnostics.first_updates_received)
+        current.u_messages_received.update(diagnostics.u_messages_received)
+        current.safe_update_diagnostics.extend(
+            item for item in diagnostics.safe_update_diagnostics if item not in current.safe_update_diagnostics
+        )
         current.subscription_states.update(diagnostics.subscription_states)
         for target, source in ((current.server_messages, diagnostics.server_messages), (current.protocol_errors, diagnostics.protocol_errors)):
             for value in source:
@@ -262,6 +283,8 @@ class WebSocketLightstreamerTransport:
         self._websocket = websocket
         self._socket = None
         self._field_names: list[str] = []
+        self._field_names_by_subscription: dict[str, tuple[str, ...]] = {}
+        self._field_state: dict[tuple[str, str], dict[str, Any]] = {}
         self._endpoint = ""
         self._session_id: str | None = None
         self._next_request_id = 1
@@ -274,6 +297,8 @@ class WebSocketLightstreamerTransport:
         # connection creates a fresh TLCP session and starts at one.
         self._session_id = None
         self._next_request_id = 1
+        self._field_names_by_subscription = {}
+        self._field_state = {}
         self.diagnostics = StreamDiagnostics()
         self._secrets = (username, password)
         try:
@@ -332,6 +357,7 @@ class WebSocketLightstreamerTransport:
             self._field_names = params["fields"].split(",")
             request_id = self._request_id()
             subscription_id = params["LS_subId"]
+            self._field_names_by_subscription[subscription_id] = tuple(self._field_names)
             params = {
                 "LS_op": "add",
                 "LS_reqId": request_id,
@@ -363,6 +389,10 @@ class WebSocketLightstreamerTransport:
 
     def _parse(self, raw: str) -> dict[str, Any]:
         self._ensure_diagnostics()
+        if not hasattr(self, "_field_names_by_subscription"):
+            self._field_names_by_subscription = {}
+        if not hasattr(self, "_field_state"):
+            self._field_state = {}
         line = raw.strip("\r\n")
         if line.startswith("PROBE"):
             self._record_server_message("PROBE")
@@ -406,8 +436,7 @@ class WebSocketLightstreamerTransport:
                 return {"type": "U"}
             subscription_id = args[0]
             if subscription_id in self.diagnostics.subscription_requests_sent:
-                self.diagnostics.first_updates_received.add(subscription_id)
-                self.diagnostics.subscription_states[subscription_id] = "DATA_OBSERVED"
+                self.diagnostics.u_messages_received.add(subscription_id)
         elif tag == "SUBCMD":
             self._record_server_message(tag)
             subscription_id = args[0] if args else ""
@@ -422,13 +451,60 @@ class WebSocketLightstreamerTransport:
         if tag != "U" or len(args) < 3:
             return {"type": tag or "UNKNOWN"}
         subscription_id, item, values = args[0], args[1], args[2]
-        update: dict[str, Any] = {"item": item, "subscription_id": subscription_id}
-        for index, value in enumerate(values.split("|")):
-            if index < len(self._field_names) and value != "":
-                if value.startswith("^"):
-                    continue
-                update[self._field_names[index]] = value
+        field_names = getattr(self, "_field_names_by_subscription", {}).get(subscription_id, tuple(self._field_names))
+        field_state = getattr(self, "_field_state", {})
+        state = field_state.setdefault((subscription_id, item), {})
+        changed_fields: list[str] = []
+        field_index = 0
+        for value in values.split("|"):
+            if field_index >= len(field_names):
+                break
+            if value == "":
+                field_index += 1
+                continue
+            if value.startswith("^") and len(value) > 1 and value[1:].isdigit():
+                field_index += int(value[1:])
+                continue
+            field_name = field_names[field_index]
+            if value == "#":
+                state[field_name] = None
+            elif value == "$":
+                state[field_name] = ""
+            elif value.startswith("^"):
+                self._record_update_diagnostic(subscription_id, item, changed_fields, state, "unsupported_field_diff")
+                return {"type": "U", "subscription_id": subscription_id, "item": item}
+            else:
+                state[field_name] = value
+            changed_fields.append(field_name)
+            field_index += 1
+        update: dict[str, Any] = {"item": item, "subscription_id": subscription_id, **state}
+        bid = state.get("BID") or state.get("BIDPRICE1")
+        ask = state.get("OFFER") or state.get("ASKPRICE1")
+        sufficient = bid not in (None, "") and ask not in (None, "")
+        self._record_update_diagnostic(
+            subscription_id, item, changed_fields, state, "none" if sufficient else "missing_bid_or_ask"
+        )
         return update
+
+    def _record_update_diagnostic(
+        self,
+        subscription_id: str,
+        item: str,
+        fields: list[str],
+        state: dict[str, Any],
+        skip_reason: str,
+    ) -> None:
+        self.diagnostics.safe_update_diagnostics.append(
+            {
+                "subscription_id": subscription_id,
+                "item": item,
+                "fields_present": ",".join(fields),
+                "bid_decoded": str((state.get("BID") or state.get("BIDPRICE1")) not in (None, "")),
+                "ask_decoded": str((state.get("OFFER") or state.get("ASKPRICE1")) not in (None, "")),
+                "sufficient_fields": str(skip_reason == "none"),
+                "skip_reason": skip_reason,
+            }
+        )
 
     def _send_request(self, name: str, params: dict[str, str] | None = None) -> None:
         encoded = urlencode(params or {})

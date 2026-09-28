@@ -139,7 +139,7 @@ def test_websocket_session_flow_uses_protocol_and_subscribes_after_conok():
     assert transport.diagnostics.session_id_established
     assert transport.diagnostics.control_sent
     assert transport.diagnostics.subscriptions_accepted == {"1"}
-    assert transport.diagnostics.first_updates_received == {"1"}
+    assert transport.diagnostics.u_messages_received == {"1"}
     assert transport.diagnostics.server_messages == ["SUBOK"]
 
 
@@ -211,6 +211,35 @@ def test_service_passes_subscription_data_adapter():
     assert transport.subscriptions[0][1]["adapter"] == "Pricing"
 
 
+def test_service_correlates_real_numeric_item_by_subscription_id():
+    class UTransport(FakeTransport):
+        def __init__(self):
+            super().__init__()
+            self.updates = [
+                {
+                    "item": "1",
+                    "subscription_id": "1",
+                    "BIDPRICE1": "100",
+                    "ASKPRICE1": "102",
+                    "TIMESTAMP": "1760000000000",
+                }
+            ]
+
+    transport = UTransport()
+    service = IGStreamService("endpoint", "user", "secret", transport, reconnect_seconds=0)
+    service.add_subscription(Subscription("EPIC", "PRICE:ACCOUNT:EPIC"))
+    received = []
+
+    def receive(update):
+        received.append(update)
+        service.stop()
+
+    service.run(receive)
+    assert received[0]["instrument_id"] == "EPIC"
+    assert received[0]["epic"] == "EPIC"
+    assert service.stats.diagnostics.first_updates_received == {"1"}
+
+
 def test_handshake_status_is_safe_and_structurally_invalid_not_retried():
     class BadStatus(Exception):
         status_code = 403
@@ -261,6 +290,50 @@ def test_lightstreamer_parser_carries_forward_partial_fields():
     assert second["BIDPRICE1"] == "100" and second["TIMESTAMP"] == "124"
 
 
+def test_realistic_u_decoder_resolves_item_index_delta_and_null_empty_values():
+    transport = object.__new__(WebSocketLightstreamerTransport)
+    transport._field_names = ["BIDPRICE1", "ASKPRICE1", "TIMESTAMP", "DLG_FLAG"]
+    transport._secrets = ()
+    transport.diagnostics = StreamDiagnostics()
+    transport.diagnostics.subscription_requests_sent["1"] = "PRICE:ACCOUNT:EPIC"
+
+    first = transport._parse("U,1,1,100|102|1760000000000|DEAL")
+    second = transport._parse("U,1,1,^2|1770000000000|$")
+    third = transport._parse("U,1,1,#|102|^1|TRADEABLE")
+
+    assert first["BIDPRICE1"] == "100" and first["ASKPRICE1"] == "102"
+    assert second["BIDPRICE1"] == "100" and second["ASKPRICE1"] == "102"
+    assert second["DLG_FLAG"] == ""
+    assert third["BIDPRICE1"] is None and third["ASKPRICE1"] == "102"
+    assert transport.diagnostics.u_messages_received == {"1"}
+    diagnostic = transport.diagnostics.safe_update_diagnostics[-1]
+    assert diagnostic["subscription_id"] == "1"
+    assert diagnostic["bid_decoded"] == "False"
+    assert "100" not in str(diagnostic)
+
+
+def test_decoder_keeps_subscription_and_item_state_isolated():
+    transport = object.__new__(WebSocketLightstreamerTransport)
+    transport._field_names = []
+    transport._field_names_by_subscription = {"1": ("BID", "OFFER"), "2": ("BID", "OFFER")}
+    transport._field_state = {}
+    transport._secrets = ()
+    transport.diagnostics = StreamDiagnostics()
+    transport.diagnostics.subscription_requests_sent.update({"1": "PRICE:EPIC1", "2": "PRICE:EPIC2"})
+
+    first = transport._parse("U,1,1,10|12")
+    second = transport._parse("U,2,1,20|22")
+    delta = transport._parse("U,1,1,|13")
+    wrong_item = transport._parse("U,1,2,99|100")
+
+    assert first["BID"] == "10" and first["OFFER"] == "12"
+    assert second["BID"] == "20" and second["OFFER"] == "22"
+    assert delta["BID"] == "10" and delta["OFFER"] == "13"
+    assert wrong_item["BID"] == "99"
+    assert transport._field_state[("1", "1")]["BID"] == "10"
+    assert transport._field_state[("1", "2")]["BID"] == "99"
+
+
 def test_lightstreamer_parser_tracks_keepalives_and_rejects_protocol_errors_safely():
     transport = object.__new__(WebSocketLightstreamerTransport)
     transport._field_names = ["BIDPRICE1"]
@@ -294,11 +367,11 @@ def test_lightstreamer_parser_tracks_control_lifecycle_without_emitting_control_
         "BIDPRICE1": "100",
     }
     assert transport.diagnostics.server_messages == ["REQOK", "SUBCMD", "SUBOK"]
-    assert transport.diagnostics.first_updates_received == {"1"}
+    assert transport.diagnostics.u_messages_received == {"1"}
     assert transport.diagnostics.reqok_request_ids == {"1"}
     assert transport.diagnostics.subcmd_subscription_ids == {"1"}
     assert transport.diagnostics.subok_subscription_ids == {"1"}
-    assert transport.diagnostics.subscription_states["1"] == "DATA_OBSERVED"
+    assert transport.diagnostics.subscription_states["1"] == "SUBSCRIPTION_ESTABLISHED"
 
 
 def test_control_and_subscription_correlations_do_not_false_accept():
@@ -325,9 +398,9 @@ def test_control_and_subscription_correlations_do_not_false_accept():
     transport._parse("U,99,UNKNOWN,999")
     assert transport.diagnostics.subok_subscription_ids == {"2"}
     assert transport.diagnostics.subcmd_subscription_ids == {"1"}
-    assert transport.diagnostics.first_updates_received == {"2"}
+    assert transport.diagnostics.u_messages_received == {"2"}
     assert "99" not in transport.diagnostics.first_updates_received
-    assert transport.diagnostics.subscription_states["2"] == "DATA_OBSERVED"
+    assert transport.diagnostics.subscription_states["2"] == "SUBSCRIPTION_ESTABLISHED"
 
 
 def test_reqerr_correlation_redacts_error_content():
