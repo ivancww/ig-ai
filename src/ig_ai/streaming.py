@@ -18,6 +18,13 @@ def lightstreamer_password(cst: str, security_token: str) -> str:
     return f"CST-{cst}|XST-{security_token}"
 
 
+def configure_lightstreamer_connection(client: Any, username: str, password: str) -> None:
+    """Configure credentials through the official SDK 2.2.3 API boundary."""
+    connection_details = client.connectionDetails
+    connection_details.setUser(username)
+    connection_details.setPassword(password)
+
+
 def _safe_endpoint(endpoint: str) -> str:
     parsed = urlsplit(endpoint)
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", "", ""))
@@ -138,8 +145,7 @@ class OfficialLightstreamerTransport:
             self._client = client_factory(endpoint, "DEFAULT")
             self.diagnostics.sdk_client_created = True
             self.diagnostics.client_lifecycle_state = "CREATED"
-            self._client.setUser(username)
-            self._client.setPassword(password)
+            configure_lightstreamer_connection(self._client, username, password)
             self.diagnostics.client_lifecycle_state = "CONFIGURED"
             self._client.addListener(_ClientListener(self))
             self.diagnostics.client_lifecycle_state = "LISTENER_ATTACHED"

@@ -8,7 +8,7 @@ from typing import Any
 
 from .discovery import discover_markets
 from .rest import IGRestClient
-from .streaming import lightstreamer_password
+from .streaming import configure_lightstreamer_connection, lightstreamer_password
 
 
 @dataclass
@@ -21,6 +21,8 @@ class SmokeResult:
     subscription_requested: bool = False
     subscription_established: bool = False
     item_update_received: bool = False
+    failure_stage: str | None = None
+    error_type: str | None = None
     error: str | None = None
 
     @property
@@ -101,9 +103,11 @@ def run_stream_smoke(
 
     result = SmokeResult()
     sdk_client = None
+    stage = "authenticate"
     try:
         session_data = client.authenticate()
         result.authentication = True
+        stage = "resolve_session"
         session = client.ensure_session()
         endpoint = session.lightstreamer_endpoint or session_data.get("lightstreamerEndpoint")
         account_id = session.account_id or session_data.get("currentAccountId")
@@ -112,6 +116,7 @@ def run_stream_smoke(
             result.error = "missing session streaming details"
             return result
 
+        stage = "discover_market"
         candidates = discover_markets(client, {"US Tech 100": "US Tech 100"})
         verified = sorted(
             (candidate for candidate in candidates if candidate.verified),
@@ -127,15 +132,20 @@ def run_stream_smoke(
             client_factory = client_factory or sdk_client_type
             subscription_factory = subscription_factory or subscription_type
 
+        stage = "create_sdk_client"
         sdk_client = client_factory(endpoint, "DEFAULT")
         result.sdk_client_created = True
         connected = threading.Event()
         sdk_client.addListener(_ConnectionListener(result, connected))
-        sdk_client.setUser(account_id)
-        sdk_client.setPassword(lightstreamer_password(session.cst, session.security_token))
+        stage = "configure_connection"
+        configure_lightstreamer_connection(
+            sdk_client, account_id, lightstreamer_password(session.cst, session.security_token)
+        )
         result.connect_invoked = True
+        stage = "connect"
         started = time.monotonic()
         sdk_client.connect()
+        stage = "wait_for_connection"
         remaining = max(0.0, duration - (time.monotonic() - started))
         if not connected.wait(remaining):
             result.error = "SDK did not reach CONNECTED"
@@ -143,6 +153,7 @@ def run_stream_smoke(
 
         subscribed = threading.Event()
         updated = threading.Event()
+        stage = "create_subscription"
         subscription = subscription_factory(
             "MERGE",
             [f"PRICE:{account_id}:{epic}"],
@@ -151,15 +162,20 @@ def run_stream_smoke(
         subscription.setDataAdapter("Pricing")
         subscription.addListener(_SubscriptionListener(result, subscribed, updated))
         result.subscription_requested = True
+        stage = "subscribe"
         sdk_client.subscribe(subscription)
+        stage = "wait_for_subscription"
         remaining = max(0.0, duration - (time.monotonic() - started))
         if not subscribed.wait(remaining):
             result.error = "subscription was not established"
             return result
+        stage = "wait_for_update"
         if not updated.wait(max(0.0, duration - (time.monotonic() - started))):
             result.error = "no ItemUpdate received"
     except Exception as exc:
-        result.error = type(exc).__name__
+        result.failure_stage = stage
+        result.error_type = type(exc).__name__
+        result.error = result.error_type
     finally:
         if sdk_client is not None:
             try:
@@ -185,4 +201,8 @@ def format_smoke_result(result: SmokeResult) -> str:
             f"LIVE SMOKE TEST: {'PASS' if result.passed else 'FAIL'}",
         ]
     )
+    if result.failure_stage:
+        lines.append(f"Failure stage: {result.failure_stage}")
+    if result.error_type:
+        lines.append(f"Error type: {result.error_type}")
     return "\n".join(lines)

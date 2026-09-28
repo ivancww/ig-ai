@@ -40,15 +40,10 @@ class FakeSDKClient:
     def __init__(self, endpoint, adapter_set):
         self.endpoint = endpoint
         self.adapter_set = adapter_set
+        self.connectionDetails = FakeConnectionDetails()
         self.listener = None
         self.events = []
         self.subscription = None
-
-    def setUser(self, user):
-        self.events.append(("user", user))
-
-    def setPassword(self, password):
-        self.events.append(("password", password))
 
     def addListener(self, listener):
         self.events.append(("listener",))
@@ -66,6 +61,17 @@ class FakeSDKClient:
 
     def disconnect(self):
         self.events.append(("disconnect",))
+
+
+class FakeConnectionDetails:
+    def __init__(self):
+        self.values = []
+
+    def setUser(self, user):
+        self.values.append(("user", user))
+
+    def setPassword(self, password):
+        self.values.append(("password", password))
 
 
 def fake_discovery(monkeypatch):
@@ -109,6 +115,10 @@ def test_smoke_path_connects_and_receives_one_update_without_high_level_service(
     assert subscription.items == ["PRICE:ACCOUNT:CS.D.US. NASDAQ. MINI.IP"]
     assert subscription.adapter == "Pricing"
     assert subscription.fields == ["BIDPRICE1", "ASKPRICE1", "TIMESTAMP", "DLG_FLAG"]
+    assert created[0].connectionDetails.values == [
+        ("user", "ACCOUNT"),
+        ("password", "CST-cst|XST-token"),
+    ]
 
 
 def test_stream_smoke_command_connects_once_after_client_creation(monkeypatch):
@@ -159,3 +169,28 @@ def test_smoke_output_does_not_include_credentials_or_prices():
     assert "cst" not in output.lower()
     assert "token" not in output.lower()
     assert "100" not in output
+
+
+def test_smoke_reports_failure_stage_and_error_type_without_exception_text(monkeypatch):
+    fake_discovery(monkeypatch)
+
+    class BrokenDetails(FakeConnectionDetails):
+        def setUser(self, _user):
+            raise RuntimeError("CST-secret|XST-token must never be printed")
+
+    class BrokenClient(FakeSDKClient):
+        def __init__(self, endpoint, adapter_set):
+            super().__init__(endpoint, adapter_set)
+            self.connectionDetails = BrokenDetails()
+
+    result = run_stream_smoke(
+        FakeRestClient(), 1, client_factory=BrokenClient, subscription_factory=FakeSDKSubscription
+    )
+
+    output = format_smoke_result(result)
+    assert result.failure_stage == "configure_connection"
+    assert result.error_type == "RuntimeError"
+    assert "Failure stage: configure_connection" in output
+    assert "Error type: RuntimeError" in output
+    assert "CST-secret" not in output
+    assert "XST-token" not in output

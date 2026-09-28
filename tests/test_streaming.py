@@ -10,6 +10,7 @@ from ig_ai.streaming import (
     OfficialLightstreamerTransport,
     StreamDiagnostics,
     Subscription,
+    configure_lightstreamer_connection,
     lightstreamer_password,
 )
 
@@ -47,19 +48,11 @@ class FakeClient:
 
     def __init__(self, endpoint, adapter_set):
         self.endpoint, self.adapter_set = endpoint, adapter_set
-        self.user = self.password = None
+        self.connectionDetails = FakeConnectionDetails(self)
         self.listener = None
         self.subscriptions = []
         self.events = []
         FakeClient.instances.append(self)
-
-    def setUser(self, user):
-        self.events.append("setUser")
-        self.user = user
-
-    def setPassword(self, password):
-        self.events.append("setPassword")
-        self.password = password
 
     def addListener(self, listener):
         self.events.append("addListener")
@@ -75,6 +68,20 @@ class FakeClient:
 
     def disconnect(self):
         self.listener.onStatusChange("DISCONNECTED")
+
+
+class FakeConnectionDetails:
+    def __init__(self, client):
+        self.client = client
+        self.user = self.password = None
+
+    def setUser(self, user):
+        self.client.events.append("connectionDetails.setUser")
+        self.user = user
+
+    def setPassword(self, password):
+        self.client.events.append("connectionDetails.setPassword")
+        self.password = password
 
 
 class FakeListener:
@@ -101,8 +108,8 @@ def test_password_and_sdk_configuration_are_safe(monkeypatch):
     client = FakeClient.instances[0]
     assert client.endpoint == "https://stream.example/lightstreamer?secret=hidden"
     assert client.adapter_set == "DEFAULT"
-    assert client.user == "ACCOUNT"
-    assert client.password == "CST-secret|XST-token"
+    assert client.connectionDetails.user == "ACCOUNT"
+    assert client.connectionDetails.password == "CST-secret|XST-token"
     assert lightstreamer_password("cst", "token") == "CST-cst|XST-token"
     assert "CST-secret" not in transport.diagnostics.sdk_statuses
 
@@ -125,13 +132,41 @@ def test_sdk_connection_waits_for_async_status_and_preserves_configuration_order
     )
 
     client = AsyncClient.instances[0]
-    assert client.events == ["setUser", "setPassword", "addListener", "connect"]
+    assert client.events == [
+        "connectionDetails.setUser",
+        "connectionDetails.setPassword",
+        "addListener",
+        "connect",
+    ]
     assert transport.diagnostics.sdk_client_created
     assert transport.diagnostics.connect_invoked
     assert transport.diagnostics.connection_verified
     assert transport.diagnostics.connection_wait_seconds >= 0.01
     assert transport.diagnostics.client_lifecycle_state == "CONNECTED"
     assert transport.diagnostics.sdk_statuses == ["CONNECTED:STREAM-SENSING"]
+
+
+def test_credentials_require_sdk_connection_details_interface():
+    class Client:
+        def __init__(self):
+            self.connectionDetails = Details()
+
+    class Details:
+        def __init__(self):
+            self.values = []
+
+        def setUser(self, value):
+            self.values.append(("user", value))
+
+        def setPassword(self, value):
+            self.values.append(("password", value))
+
+    client = Client()
+    configure_lightstreamer_connection(client, "ACCOUNT", "CST-cst|XST-token")
+    assert client.connectionDetails.values == [
+        ("user", "ACCOUNT"),
+        ("password", "CST-cst|XST-token"),
+    ]
 
 
 def test_sdk_server_error_is_captured_without_credentials(monkeypatch):
