@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import types
 
 from ig_ai.streaming import (
@@ -49,18 +50,23 @@ class FakeClient:
         self.user = self.password = None
         self.listener = None
         self.subscriptions = []
+        self.events = []
         FakeClient.instances.append(self)
 
     def setUser(self, user):
+        self.events.append("setUser")
         self.user = user
 
     def setPassword(self, password):
+        self.events.append("setPassword")
         self.password = password
 
     def addListener(self, listener):
+        self.events.append("addListener")
         self.listener = listener
 
     def connect(self):
+        self.events.append("connect")
         self.listener.onStatusChange("CONNECTED:STREAM-SENSING")
 
     def subscribe(self, subscription):
@@ -99,6 +105,57 @@ def test_password_and_sdk_configuration_are_safe(monkeypatch):
     assert client.password == "CST-secret|XST-token"
     assert lightstreamer_password("cst", "token") == "CST-cst|XST-token"
     assert "CST-secret" not in transport.diagnostics.sdk_statuses
+
+
+def test_sdk_connection_waits_for_async_status_and_preserves_configuration_order(monkeypatch):
+    install_sdk(monkeypatch)
+
+    class AsyncClient(FakeClient):
+        def connect(self):
+            self.events.append("connect")
+            threading.Timer(
+                0.01, lambda: self.listener.onStatusChange("CONNECTED:STREAM-SENSING")
+            ).start()
+
+    transport = OfficialLightstreamerTransport(client_factory=AsyncClient, connection_timeout=1)
+    transport.connect(
+        "https://stream.example/lightstreamer",
+        "ACTIVE-ACCOUNT",
+        "CST-secret|XST-token",
+    )
+
+    client = AsyncClient.instances[0]
+    assert client.events == ["setUser", "setPassword", "addListener", "connect"]
+    assert transport.diagnostics.sdk_client_created
+    assert transport.diagnostics.connect_invoked
+    assert transport.diagnostics.connection_verified
+    assert transport.diagnostics.connection_wait_seconds >= 0.01
+    assert transport.diagnostics.client_lifecycle_state == "CONNECTED"
+    assert transport.diagnostics.sdk_statuses == ["CONNECTED:STREAM-SENSING"]
+
+
+def test_sdk_server_error_is_captured_without_credentials(monkeypatch):
+    install_sdk(monkeypatch)
+
+    class ErrorClient(FakeClient):
+        def connect(self):
+            self.events.append("connect")
+            self.listener.onStatusChange("CONNECTING")
+            self.listener.onStatusChange("DISCONNECTED")
+            self.listener.onServerError(1, "bad CST-secret|XST-token password")
+
+    transport = OfficialLightstreamerTransport(client_factory=ErrorClient, connection_timeout=1)
+    try:
+        transport.connect("https://stream.example/lightstreamer", "ACCOUNT", "CST-secret|XST-token")
+    except ConnectionError:
+        pass
+    else:
+        raise AssertionError("connection should not be verified")
+
+    assert transport.diagnostics.server_error_code == 1
+    assert "CST-secret" not in transport.diagnostics.server_error_message
+    assert "XST-token" not in transport.diagnostics.server_error_message
+    assert transport.diagnostics.connection_verified is False
 
 
 def test_merge_price_subscription_pricing_adapter_and_required_fields(monkeypatch):

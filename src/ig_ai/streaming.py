@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -63,6 +64,12 @@ class StreamDiagnostics:
     intentional_shutdown: bool = False
     duration_expired: bool = False
     unexpected_disconnect: bool = False
+    sdk_client_created: bool = False
+    connect_invoked: bool = False
+    connection_wait_seconds: float = 0.0
+    server_error_code: int | None = None
+    server_error_message: str | None = None
+    client_lifecycle_state: str = "NOT_CREATED"
 
 
 @dataclass
@@ -78,9 +85,12 @@ class StreamStats:
 class OfficialLightstreamerTransport:
     """Official Lightstreamer Python SDK boundary for IG streaming."""
 
-    def __init__(self, client_factory: Callable[..., Any] | None = None):
+    def __init__(self, client_factory: Callable[..., Any] | None = None, *, connection_timeout: float = 15.0):
         self._client_factory = client_factory
+        self._connection_timeout = connection_timeout
         self._client = None
+        self._connection_event = threading.Event()
+        self._sensitive_values: tuple[str, ...] = ()
         self._subscriptions: dict[str, Any] = {}
         self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._subscription_specs: dict[str, dict[str, str]] = {}
@@ -101,20 +111,58 @@ class OfficialLightstreamerTransport:
             raise RuntimeError("Install ig-ai[streaming] to use the Lightstreamer SDK") from exc
         return LightstreamerClient, sdk_subscription, SubscriptionListener
 
+    def _safe_server_error(self, message: object) -> str:
+        safe = str(message)
+        for value in self._sensitive_values:
+            if value:
+                safe = safe.replace(value, "[REDACTED]")
+        safe = re.sub(r"(?i)(?:CST|XST)-[^\s|,;]+", "[REDACTED]", safe)
+        return safe[:500]
+
     def connect(self, endpoint: str, username: str, password: str) -> None:
         client_factory, _, _ = self._sdk()
+        started = time.monotonic()
+        self._connection_event.clear()
+        self.diagnostics.connection_state = "DISCONNECTED"
+        self.diagnostics.connection_verified = False
+        self.diagnostics.connect_invoked = False
+        self.diagnostics.connection_wait_seconds = 0.0
+        self.diagnostics.server_error_code = None
+        self.diagnostics.server_error_message = None
+        self.diagnostics.client_lifecycle_state = "NOT_CREATED"
+        self._sensitive_values = (username, password)
         try:
+            # The endpoint is the exact lightstreamerEndpoint returned by IG.
+            # The SDK accepts the server address and adapter set separately; it
+            # owns the /lightstreamer transport path and protocol selection.
             self._client = client_factory(endpoint, "DEFAULT")
+            self.diagnostics.sdk_client_created = True
+            self.diagnostics.client_lifecycle_state = "CREATED"
             self._client.setUser(username)
             self._client.setPassword(password)
+            self.diagnostics.client_lifecycle_state = "CONFIGURED"
             self._client.addListener(_ClientListener(self))
+            self.diagnostics.client_lifecycle_state = "LISTENER_ATTACHED"
+            self.diagnostics.connect_invoked = True
+            self.diagnostics.client_lifecycle_state = "CONNECT_REQUESTED"
             self._client.connect()
         except Exception as exc:
+            self.diagnostics.connection_wait_seconds = time.monotonic() - started
+            self.diagnostics.client_lifecycle_state = "FAILED"
             raise LightstreamerError(
                 "Lightstreamer SDK connection failed", endpoint=endpoint, phase="connect"
             ) from exc
-        self.diagnostics.connection_verified = True
-        self.diagnostics.connection_state = "CONNECTED"
+
+        connected = self._connection_event.wait(self._connection_timeout)
+        self.diagnostics.connection_wait_seconds = time.monotonic() - started
+        if not connected or not self.diagnostics.connection_verified:
+            self.diagnostics.client_lifecycle_state = "FAILED"
+            detail = self.diagnostics.server_error_message or "connection status was not CONNECTED"
+            raise LightstreamerError(
+                f"Lightstreamer SDK connection not established: {detail}",
+                endpoint=endpoint,
+                phase="connect",
+            )
 
     def send(self, command: str, params: dict[str, str]) -> None:
         if command != "subscribe" or self._client is None:
@@ -142,6 +190,7 @@ class OfficialLightstreamerTransport:
             self._client.disconnect()
         self._client = None
         self.diagnostics.connection_state = "DISCONNECTED"
+        self.diagnostics.client_lifecycle_state = "CLOSED"
 
     def _on_item_update(self, subscription_id: str, update: Any) -> None:
         spec = self._subscription_specs[subscription_id]
@@ -168,9 +217,17 @@ class _ClientListener:
         self.transport.diagnostics.connection_state = status
         if status.startswith("CONNECTED"):
             self.transport.diagnostics.connection_verified = True
+            self.transport.diagnostics.client_lifecycle_state = "CONNECTED"
+            self.transport._connection_event.set()
+        elif status.startswith("DISCONNECTED"):
+            self.transport.diagnostics.client_lifecycle_state = "DISCONNECTED"
 
-    def onServerError(self, error_code: int, _error_message: str) -> None:
-        self.transport.diagnostics.warnings.append(f"SDK server error {error_code}")
+    def onServerError(self, error_code: int, error_message: str) -> None:
+        safe_message = self.transport._safe_server_error(error_message)
+        self.transport.diagnostics.server_error_code = int(error_code)
+        self.transport.diagnostics.server_error_message = safe_message
+        self.transport.diagnostics.warnings.append(f"SDK server error {error_code}: {safe_message}")
+        self.transport._connection_event.set()
 
 
 class _SubscriptionListener:

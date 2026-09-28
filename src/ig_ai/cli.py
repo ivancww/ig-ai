@@ -165,7 +165,13 @@ def main() -> int:
                     + f"markets receiving updates={sum(bool(value) for value in stream.stats.updates_received.values())}/{len(instruments)}; "
                     + f"observations={sink.observations_written}; 15M candles={sink.candles_written['15M']}; "
                     + f"1H candles={sink.candles_written['1H']}; reconnects={stream.stats.reconnect_count}; "
-                    + f"; SDK statuses={','.join(stream.stats.diagnostics.sdk_statuses) or 'NONE'}"
+                    + f"; SDK statuses={','.join(stream.stats.diagnostics.sdk_statuses) or 'NONE'}; "
+                    + f"SDK client created={str(stream.stats.diagnostics.sdk_client_created).lower()}; "
+                    + f"connect invoked={str(stream.stats.diagnostics.connect_invoked).lower()}; "
+                    + f"connection wait={stream.stats.diagnostics.connection_wait_seconds:.3f}s; "
+                    + f"client lifecycle={stream.stats.diagnostics.client_lifecycle_state}; "
+                    + f"server error code={stream.stats.diagnostics.server_error_code or 'NONE'}; "
+                    + f"server error message={stream.stats.diagnostics.server_error_message or 'NONE'}"
                 ),
                 runtime_outcome="COMPLETED",
                 connection_established=(
