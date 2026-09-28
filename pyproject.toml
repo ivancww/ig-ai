@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ig-ai"
+version = "0.1.0"
+description = "Market-data foundation for technical-first IG market analysis"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0,<9", "ruff>=0.6,<1"]
+streaming = ["lightstreamer-client-lib>=2.2,<3"]
+
+[project.scripts]
+ig-ai = "ig_ai.cli:main"
+igai-report = "ig_ai.reporting:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
