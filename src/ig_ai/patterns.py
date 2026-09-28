@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from .direction import DirectionScoreEngine
 from .models import Candle
 from .technical import TechnicalFeatureEngine, _structure, ema, rsi
 
@@ -199,13 +200,20 @@ class MarketStructureEngine:
         breakout = "up" if last_high and close > float(last_high["price"]) else "down" if last_low and close < float(last_low["price"]) else None
         previous_close = float(history[-2].close) if len(history) > 1 else close
         retest = bool((last_high and previous_close > float(last_high["price"]) and float(target.low) <= float(last_high["price"]) <= close) or (last_low and previous_close < float(last_low["price"]) and float(target.high) >= float(last_low["price"]) >= close))
-        false_breakout = bool((last_high and float(target.high) > float(last_high["price"]) and close <= float(last_high["price"])) or (last_low and float(target.low) < float(last_low["price"]) and close >= float(last_low["price"])))
+        false_breakout_up = bool(last_high and float(target.high) > float(last_high["price"]) and close <= float(last_high["price"]))
+        false_breakout_down = bool(last_low and float(target.low) < float(last_low["price"]) and close >= float(last_low["price"]))
+        false_breakout = false_breakout_up or false_breakout_down
         labels = [p["classification"] for p in highs[-2:] + lows[-2:] if p.get("classification")]
         direction = "UP_STRUCTURE" if "HH" in labels and "HL" in labels else "DOWN_STRUCTURE" if "LH" in labels and "LL" in labels else "RANGE"
+        prior_labels = [p["classification"] for p in highs[-3:-1] + lows[-3:-1] if p.get("classification")]
+        prior_direction = "UP" if "HH" in prior_labels and "HL" in prior_labels else "DOWN" if "LH" in prior_labels and "LL" in prior_labels else "NEUTRAL"
+        breakout_direction = breakout
+        current_direction = "UP" if direction == "UP_STRUCTURE" else "DOWN" if direction == "DOWN_STRUCTURE" else "NEUTRAL"
+        break_of_structure = bool(breakout_direction and prior_direction in {"UP", "DOWN"} and breakout_direction != prior_direction)
         ranges = [float(c.high - c.low) for c in history[-5:]]
         compression = len(ranges) >= 3 and ranges[-1] < sum(ranges[:-1]) / len(ranges[:-1])
         expansion = len(ranges) >= 3 and ranges[-1] > sum(ranges[:-1]) / len(ranges[:-1])
-        return {"schema_version": PATTERN_SCHEMA_VERSION, "instrument": target.instrument_id, "timeframe": target.timeframe, "candle_timestamp": target.start.isoformat(), "candle_state": "CLOSED" if target.is_closed else "FORMING", "direction": direction, "confirmed_highs": highs[-5:], "confirmed_lows": lows[-5:], "break_of_structure": breakout is not None, "breakout": breakout, "retest": bool(retest), "false_breakout": false_breakout, "compression": compression, "expansion": expansion}
+        return {"schema_version": PATTERN_SCHEMA_VERSION, "instrument": target.instrument_id, "timeframe": target.timeframe, "candle_timestamp": target.start.isoformat(), "candle_state": "CLOSED" if target.is_closed else "FORMING", "direction": direction, "current_direction": current_direction, "prior_direction": prior_direction, "confirmed_highs": highs[-5:], "confirmed_lows": lows[-5:], "break_of_structure": break_of_structure, "breakout": breakout, "breakout_direction": breakout_direction, "retest": bool(retest), "false_breakout": false_breakout, "false_breakout_direction": "UP" if false_breakout_up else "DOWN" if false_breakout_down else None, "compression": compression, "expansion": expansion}
 
 
 class ChartPatternEngine:
@@ -380,7 +388,8 @@ class MultiTimeframeCoordinator:
             features[timeframe] = {"structure": analysis["structure"], "macd": technical["macd"], "rsi14": technical["rsi"]}
             divergences[timeframe] = analysis["divergences"]
         direction = DirectionReversalEngine().classify(features, divergences)
-        return {"schema_version": PATTERN_SCHEMA_VERSION, "timeframes": analyses, "direction_reversal": direction, "history_lengths": {timeframe: len(candles) for timeframe, candles in aligned.items()}}
+        direction_score = DirectionScoreEngine().analyze(analyses)
+        return {"schema_version": PATTERN_SCHEMA_VERSION, "timeframes": analyses, "direction_reversal": direction, "direction_score": direction_score, "history_lengths": {timeframe: len(candles) for timeframe, candles in aligned.items()}}
 
 
 class Phase2BEngine:

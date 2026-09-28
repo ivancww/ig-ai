@@ -283,6 +283,22 @@ def test_multi_timeframe_alignment_uses_closed_end_not_start_only():
     assert result["history_lengths"]["1D"] == 0
 
 
+def test_phase3_direction_score_excludes_future_higher_timeframe_evidence():
+    histories = {
+        "15M": [make_candle(i, open_=100, high=102, low=98, close=100, timeframe="15M") for i in range(8)],
+        "1H": [make_candle(i, open_=100, high=102, low=98, close=100, timeframe="1H") for i in range(6)],
+        "4H": [make_candle(i * 4, open_=100, high=102, low=98, close=100, timeframe="4H") for i in range(3)],
+        "1D": [make_candle(i * 24, open_=100, high=102, low=98, close=100, timeframe="1D") for i in range(2)],
+    }
+    target = histories["1H"][4]
+    baseline = MultiTimeframeCoordinator(max_history=20).analyze(histories, target_time=target.start, target_timeframe="1H")
+    histories["4H"][1] = make_candle(4, open_=500, high=900, low=400, close=850, timeframe="4H", closed=False)
+    histories["1D"][0] = make_candle(0, open_=500, high=900, low=400, close=850, timeframe="1D", closed=False)
+    future = MultiTimeframeCoordinator(max_history=20).analyze(histories, target_time=target.start, target_timeframe="1H")
+    assert future["history_lengths"] == baseline["history_lengths"]
+    assert future["direction_score"] == baseline["direction_score"]
+
+
 def test_runtime_throttles_forming_phase2b_analysis(tmp_path):
     database = Database(tmp_path / "throttle.sqlite")
     sink = PersistedStream(database, {"TEST": Instrument("TEST", "TEST.EPIC", "Test")})

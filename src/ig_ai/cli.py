@@ -25,6 +25,14 @@ from .streaming import (
 )
 
 
+def direction_evidence_sections(snapshot: dict) -> tuple[list[dict], list[dict]]:
+    """Return evidence relative to the primary model direction, not labels."""
+    direction = snapshot.get("direction")
+    supporting = [item for item in snapshot.get("evidence_ledger", []) if item.get("direction") == direction]
+    opposing = [item for item in snapshot.get("evidence_ledger", []) if item.get("direction") in {"UP", "DOWN"} and item.get("direction") != direction]
+    return supporting, opposing
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="ig-ai")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -38,6 +46,9 @@ def main() -> int:
     pattern_parser = commands.add_parser("pattern-status")
     pattern_parser.add_argument("--instrument", default=None)
     pattern_parser.add_argument("--timeframe", choices=("15M", "1H", "4H", "1D"), default="1H")
+    direction_parser = commands.add_parser("direction-status")
+    direction_parser.add_argument("--instrument", default=None)
+    direction_parser.add_argument("--timeframe", choices=("15M", "1H", "4H", "1D"), default="1H")
     stream_parser = commands.add_parser("stream")
     stream_parser.add_argument("--duration", type=float, default=300.0)
     stream_parser.add_argument("--markets", default="US Tech 100,Japan 225,Hong Kong HS50")
@@ -109,6 +120,43 @@ def main() -> int:
                     print(f"  {pattern['pattern']}: {pattern.get('lifecycle')} ({pattern.get('candle_state')})")
                 print(f"Direction/reversal evidence: {status['direction_reversal']}")
                 print("Inspection only; no trading recommendation.")
+            finally:
+                database.close()
+            return 0
+        if args.command == "direction-status":
+            settings = Settings.from_env(require_credentials=False)
+            database = Database(settings.database_path)
+            try:
+                instruments = database.list_instruments()
+                selected = args.instrument or (instruments[0][0] if instruments else None)
+                if selected is None:
+                    print("No instruments or direction snapshots available.")
+                    return 0
+                if args.timeframe != "1H":
+                    print("Direction model reference timeframe is 1H; no independent direction model exists for this timeframe.")
+                    return 0
+                snapshot = database.get_direction_status(selected, args.timeframe)
+                if snapshot is None:
+                    print(f"No direction snapshot for {selected} {args.timeframe}.")
+                    return 0
+                print(selected)
+                print(f"Primary Direction: {snapshot['direction']}")
+                reference = snapshot.get("model_reference", snapshot)
+                print(f"Model Reference: {reference['timeframe']} {reference['candle_timestamp']}")
+                print(f"UP Score: {snapshot['up_score']}")
+                print(f"DOWN Score: {snapshot['down_score']}")
+                print(f"Trend Stage: {snapshot['trend_stage']}")
+                print(f"Holding Window: {snapshot['holding_window']}")
+                print(f"Reversal Risk: {snapshot['reversal_risk']['category']}")
+                print(f"Timeframe Agreement: {snapshot['timeframe_agreement']['status']}")
+                supporting, opposing = direction_evidence_sections(snapshot)
+                print("Supporting Evidence:")
+                for item in supporting:
+                    print(f"  - {item['timeframe']} {item['evidence_type']}: {item['raw_state']}")
+                print("Opposing/Risk Evidence:")
+                for item in opposing:
+                    print(f"  - {item['timeframe']} {item['evidence_type']}: {item['raw_state']}")
+                print("Technical score only — not a calibrated probability or trading recommendation.")
             finally:
                 database.close()
             return 0
