@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
-from urllib.parse import urlencode, urlsplit, urlunsplit
+from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 
 log = logging.getLogger(__name__)
 
@@ -475,12 +475,23 @@ class WebSocketLightstreamerTransport:
             return {"type": tag}
         if tag != "U" or len(args) < 3:
             return {"type": tag or "UNKNOWN"}
-        subscription_id, item, values = args[0], args[1], args[2]
+        subscription_id, item, encoded_values = args[0], unquote(args[1]), args[2]
         field_names = getattr(self, "_field_names_by_subscription", {}).get(subscription_id, tuple(self._field_names))
         field_state = getattr(self, "_field_state", {})
         state = field_state.setdefault((subscription_id, item), {})
         previous_state_available = bool(state)
-        received_values = values.split("|")
+        encoded_values_list = encoded_values.split("|")
+        # TLCP keeps the final U argument intact during first-pass parsing and
+        # percent-decodes each field value during second-level decoding. Some
+        # IG runtime frames URL-encode the whole field list, including its
+        # pipes; accept that provider form when no literal field separator is
+        # present, without changing the standard handling of encoded pipes in
+        # an individual field value.
+        if len(encoded_values_list) == 1 and "%7c" in encoded_values.lower():
+            decoded_values = unquote(encoded_values)
+            received_values = decoded_values.split("|")
+        else:
+            received_values = [unquote(value) for value in encoded_values_list]
         changed_fields: list[str] = []
         field_index = 0
         for value in received_values:
@@ -524,6 +535,9 @@ class WebSocketLightstreamerTransport:
             "none" if sufficient else "missing_bid_or_ask",
             field_count_received=len(received_values),
             previous_state_available=previous_state_available,
+            u_argument_count=len(args),
+            encoded_field_token_count=len(encoded_values_list),
+            decoded_field_count=len(received_values),
         )
         return update
 
@@ -537,6 +551,9 @@ class WebSocketLightstreamerTransport:
         *,
         field_count_received: int = 0,
         previous_state_available: bool = False,
+        u_argument_count: int = 0,
+        encoded_field_token_count: int = 0,
+        decoded_field_count: int = 0,
     ) -> None:
         field_names = getattr(self, "_field_names_by_subscription", {}).get(subscription_id, tuple(self._field_names))
         decoded_names = [name for name in field_names if state.get(name) not in (None, "")]
@@ -553,6 +570,9 @@ class WebSocketLightstreamerTransport:
                 "subscription_id": subscription_id,
                 "item_index": item,
                 "schema_fields_expected": ",".join(field_names),
+                "u_argument_count": str(u_argument_count),
+                "encoded_field_token_count": str(encoded_field_token_count),
+                "decoded_field_count": str(decoded_field_count),
                 "field_count_received": str(field_count_received),
                 "decoded_field_names_present": ",".join(decoded_names),
                 "fields_changed": ",".join(fields),
@@ -587,7 +607,13 @@ class WebSocketLightstreamerTransport:
     @staticmethod
     def _response(line: str) -> tuple[str, list[str]]:
         parts = line.split(",", 1)
-        return parts[0], parts[1].split(",") if len(parts) == 2 else []
+        if len(parts) != 2:
+            return parts[0], []
+        if parts[0] == "U":
+            # U has exactly three arguments. The final field-list argument is
+            # variable-length and may itself contain commas.
+            return parts[0], parts[1].split(",", 2)
+        return parts[0], parts[1].split(",")
 
     def _raise_protocol(self, tag: str, args: list[str], phase: str) -> None:
         self._ensure_diagnostics()

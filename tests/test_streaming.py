@@ -344,6 +344,47 @@ def test_realistic_price_schema_diagnostic_marks_decoded_fields_without_values()
     assert "100" not in str(diagnostic)
 
 
+def test_u_parser_preserves_final_argument_and_decodes_encoded_field_list():
+    transport = object.__new__(WebSocketLightstreamerTransport)
+    transport._field_names = ["BIDPRICE1", "ASKPRICE1", "TIMESTAMP", "DLG_FLAG"]
+    transport._field_names_by_subscription = {"1": tuple(transport._field_names)}
+    transport._market_identity_by_subscription = {"1": "EPIC"}
+    transport._field_state = {}
+    transport._secrets = ()
+    transport.diagnostics = StreamDiagnostics()
+    transport.diagnostics.subscription_requests_sent["1"] = "PRICE:ACCOUNT:EPIC"
+
+    update = transport._parse(
+        "U,1,1,100%7C102%7C1760000000000%7CTRADEABLE,comma-preserved"
+    )
+
+    assert update["BIDPRICE1"] == "100"
+    assert update["ASKPRICE1"] == "102"
+    assert update["TIMESTAMP"] == "1760000000000"
+    assert update["DLG_FLAG"] == "TRADEABLE,comma-preserved"
+    diagnostic = transport.diagnostics.safe_update_diagnostics[-1]
+    assert diagnostic["u_argument_count"] == "3"
+    assert diagnostic["encoded_field_token_count"] == "1"
+    assert diagnostic["decoded_field_count"] == "4"
+    assert diagnostic["fields_changed"] == "BIDPRICE1,ASKPRICE1,TIMESTAMP,DLG_FLAG"
+
+
+def test_u_parser_decodes_each_pipe_field_without_decoding_field_boundaries():
+    transport = object.__new__(WebSocketLightstreamerTransport)
+    transport._field_names = ["BIDPRICE1", "ASKPRICE1"]
+    transport._field_names_by_subscription = {"1": tuple(transport._field_names)}
+    transport._market_identity_by_subscription = {"1": "EPIC"}
+    transport._field_state = {}
+    transport._secrets = ()
+    transport.diagnostics = StreamDiagnostics()
+    transport.diagnostics.subscription_requests_sent["1"] = "PRICE:ACCOUNT:EPIC"
+
+    update = transport._parse("U,1,1,100%2C25|102%7C50")
+
+    assert update["BIDPRICE1"] == "100,25"
+    assert update["ASKPRICE1"] == "102|50"
+
+
 def test_decoder_keeps_subscription_and_item_state_isolated():
     transport = object.__new__(WebSocketLightstreamerTransport)
     transport._field_names = []
