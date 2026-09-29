@@ -168,23 +168,19 @@ class HistoricalIGClient:
         resolution = IG_RESOLUTIONS[timeframe]
         all_rows: list[dict[str, Any]] = []
         page_count = 0
-        # IG's current date-range contract is the version-2 path endpoint.  The
-        # legacy version-1 query endpoint accepts a different date format, so
-        # sending ISO timestamps there causes a provider HTTP 400.
-        start_text = start.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
-        end_text = end.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
-        path = "/prices/{}/{}/{}/{}".format(
-            quote(epic, safe=""),
-            resolution,
-            quote(start_text, safe=""),
-            quote(end_text, safe=""),
-        )
-        params: dict[str, str] | None = None
+        # IG's date-range query contract is version 1 and requires its
+        # provider-specific yyyy:MM:dd-HH:mm:ss format.  The version-2 path
+        # and version-3 /prices/{epic} forms are not accepted by the live
+        # historical endpoint used by this account.
+        start_text = start.astimezone(UTC).strftime("%Y:%m:%d-%H:%M:%S")
+        end_text = end.astimezone(UTC).strftime("%Y:%m:%d-%H:%M:%S")
+        path = f"/prices/{quote(epic, safe='')}/{resolution}"
+        params: dict[str, str] | None = {"startdate": start_text, "enddate": end_text}
         while True:
             page_attempt = 0
             while True:
                 try:
-                    payload, headers = self.client._request("GET", path, params=params, version="2", retry=False, phase="historical_backfill")
+                    payload, headers = self.client._request("GET", path, params=params, version="1", retry=False, phase="historical_backfill")
                     break
                 except RateLimitError:
                     if page_attempt >= self.max_retries:

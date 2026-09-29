@@ -83,7 +83,7 @@ def test_provider_paging_is_followed_and_rows_are_combined():
     assert len(rows) == 2 and metadata["pages"] == 2 and len(client.calls) == 2
 
 
-def test_historical_date_range_uses_ig_version_two_path_contract():
+def test_historical_date_range_uses_ig_version_one_query_contract():
     client = PagingClient([({"prices": [row()]}, {})])
     HistoricalIGClient(client, pacing_seconds=0).fetch(
         "CS.D.US.TECH.CFD.IP", "1H",
@@ -93,9 +93,12 @@ def test_historical_date_range_uses_ig_version_two_path_contract():
 
     method, path, kwargs = client.calls[0]
     assert method == "GET"
-    assert path == "/prices/CS.D.US.TECH.CFD.IP/HOUR/2026-01-01%2000%3A00%3A01/2026-01-02%2000%3A00%3A02"
-    assert kwargs["params"] is None
-    assert kwargs["version"] == "2"
+    assert path == "/prices/CS.D.US.TECH.CFD.IP/HOUR"
+    assert kwargs["params"] == {
+        "startdate": "2026:01:01-00:00:01",
+        "enddate": "2026:01:02-00:00:02",
+    }
+    assert kwargs["version"] == "1"
     assert kwargs["retry"] is False
     assert kwargs["phase"] == "historical_backfill"
 
