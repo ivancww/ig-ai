@@ -45,3 +45,6 @@ RUFF: PASS
 DIFF CHECK: PASS
 SECURITY: PASS — 2 passed
 FILES CHANGED: src/ig_ai/database.py; src/ig_ai/history.py; src/ig_ai/cli.py; tests/test_history.py; igai-report.txt
+BRANCH: fix/historical-malformed-row-skip
+HEAD SHA: cd4fb07
+PR: #11 — https://github.com/ivancww/ig-ai/pull/11 (OPEN; do not merge)
