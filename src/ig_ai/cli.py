@@ -11,7 +11,7 @@ from pathlib import Path
 from .config import Settings
 from .database import Database
 from .discovery import discover_market_groups, select_stream_instruments
-from .exceptions import IGHTTPError
+from .exceptions import IGHTTPError, MalformedResponseError
 from .history import SUPPORTED_TIMEFRAMES, BackfillService, HistoricalIGClient, ReplayService
 from .models import Instrument
 from .phase1 import run_phase1_check
@@ -576,7 +576,7 @@ def main() -> int:
             print(format_smoke_result(result))
             return 0 if result.passed else 1
     except Exception as exc:
-        safe_output = exc.safe_diagnostic() if isinstance(exc, IGHTTPError) else type(exc).__name__
+        safe_output = exc.safe_diagnostic() if isinstance(exc, (IGHTTPError, MalformedResponseError)) else type(exc).__name__
         update_terminal_report(
             command=f"ig-ai {args.command}",
             account_type=os.environ.get("IG_ACCOUNT_TYPE", "DEMO"),

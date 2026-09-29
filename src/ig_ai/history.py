@@ -7,6 +7,8 @@ UTC fallback for fixtures/providers that omit it.
 """
 from __future__ import annotations
 
+import json
+import re
 import time
 from collections import deque
 from collections.abc import Iterable
@@ -16,7 +18,7 @@ from decimal import Decimal, InvalidOperation
 from itertools import pairwise
 from math import isfinite
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, quote, urlsplit
 
 from .direction import DIRECTION_SCHEMA_VERSION
 from .discovery import discover_market_groups, select_stream_instruments
@@ -48,6 +50,13 @@ def parse_ig_timestamp(value: Any, *, allow_naive: bool = False) -> datetime:
             return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
         except ValueError:
             continue
+    try:
+        parsed = datetime.strptime(text, "%Y:%m:%d-%H:%M:%S")
+        if not allow_naive:
+            raise MalformedResponseError("un-zoned IG provider timestamp is not accepted; use snapshotTimeUTC")
+        return parsed.replace(tzinfo=UTC)
+    except ValueError:
+        pass
     raise MalformedResponseError("historical candle timestamp is invalid")
 
 
@@ -69,15 +78,52 @@ def _field(row: dict[str, Any], *names: str) -> Any:
     return None
 
 
+def safe_historical_response_diagnostic(row: dict[str, Any], metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Describe historical response shape without returning provider values."""
+    timestamp_fields = {}
+    for name in ("snapshotTimeUTC", "snapshotTime", "timestamp", "time"):
+        if name not in row:
+            continue
+        value = row[name]
+        item = {"type": type(value).__name__}
+        if isinstance(value, str):
+            item.update({"length": len(value), "masked_shape": re.sub(r"[A-Za-z0-9]", "X", value)})
+        timestamp_fields[name] = item
+
+    def field_types(value: Any) -> dict[str, str]:
+        return {key: type(item).__name__ for key, item in value.items()} if isinstance(value, dict) else {}
+
+    metadata = metadata if isinstance(metadata, dict) else {}
+    metadata_names = {"allowance", "pageData", "paging", "size", "next"}
+    return {
+        "timestamp_fields": timestamp_fields,
+        "row_fields": field_types(row),
+        "metadata_fields": {key: type(metadata[key]).__name__ for key in sorted(metadata_names & metadata.keys())},
+        "paging_fields": {
+            key: field_types(metadata.get(key))
+            for key in ("paging", "pageData")
+            if isinstance(metadata.get(key), dict)
+        },
+    }
+
+
 def normalize_historical_price(row: dict[str, Any], *, instrument_id: str, epic: str, timeframe: str) -> Candle:
     if timeframe not in SUPPORTED_TIMEFRAMES:
         raise ValueError(f"unsupported timeframe: {timeframe}")
     timestamp = _field(row, "snapshotTimeUTC")
-    if timestamp is None:
-        timestamp = _field(row, "snapshotTime", "timestamp", "time")
+    if timestamp is not None:
+        # Prefer IG's authoritative UTC field whenever the provider supplies it.
+        start = parse_ig_timestamp(timestamp)
+    elif row.get("snapshotTime") is not None:
+        # The verified v1 response documents snapshotTime without an offset;
+        # IG's general API date semantics make that value UTC.  Do not apply
+        # this interpretation to arbitrary fallback fields.
+        start = parse_ig_timestamp(row["snapshotTime"], allow_naive=True)
+    else:
+        timestamp = _field(row, "timestamp", "time")
         if isinstance(timestamp, str) and ("+" not in timestamp and not timestamp.endswith("Z")):
-            raise MalformedResponseError("IG snapshotTime fallback must include an explicit timezone")
-    start = parse_ig_timestamp(timestamp)
+            raise MalformedResponseError("historical timestamp fallback must include an explicit timezone")
+        start = parse_ig_timestamp(timestamp)
     end = start + TIMEFRAME_DURATION[timeframe]
     opens = _field(row, "openPrice", "open")
     highs = _field(row, "highPrice", "high")
@@ -168,13 +214,19 @@ class HistoricalIGClient:
         resolution = IG_RESOLUTIONS[timeframe]
         all_rows: list[dict[str, Any]] = []
         page_count = 0
-        path = f"/prices/{epic}/{resolution}"
-        params: dict[str, str] = {"startdate": start.isoformat(), "enddate": end.isoformat()}
+        # IG's date-range query contract is version 1 and requires its
+        # provider-specific yyyy:MM:dd-HH:mm:ss format.  The version-2 path
+        # and version-3 /prices/{epic} forms are not accepted by the live
+        # historical endpoint used by this account.
+        start_text = start.astimezone(UTC).strftime("%Y:%m:%d-%H:%M:%S")
+        end_text = end.astimezone(UTC).strftime("%Y:%m:%d-%H:%M:%S")
+        path = f"/prices/{quote(epic, safe='')}/{resolution}"
+        params: dict[str, str] | None = {"startdate": start_text, "enddate": end_text}
         while True:
             page_attempt = 0
             while True:
                 try:
-                    payload, headers = self.client._request("GET", path, params=params, version="3", retry=False, phase="historical_backfill")
+                    payload, headers = self.client._request("GET", path, params=params, version="1", retry=False, phase="historical_backfill")
                     break
                 except RateLimitError:
                     if page_attempt >= self.max_retries:
@@ -254,7 +306,11 @@ class BackfillService:
                     raise MalformedResponseError("historical provider coverage is incomplete")
                 chunk_inserted = 0
                 for row in sorted(rows, key=lambda value: str(value.get("snapshotTimeUTC") or value.get("snapshotTime") or "")):
-                    candle = normalize_historical_price(row, instrument_id=instrument_id, epic=candidate.epic, timeframe=timeframe)
+                    try:
+                        candle = normalize_historical_price(row, instrument_id=instrument_id, epic=candidate.epic, timeframe=timeframe)
+                    except MalformedResponseError as exc:
+                        diagnostic = safe_historical_response_diagnostic(row, metadata.get("metadata"))
+                        raise MalformedResponseError(f"{exc}; safe_response_shape={json.dumps(diagnostic, sort_keys=True)}") from exc
                     if not (start <= candle.start < end):
                         continue
                     retrieved += 1

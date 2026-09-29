@@ -50,3 +50,7 @@ class RateLimitError(IGHTTPError):
 
 class MalformedResponseError(IGError):
     """IG returned a response that could not be interpreted."""
+
+    def safe_diagnostic(self) -> str:
+        """Return the already-sanitized response-shape diagnostic, if present."""
+        return f"Malformed response: {self}"

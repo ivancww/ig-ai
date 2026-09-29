@@ -13,6 +13,7 @@ from ig_ai.history import (
     aggregate_candles,
     normalize_historical_price,
     report_gaps,
+    safe_historical_response_diagnostic,
 )
 from ig_ai.models import Candle
 from ig_ai.research import HistoricalReplay
@@ -57,9 +58,58 @@ def test_four_hour_aggregation_rejects_partial_and_non_contiguous_groups():
     assert aggregate_candles(non_contiguous) == []
 
 
-def test_unzoned_snapshot_fallback_is_rejected():
+def test_v1_unzoned_snapshot_time_is_provider_utc():
+    observed = {
+        **row(),
+        "snapshotTimeUTC": None,
+        "snapshotTime": "2026:01:01-00:00:00",
+    }
+    candle = normalize_historical_price(observed, instrument_id="ig:E", epic="E", timeframe="1H")
+    assert candle.start == datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def test_snapshot_time_utc_is_preferred_over_unzoned_snapshot_time():
+    observed = {
+        **row("2026-01-01T00:15:00Z"),
+        "snapshotTime": "2026/01/01 00:00:00",
+    }
+    candle = normalize_historical_price(observed, instrument_id="ig:E", epic="E", timeframe="15M")
+    assert candle.start == datetime(2026, 1, 1, 0, 15, tzinfo=UTC)
+
+
+def test_unzoned_generic_timestamp_fallback_is_rejected():
     with pytest.raises(MalformedResponseError, match="explicit timezone"):
-        normalize_historical_price({**row(), "snapshotTimeUTC": None, "snapshotTime": "2026-01-01 00:00:00"}, instrument_id="ig:E", epic="E", timeframe="1H")
+        normalize_historical_price({**row(), "snapshotTimeUTC": None, "timestamp": "2026-01-01 00:00:00"}, instrument_id="ig:E", epic="E", timeframe="1H")
+
+
+@pytest.mark.parametrize(
+    "value,allow_naive,expected",
+    [
+        ("2026-01-01T00:00:00Z", False, datetime(2026, 1, 1, tzinfo=UTC)),
+        ("2026-01-01T01:00:00+01:00", False, datetime(2026, 1, 1, tzinfo=UTC)),
+        ("2026/01/01 00:00:00", True, datetime(2026, 1, 1, tzinfo=UTC)),
+    ],
+)
+def test_supported_ig_timestamp_shapes_are_normalized_to_utc(value, allow_naive, expected):
+    from ig_ai.history import parse_ig_timestamp
+
+    assert parse_ig_timestamp(value, allow_naive=allow_naive) == expected
+
+
+def test_safe_historical_response_diagnostic_masks_values_and_exposes_shape_only():
+    diagnostic = safe_historical_response_diagnostic(
+        {
+            "snapshotTime": "2026:01:01-00:00:00",
+            "openPrice": {"bid": 1, "ask": 2},
+            "closePrice": None,
+        },
+        {"pageData": {"pageNumber": 0, "totalPages": 1}, "allowance": {"remainingAllowance": 99}},
+    )
+    assert diagnostic["timestamp_fields"]["snapshotTime"] == {"type": "str", "length": 19, "masked_shape": "XXXX:XX:XX-XX:XX:XX"}
+    assert diagnostic["row_fields"] == {"snapshotTime": "str", "openPrice": "dict", "closePrice": "NoneType"}
+    assert diagnostic["metadata_fields"] == {"allowance": "dict", "pageData": "dict"}
+    assert diagnostic["paging_fields"]["pageData"] == {"pageNumber": "int", "totalPages": "int"}
+    assert "2026" not in json.dumps(diagnostic)
 
 
 class PagingClient:
@@ -81,6 +131,26 @@ def test_provider_paging_is_followed_and_rows_are_combined():
     client = PagingClient([(first, {"X-REQUEST-ID": "safe"}), (second, {})])
     rows, metadata = HistoricalIGClient(client, pacing_seconds=0).fetch("E", "1H", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC))
     assert len(rows) == 2 and metadata["pages"] == 2 and len(client.calls) == 2
+
+
+def test_historical_date_range_uses_ig_version_one_query_contract():
+    client = PagingClient([({"prices": [row()]}, {})])
+    HistoricalIGClient(client, pacing_seconds=0).fetch(
+        "CS.D.US.TECH.CFD.IP", "1H",
+        datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
+        datetime(2026, 1, 2, 0, 0, 2, tzinfo=UTC),
+    )
+
+    method, path, kwargs = client.calls[0]
+    assert method == "GET"
+    assert path == "/prices/CS.D.US.TECH.CFD.IP/HOUR"
+    assert kwargs["params"] == {
+        "startdate": "2026:01:01-00:00:01",
+        "enddate": "2026:01:02-00:00:02",
+    }
+    assert kwargs["version"] == "1"
+    assert kwargs["retry"] is False
+    assert kwargs["phase"] == "historical_backfill"
 
 
 def test_each_provider_page_gets_its_own_retry_budget(monkeypatch):
