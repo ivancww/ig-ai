@@ -50,6 +50,13 @@ def parse_ig_timestamp(value: Any, *, allow_naive: bool = False) -> datetime:
             return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
         except ValueError:
             continue
+    try:
+        parsed = datetime.strptime(text, "%Y:%m:%d-%H:%M:%S")
+        if not allow_naive:
+            raise MalformedResponseError("un-zoned IG provider timestamp is not accepted; use snapshotTimeUTC")
+        return parsed.replace(tzinfo=UTC)
+    except ValueError:
+        pass
     raise MalformedResponseError("historical candle timestamp is invalid")
 
 

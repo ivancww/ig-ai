@@ -62,7 +62,7 @@ def test_v1_unzoned_snapshot_time_is_provider_utc():
     observed = {
         **row(),
         "snapshotTimeUTC": None,
-        "snapshotTime": "2026/01/01 00:00:00",
+        "snapshotTime": "2026:01:01-00:00:00",
     }
     candle = normalize_historical_price(observed, instrument_id="ig:E", epic="E", timeframe="1H")
     assert candle.start == datetime(2026, 1, 1, tzinfo=UTC)
@@ -99,13 +99,13 @@ def test_supported_ig_timestamp_shapes_are_normalized_to_utc(value, allow_naive,
 def test_safe_historical_response_diagnostic_masks_values_and_exposes_shape_only():
     diagnostic = safe_historical_response_diagnostic(
         {
-            "snapshotTime": "2026/01/01 00:00:00",
+            "snapshotTime": "2026:01:01-00:00:00",
             "openPrice": {"bid": 1, "ask": 2},
             "closePrice": None,
         },
         {"pageData": {"pageNumber": 0, "totalPages": 1}, "allowance": {"remainingAllowance": 99}},
     )
-    assert diagnostic["timestamp_fields"]["snapshotTime"] == {"type": "str", "length": 19, "masked_shape": "XXXX/XX/XX XX:XX:XX"}
+    assert diagnostic["timestamp_fields"]["snapshotTime"] == {"type": "str", "length": 19, "masked_shape": "XXXX:XX:XX-XX:XX:XX"}
     assert diagnostic["row_fields"] == {"snapshotTime": "str", "openPrice": "dict", "closePrice": "NoneType"}
     assert diagnostic["metadata_fields"] == {"allowance": "dict", "pageData": "dict"}
     assert diagnostic["paging_fields"]["pageData"] == {"pageNumber": "int", "totalPages": "int"}
