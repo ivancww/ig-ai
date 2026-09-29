@@ -257,7 +257,9 @@ CREATE TABLE IF NOT EXISTS backfill_jobs (
     job_id TEXT PRIMARY KEY, instrument_id TEXT NOT NULL, epic TEXT NOT NULL, market_name TEXT NOT NULL,
     timeframe TEXT NOT NULL, requested_start TEXT NOT NULL, requested_end TEXT NOT NULL,
     current_progress TEXT, last_successful_range TEXT, rows_retrieved INTEGER NOT NULL DEFAULT 0,
-    rows_inserted INTEGER NOT NULL DEFAULT 0, rows_skipped INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
+    rows_inserted INTEGER NOT NULL DEFAULT 0, rows_skipped INTEGER NOT NULL DEFAULT 0,
+    malformed_rows INTEGER NOT NULL DEFAULT 0, skipped_malformed_rows INTEGER NOT NULL DEFAULT 0,
+    malformed_diagnostics_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL,
     last_provider_metadata_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS backfill_jobs_lookup ON backfill_jobs (instrument_id, timeframe, status, updated_at);
@@ -278,6 +280,7 @@ class Database:
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.executescript(SCHEMA)
         self._ensure_research_columns()
+        self._ensure_backfill_columns()
         pattern_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(pattern_observations)")}
         if pattern_columns and "pattern_instance_id" not in pattern_columns:
             self.connection.execute("BEGIN")
@@ -331,6 +334,18 @@ class Database:
             for name, definition in columns.items():
                 if name not in existing:
                     self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+    def _ensure_backfill_columns(self) -> None:
+        """Add non-destructive malformed-row accounting to existing jobs."""
+        columns = {
+            "malformed_rows": "INTEGER NOT NULL DEFAULT 0",
+            "skipped_malformed_rows": "INTEGER NOT NULL DEFAULT 0",
+            "malformed_diagnostics_json": "TEXT NOT NULL DEFAULT '[]'",
+        }
+        existing = {row[1] for row in self.connection.execute("PRAGMA table_info(backfill_jobs)")}
+        for name, definition in columns.items():
+            if name not in existing:
+                self.connection.execute(f"ALTER TABLE backfill_jobs ADD COLUMN {name} {definition}")
 
     def close(self) -> None:
         self.connection.close()
@@ -471,19 +486,19 @@ class Database:
         self.connection.execute("INSERT INTO backfill_jobs (job_id, instrument_id, epic, market_name, timeframe, requested_start, requested_end, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, ?) ON CONFLICT(job_id) DO UPDATE SET status='RUNNING', updated_at=excluded.updated_at", (job_id, instrument_id, epic, market_name, timeframe, requested_start, requested_end, now, now))
         self.connection.commit()
 
-    def checkpoint_backfill_job(self, job_id: str, progress: str, retrieved: int, inserted: int, skipped: int, metadata: dict) -> None:
-        self.connection.execute("UPDATE backfill_jobs SET current_progress=?, last_successful_range=?, rows_retrieved=?, rows_inserted=?, rows_skipped=?, last_provider_metadata_json=?, updated_at=? WHERE job_id=?", (progress, progress, retrieved, inserted, skipped, json.dumps(metadata, sort_keys=True, separators=(",", ":")), datetime.now(UTC).isoformat(), job_id))
+    def checkpoint_backfill_job(self, job_id: str, progress: str, retrieved: int, inserted: int, skipped: int, metadata: dict, malformed_rows: int = 0, skipped_malformed_rows: int = 0, malformed_diagnostics: list[dict] | None = None) -> None:
+        self.connection.execute("UPDATE backfill_jobs SET current_progress=?, last_successful_range=?, rows_retrieved=?, rows_inserted=?, rows_skipped=?, malformed_rows=?, skipped_malformed_rows=?, malformed_diagnostics_json=?, last_provider_metadata_json=?, updated_at=? WHERE job_id=?", (progress, progress, retrieved, inserted, skipped, malformed_rows, skipped_malformed_rows, json.dumps(malformed_diagnostics or [], sort_keys=True, separators=(",", ":")), json.dumps(metadata, sort_keys=True, separators=(",", ":")), datetime.now(UTC).isoformat(), job_id))
         self.connection.commit()
 
     def get_backfill_job(self, job_id: str) -> dict | None:
-        row = self.connection.execute("SELECT job_id, instrument_id, epic, market_name, timeframe, requested_start, requested_end, current_progress, rows_retrieved, rows_inserted, rows_skipped, status FROM backfill_jobs WHERE job_id=?", (job_id,)).fetchone()
+        row = self.connection.execute("SELECT job_id, instrument_id, epic, market_name, timeframe, requested_start, requested_end, current_progress, rows_retrieved, rows_inserted, rows_skipped, malformed_rows, skipped_malformed_rows, malformed_diagnostics_json, status FROM backfill_jobs WHERE job_id=?", (job_id,)).fetchone()
         if row is None:
             return None
-        names = ("job_id", "instrument_id", "epic", "market_name", "timeframe", "requested_start", "requested_end", "current_progress", "rows_retrieved", "rows_inserted", "rows_skipped", "status")
+        names = ("job_id", "instrument_id", "epic", "market_name", "timeframe", "requested_start", "requested_end", "current_progress", "rows_retrieved", "rows_inserted", "rows_skipped", "malformed_rows", "skipped_malformed_rows", "malformed_diagnostics_json", "status")
         return dict(zip(names, row, strict=True))
 
-    def finish_backfill_job(self, job_id: str, status: str, retrieved: int, inserted: int, skipped: int) -> None:
-        self.connection.execute("UPDATE backfill_jobs SET status=?, rows_retrieved=?, rows_inserted=?, rows_skipped=?, updated_at=? WHERE job_id=?", (status, retrieved, inserted, skipped, datetime.now(UTC).isoformat(), job_id))
+    def finish_backfill_job(self, job_id: str, status: str, retrieved: int, inserted: int, skipped: int, malformed_rows: int = 0, skipped_malformed_rows: int = 0, malformed_diagnostics: list[dict] | None = None) -> None:
+        self.connection.execute("UPDATE backfill_jobs SET status=?, rows_retrieved=?, rows_inserted=?, rows_skipped=?, malformed_rows=?, skipped_malformed_rows=?, malformed_diagnostics_json=?, updated_at=? WHERE job_id=?", (status, retrieved, inserted, skipped, malformed_rows, skipped_malformed_rows, json.dumps(malformed_diagnostics or [], sort_keys=True, separators=(",", ":")), datetime.now(UTC).isoformat(), job_id))
         self.connection.commit()
 
     def start_replay_job(self, job_id: str, instrument_id: str, requested_start: str, requested_end: str, window: str) -> None:

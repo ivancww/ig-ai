@@ -22,16 +22,26 @@ CLASSIFIED DENOMINATOR SAFETY: PASS — only CLASSIFIED results enter summarize_
 ATR FABRICATION: NO
 LEGACY THRESHOLD FALLBACK WHEN ATR MISSING: NO
 EXISTING HISTORICAL OUTCOMES: PRESERVED
+
+=== MALFORMED HISTORICAL ROW FIX / DEVELOPMENT ===
+
+MALFORMED HISTORICAL ROW FIX: PASS
+ROOT CAUSE: row-level normalization errors were escalated as whole-job failures; complete provider response/page validation remains fail-closed
+BEHAVIOR BEFORE: one unusable historical OHLC row stopped the chunk and preserved a checkpoint before that chunk
+BEHAVIOR AFTER: unusable row-level OHLC observations are skipped with bounded safe diagnostics; valid rows persist and a complete chunk advances its checkpoint
+FABRICATED CANDLES POSSIBLE: NO
+ROW-LEVEL MALFORMED HANDLING: PASS — malformed_rows and skipped_malformed_rows are persisted; no raw authenticated data is recorded
+PAGE/RESPONSE FAILURE HANDLING: PASS — malformed/truncated/incomplete provider responses still fail safely
+CHECKPOINT SAFETY: PASS — checkpoint advances only after all rows in a complete provider chunk are processed
+RESUME SAFETY: PASS — malformed rows do not create a resume loop; reruns remain duplicate-safe
+GAP SEMANTICS: PASS — diagnostics identify PROVIDER_MALFORMED_ROW_GAP separately from session-gap uncertainty
+PROVENANCE: PASS — IG_HISTORICAL / IG / CFD preserved
+IDEMPOTENCY: PASS
 MODEL WEIGHTS CHANGED: NO
 THRESHOLDS OPTIMIZED: NO
-PROBABILITY CALIBRATION: NOT RUN
-IG PROVIDER REQUEST ISSUED: NO
-TRADING/MUTATION ENDPOINT USED: NO
-PYTEST: PASS — 251 passed
+PROBABILITY CALIBRATION: NO
+PYTEST: PASS — 258 passed
 RUFF: PASS
 DIFF CHECK: PASS
-SECURITY: PASS — 2 tests passed
-MERGEABILITY BEFORE PUSH: CLEAN
-MERGEABILITY AFTER PUSH: PENDING (GitHub reported UNKNOWN while recalculating)
-HEAD SHA: 44dadb08e3caa39be38fff7f34e8a8bccc8db993
-STOP STATE: Update PR #10 only; do not merge
+SECURITY: PASS — 2 passed
+FILES CHANGED: src/ig_ai/database.py; src/ig_ai/history.py; src/ig_ai/cli.py; tests/test_history.py; igai-report.txt

@@ -43,6 +43,127 @@ def test_invalid_ohlc_is_rejected():
         normalize_historical_price(bad, instrument_id="ig:EPIC", epic="EPIC", timeframe="1H")
 
 
+@pytest.mark.parametrize("value", [{"bid": None, "ask": None}, {"unexpected": "value"}, float("nan"), float("inf")])
+def test_unusable_provider_price_values_are_rejected(value):
+    bad = row()
+    bad["closePrice"] = value
+    with pytest.raises((MalformedResponseError, ValueError)):
+        normalize_historical_price(bad, instrument_id="ig:EPIC", epic="EPIC", timeframe="1H")
+
+
+def test_malformed_row_is_skipped_and_checkpoint_advances(tmp_path):
+    class Candidate:
+        epic = "E"
+        market_name = "US Tech 100"
+        instrument_type = "INDICES"
+        market_status = "CLOSED"
+        metadata = {}
+        classification = "CASH/ROLLING CFD"
+
+    class Provider:
+        client = object()
+        pacing_seconds = 0
+
+        def __init__(self):
+            self.calls = 0
+
+        def fetch(self, *_args):
+            self.calls += 1
+            malformed = row("2026-01-01T01:00:00Z")
+            malformed["openPrice"] = {"bid": None, "ask": None}
+            return [row("2026-01-01T00:00:00Z"), malformed, row("2026-01-01T02:00:00Z")], {"complete": True, "pages": 1, "metadata": {"paging": {"pageNumber": 0}}}
+
+    class Service(BackfillService):
+        def resolve(self, _market):
+            return Candidate()
+
+    database = Database(tmp_path / "malformed.sqlite3")
+    provider = Provider()
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    result = Service(database, provider).run(market="US Tech 100", timeframe="1H", start=start, end=start + timedelta(days=1))
+    assert result["status"] == "COMPLETE"
+    assert result["retrieved"] == 2 and result["inserted"] == 2 and result["skipped"] == 0
+    assert result["malformed_rows"] == result["skipped_malformed_rows"] == 1
+    assert result["malformed_diagnostics"][0]["gap_type"] == "PROVIDER_MALFORMED_ROW_GAP"
+    assert result["malformed_diagnostics"][0]["timestamp"] == "2026-01-01T01:00:00+00:00"
+    assert database.connection.execute("SELECT COUNT(*) FROM candles").fetchone()[0] == 2
+    assert database.connection.execute("SELECT COUNT(*) FROM candle_provenance WHERE source='IG_HISTORICAL'").fetchone()[0] == 2
+    job = database.get_backfill_job(result["job_id"])
+    assert job["current_progress"] == (start + timedelta(days=1)).isoformat()
+    assert job["malformed_rows"] == 1 and job["skipped_malformed_rows"] == 1
+    assert provider.calls == 1
+    database.close()
+
+
+def test_malformed_row_resume_is_not_replayed_or_duplicated(tmp_path):
+    class Candidate:
+        epic = "E"
+        market_name = "US Tech 100"
+        instrument_type = "INDICES"
+        market_status = "CLOSED"
+        metadata = {}
+        classification = "CASH/ROLLING CFD"
+
+    class Provider:
+        client = object()
+        pacing_seconds = 0
+
+        def __init__(self):
+            self.calls = 0
+
+        def fetch(self, *_args):
+            self.calls += 1
+            malformed = row("2026-01-01T01:00:00Z")
+            malformed["closePrice"] = {"lastTraded": None}
+            return [row("2026-01-01T00:00:00Z"), malformed], {"complete": True, "pages": 1}
+
+    class Service(BackfillService):
+        def resolve(self, _market):
+            return Candidate()
+
+    database = Database(tmp_path / "resume.sqlite3")
+    provider = Provider()
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    service = Service(database, provider)
+    first = service.run(market="US Tech 100", timeframe="1H", start=start, end=start + timedelta(days=1))
+    second = service.run(market="US Tech 100", timeframe="1H", start=start, end=start + timedelta(days=1), resume=True)
+    assert first["malformed_rows"] == second["malformed_rows"] == 1
+    assert provider.calls == 1
+    assert database.connection.execute("SELECT COUNT(*) FROM candles").fetchone()[0] == 1
+    assert database.connection.execute("SELECT COUNT(*) FROM candle_provenance").fetchone()[0] == 1
+    database.close()
+
+
+def test_malformed_provider_response_still_fails_and_does_not_checkpoint(tmp_path):
+    class Candidate:
+        epic = "E"
+        market_name = "US Tech 100"
+        instrument_type = "INDICES"
+        market_status = "CLOSED"
+        metadata = {}
+        classification = "CASH/ROLLING CFD"
+
+    class Provider:
+        client = object()
+        pacing_seconds = 0
+
+        def fetch(self, *_args):
+            return [row()], {"complete": False, "pages": 1}
+
+    class Service(BackfillService):
+        def resolve(self, _market):
+            return Candidate()
+
+    database = Database(tmp_path / "response.sqlite3")
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    with pytest.raises(MalformedResponseError, match="coverage is incomplete"):
+        Service(database, Provider()).run(market="US Tech 100", timeframe="1H", start=start, end=start + timedelta(days=1))
+    job = database.connection.execute("SELECT status, current_progress, malformed_rows FROM backfill_jobs").fetchone()
+    assert job == ("FAILED", None, 0)
+    assert database.connection.execute("SELECT COUNT(*) FROM candles").fetchone()[0] == 0
+    database.close()
+
+
 def test_four_hour_aggregation_does_not_fabricate_partial_group():
     start = datetime(2026, 1, 1, tzinfo=UTC)
     candles = [Candle("ig:E", "E", "1H", start + timedelta(hours=i), start + timedelta(hours=i + 1), Decimal(100 + i), Decimal(102 + i), Decimal(99 + i), Decimal(101 + i), is_closed=True) for i in range(4)]

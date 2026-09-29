@@ -107,6 +107,30 @@ def safe_historical_response_diagnostic(row: dict[str, Any], metadata: dict[str,
     }
 
 
+def _malformed_row_diagnostic(row: dict[str, Any], metadata: dict[str, Any] | None, chunk_start: datetime, chunk_end: datetime, exc: Exception) -> dict[str, Any]:
+    """Return bounded, non-sensitive metadata for an unusable provider row."""
+    timestamp = None
+    for name, allow_naive in (("snapshotTimeUTC", False), ("snapshotTime", True), ("timestamp", False), ("time", False)):
+        if row.get(name) is None:
+            continue
+        try:
+            timestamp = parse_ig_timestamp(row[name], allow_naive=allow_naive).isoformat()
+        except (MalformedResponseError, TypeError, ValueError):
+            timestamp = None
+        break
+    reason = "historical_row_unusable"
+    if isinstance(exc, ValueError):
+        reason = "historical_row_ohlc_inconsistent_or_non_finite"
+    return {
+        "gap_type": "PROVIDER_MALFORMED_ROW_GAP",
+        "timestamp": timestamp,
+        "chunk_start": chunk_start.isoformat(),
+        "chunk_end": chunk_end.isoformat(),
+        "reason": reason,
+        "response_shape": safe_historical_response_diagnostic(row, metadata),
+    }
+
+
 def normalize_historical_price(row: dict[str, Any], *, instrument_id: str, epic: str, timeframe: str) -> Candle:
     if timeframe not in SUPPORTED_TIMEFRAMES:
         raise ValueError(f"unsupported timeframe: {timeframe}")
@@ -301,35 +325,44 @@ class BackfillService:
         retrieved = int(prior.get("rows_retrieved", 0)) if prior else 0
         inserted = int(prior.get("rows_inserted", 0)) if prior else 0
         skipped = int(prior.get("rows_skipped", 0)) if prior else 0
+        malformed_rows = int(prior.get("malformed_rows", 0)) if prior else 0
+        skipped_malformed_rows = int(prior.get("skipped_malformed_rows", 0)) if prior else 0
+        try:
+            malformed_diagnostics = json.loads(prior.get("malformed_diagnostics_json", "[]")) if prior else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            malformed_diagnostics = []
+        if not isinstance(malformed_diagnostics, list):
+            malformed_diagnostics = []
         try:
             for chunk_start, chunk_end in plan:
                 rows, metadata = self.client.fetch(candidate.epic, timeframe, chunk_start, chunk_end)
                 if metadata.get("complete") is not True:
                     raise MalformedResponseError("historical provider coverage is incomplete")
-                chunk_inserted = 0
                 for row in sorted(rows, key=lambda value: str(value.get("snapshotTimeUTC") or value.get("snapshotTime") or "")):
                     try:
                         candle = normalize_historical_price(row, instrument_id=instrument_id, epic=candidate.epic, timeframe=timeframe)
-                    except MalformedResponseError as exc:
-                        diagnostic = safe_historical_response_diagnostic(row, metadata.get("metadata"))
-                        raise MalformedResponseError(f"{exc}; safe_response_shape={json.dumps(diagnostic, sort_keys=True)}") from exc
+                    except (MalformedResponseError, InvalidOperation, TypeError, ValueError) as exc:
+                        malformed_rows += 1
+                        skipped_malformed_rows += 1
+                        if len(malformed_diagnostics) < 100:
+                            malformed_diagnostics.append(_malformed_row_diagnostic(row, metadata.get("metadata"), chunk_start, chunk_end, exc))
+                        continue
                     if not (start <= candle.start < end):
                         continue
                     retrieved += 1
                     result = self.database.save_historical_candle(candle, provenance={"provider": "IG", "asset_source_type": "CFD", "market_name": market, "epic": candidate.epic, "provider_instrument_name": candidate.market_name, "currency": candidate.metadata.get("currency") or candidate.metadata.get("currencyCode"), "contract_metadata": candidate.metadata, "resolution": IG_RESOLUTIONS[timeframe], "retrieved_at": datetime.now(UTC).isoformat()})
                     inserted += result == "INSERTED"
                     skipped += result != "INSERTED"
-                    chunk_inserted += result == "INSERTED"
-                self.database.checkpoint_backfill_job(identity, chunk_end.isoformat(), retrieved, inserted, skipped, metadata)
+                self.database.checkpoint_backfill_job(identity, chunk_end.isoformat(), retrieved, inserted, skipped, metadata, malformed_rows, skipped_malformed_rows, malformed_diagnostics)
                 if self.client.pacing_seconds:
                     time.sleep(self.client.pacing_seconds)
-            self.database.finish_backfill_job(identity, "COMPLETE", retrieved, inserted, skipped)
-            return {"status": "COMPLETE", "job_id": identity, "market": market, "instrument_id": instrument_id, "epic": candidate.epic, "timeframe": timeframe, "retrieved": retrieved, "inserted": inserted, "skipped": skipped, "requested_start": start.isoformat(), "requested_end": end.isoformat(), "available_range": self.database.available_history(instrument_id, timeframe)}
+            self.database.finish_backfill_job(identity, "COMPLETE", retrieved, inserted, skipped, malformed_rows, skipped_malformed_rows, malformed_diagnostics)
+            return {"status": "COMPLETE", "job_id": identity, "market": market, "instrument_id": instrument_id, "epic": candidate.epic, "timeframe": timeframe, "retrieved": retrieved, "inserted": inserted, "skipped": skipped, "malformed_rows": malformed_rows, "skipped_malformed_rows": skipped_malformed_rows, "malformed_diagnostics": malformed_diagnostics, "requested_start": start.isoformat(), "requested_end": end.isoformat(), "available_range": self.database.available_history(instrument_id, timeframe)}
         except RateLimitError:
-            self.database.finish_backfill_job(identity, "PAUSED", retrieved, inserted, skipped)
-            return {"status": "BACKFILL_PAUSED_RATE_LIMIT", "job_id": identity, "retrieved": retrieved, "inserted": inserted, "skipped": skipped}
+            self.database.finish_backfill_job(identity, "PAUSED", retrieved, inserted, skipped, malformed_rows, skipped_malformed_rows, malformed_diagnostics)
+            return {"status": "BACKFILL_PAUSED_RATE_LIMIT", "job_id": identity, "retrieved": retrieved, "inserted": inserted, "skipped": skipped, "malformed_rows": malformed_rows, "skipped_malformed_rows": skipped_malformed_rows}
         except Exception:
-            self.database.finish_backfill_job(identity, "FAILED", retrieved, inserted, skipped)
+            self.database.finish_backfill_job(identity, "FAILED", retrieved, inserted, skipped, malformed_rows, skipped_malformed_rows, malformed_diagnostics)
             raise
 
 
