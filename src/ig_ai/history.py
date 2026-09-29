@@ -16,7 +16,7 @@ from decimal import Decimal, InvalidOperation
 from itertools import pairwise
 from math import isfinite
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, quote, urlsplit
 
 from .direction import DIRECTION_SCHEMA_VERSION
 from .discovery import discover_market_groups, select_stream_instruments
@@ -168,13 +168,23 @@ class HistoricalIGClient:
         resolution = IG_RESOLUTIONS[timeframe]
         all_rows: list[dict[str, Any]] = []
         page_count = 0
-        path = f"/prices/{epic}/{resolution}"
-        params: dict[str, str] = {"startdate": start.isoformat(), "enddate": end.isoformat()}
+        # IG's current date-range contract is the version-2 path endpoint.  The
+        # legacy version-1 query endpoint accepts a different date format, so
+        # sending ISO timestamps there causes a provider HTTP 400.
+        start_text = start.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        end_text = end.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        path = "/prices/{}/{}/{}/{}".format(
+            quote(epic, safe=""),
+            resolution,
+            quote(start_text, safe=""),
+            quote(end_text, safe=""),
+        )
+        params: dict[str, str] | None = None
         while True:
             page_attempt = 0
             while True:
                 try:
-                    payload, headers = self.client._request("GET", path, params=params, version="3", retry=False, phase="historical_backfill")
+                    payload, headers = self.client._request("GET", path, params=params, version="2", retry=False, phase="historical_backfill")
                     break
                 except RateLimitError:
                     if page_attempt >= self.max_retries:
