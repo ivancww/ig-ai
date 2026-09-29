@@ -9,18 +9,18 @@ PR: pending (one PR; do not merge)
 Base: origin/main at cc37fcc66c22ac64df010a71351cb3180e3d8ce8; Phase 5A merge confirmed and ancestor of branch.
 
 Historical source: IG CFD only. No cash-index, futures substitute, external provider, scraping, AI, news, macro, Telegram, or trading integration.
-Backfill schema/version: history_v1; `candle_provenance`, `backfill_jobs`; deterministic job identity and checkpoint progress.
+Backfill schema/version: history_v1; `candle_provenance`, `backfill_jobs`; deterministic job identity and checkpoint progress. Direct `HOUR_4` is the verified supported IG mapping; the optional 4H aggregation helper rejects partial/non-contiguous groups and is not silently used as a fallback.
 Replay schema/version: replay_v1; `replay_jobs`; chronological closed-candle replay, bounded histories, deterministic resume checkpoint.
 Markets/timeframes: provider-verified weekday cash/rolling CFD variants for US Tech 100, Japan 225, Hong Kong HS50; 15M, 1H, 4H, 1D. EPICs are discovered, never guessed; HS50 variant metadata is preserved.
 Price normalization: IG bid/ask OHLC arithmetic midpoint, UTC timestamps preferring snapshotTimeUTC, `volume=NULL`, `is_closed=1`; direct mappings MINUTE_15, HOUR, HOUR_4, DAY. Deterministic 4H aggregation helper is available for finer verified history.
-Coverage handling: requested, provider-available, and retrieved ranges are kept separate; no fabricated candles. Gap reporting identifies missing intervals while marking session-boundary uncertainty.
+Coverage handling: requested, provider-available, and retrieved ranges are kept separate; provider paging links are followed and page metadata without a next link is rejected as truncation. No fabricated candles. Gap reporting identifies missing intervals while marking session-boundary uncertainty.
 Rate limits/resume: bounded date chunks, configurable pacing, bounded exponential retry for transient failures, allowance-aware `BACKFILL_PAUSED_RATE_LIMIT`, SQLite checkpoints, idempotent reruns.
 LIVE/historical conflict: candle identity remains instrument/timeframe/start; existing LIVE_AGGREGATED candles are never overwritten by history; historical duplicates are skipped and provenance is explicit.
-Replay guarantee: every model input is closed and has candle.end <= the 1H information time. Technical, pattern/structure, direction, MTF state, model versions, research snapshots, and 15M/1H/2H/4H/8H/1D outcomes are rebuilt without future outcome leakage; unavailable future outcomes remain PENDING/NULL.
+Replay guarantee: every model input is closed and has candle.end <= the 1H information time. Replay uses indexed batch iterators and bounded deques rather than loading complete timeframes; interruption resumes from the persisted information-time checkpoint. Technical, pattern/structure, direction, MTF state, model versions, research snapshots, and 15M/1H/2H/4H/8H/1D outcomes are rebuilt without future outcome leakage; unavailable future outcomes remain PENDING/NULL.
 SQLite changes: provenance, backfill job, and replay job tables plus lookup indexes. Existing candle identity is reused.
 CLI: `history-backfill` (`--market`, `--timeframe`, `--days`, `--start/--end`, `--all-markets`, `--resume`, `--dry-run`), `history-status`, `history-replay`.
 Performance: chunked retrieval, indexed SQLite reads, 600-candle bounded replay histories, no per-snapshot unbounded reload.
-Tests/checks: 222 pytest passed; ruff check passed; git diff --check passed; phase1-check passed; no real bulk API backfill or smoke test run automatically.
+Tests/checks: 230 pytest passed; explicit Phase 2A/2B/3/4A/5A/5B groups 151 passed; ruff check passed; git diff --check passed; phase1-check passed; no real bulk API backfill or smoke test run automatically.
 Security/read-only: only session authentication, market discovery/details, and `/prices` GETs; no order/position/deal endpoints and no credential/token persistence/logging.
 Known limitations: IG historical data is CFD data and not official NDX/Nikkei/HSI cash history; availability depends on IG and is not guaranteed to be 3–5 years intraday; no probability calibration, AI interpretation, news/macro, Telegram, or automatic trading.
 

@@ -274,7 +274,7 @@ def main() -> int:
                 for row in rows:
                     first = datetime.fromisoformat(row["earliest"])
                     last = datetime.fromisoformat(row["latest"])
-                    print(f"{row['market_name'] or row['instrument_id']} {row['timeframe']}: source=IG CFD ({row['source']}) EPIC={row['epic']} earliest={row['earliest']} latest={row['latest']} closed={row['closed_count']} available_days={(last-first).total_seconds()/86400:.2f}")
+                    print(f"{row['market_name'] or row['instrument_id']} {row['timeframe']}: source=IG CFD ({row['source']}) EPIC={row['epic']} earliest={row['earliest']} latest={row['latest']} closed={row['closed_count']} available_days={(last-first).total_seconds()/86400:.2f} backfill_status={row['backfill_status']} last_successful_retrieval={row['last_successful_retrieval'] or 'NONE'} requested={row['requested_start'] or 'NONE'}..{row['requested_end'] or 'NONE'} retrieved_through={row['retrieved_through'] or 'NONE'} largest_gap_seconds={row['largest_gap'] if row['largest_gap'] is not None else 'NONE'} session_gap_uncertainty={str(row['session_gap_uncertainty']).upper()}")
                 return 0
             finally:
                 database.close()

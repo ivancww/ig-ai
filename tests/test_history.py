@@ -4,13 +4,17 @@ from decimal import Decimal
 import pytest
 
 from ig_ai.database import Database
+from ig_ai.exceptions import IGHTTPError, MalformedResponseError, RateLimitError
 from ig_ai.history import (
+    BackfillService,
     HistoricalIGClient,
+    ReplayService,
     aggregate_candles,
     normalize_historical_price,
     report_gaps,
 )
 from ig_ai.models import Candle
+from ig_ai.research import HistoricalReplay
 
 
 def row(timestamp="2026-01-01T00:00:00Z"):
@@ -44,6 +48,65 @@ def test_four_hour_aggregation_does_not_fabricate_partial_group():
     assert len(result) == 1 and result[0].open == 100 and result[0].close == 104
 
 
+def test_four_hour_aggregation_rejects_partial_and_non_contiguous_groups():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    partial = [Candle("ig:E", "E", "1H", start + timedelta(hours=i), start + timedelta(hours=i + 1), Decimal(100), Decimal(102), Decimal(99), Decimal(101), is_closed=True) for i in range(3)]
+    non_contiguous = [*partial, Candle("ig:E", "E", "1H", start + timedelta(hours=5), start + timedelta(hours=6), Decimal(100), Decimal(102), Decimal(99), Decimal(101), is_closed=True)]
+    assert aggregate_candles(partial) == []
+    assert aggregate_candles(non_contiguous) == []
+
+
+def test_unzoned_snapshot_fallback_is_rejected():
+    with pytest.raises(MalformedResponseError, match="explicit timezone"):
+        normalize_historical_price({**row(), "snapshotTimeUTC": None, "snapshotTime": "2026-01-01 00:00:00"}, instrument_id="ig:E", epic="E", timeframe="1H")
+
+
+class PagingClient:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.calls = []
+
+    def _request(self, method, path, **kwargs):
+        self.calls.append((method, path, kwargs))
+        return next(self.responses)
+
+
+def test_provider_paging_is_followed_and_rows_are_combined():
+    first = {"prices": [row()], "metadata": {"paging": {"next": "/prices/E/HOUR?startdate=a&enddate=b"}}}
+    second = {"prices": [{**row("2026-01-01T01:00:00Z")}], "metadata": {}}
+    client = PagingClient([(first, {"X-REQUEST-ID": "safe"}), (second, {})])
+    rows, metadata = HistoricalIGClient(client, pacing_seconds=0).fetch("E", "1H", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC))
+    assert len(rows) == 2 and metadata["pages"] == 2 and len(client.calls) == 2
+
+
+def test_provider_truncation_without_next_link_is_rejected():
+    client = PagingClient([({"prices": [row()], "metadata": {"pageData": {"pageNumber": 0, "totalPages": 2}}}, {})])
+    with pytest.raises(MalformedResponseError, match="truncated"):
+        HistoricalIGClient(client, pacing_seconds=0).fetch("E", "1H", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC))
+
+
+def test_transient_retry_is_bounded_and_permanent_error_is_not_retried_forever(monkeypatch):
+    class RetryClient:
+        def __init__(self, failures):
+            self.failures = failures
+            self.calls = 0
+
+        def _request(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls <= self.failures:
+                raise IGHTTPError(503, "server failure", retryable=True)
+            return ({"prices": [row()]}, {})
+
+    monkeypatch.setattr("ig_ai.history.time.sleep", lambda _seconds: None)
+    transient = RetryClient(2)
+    HistoricalIGClient(transient, pacing_seconds=0, max_retries=2).fetch("E", "1H", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC))
+    assert transient.calls == 3
+    permanent = RetryClient(10)
+    with pytest.raises(IGHTTPError):
+        HistoricalIGClient(permanent, pacing_seconds=0, max_retries=2).fetch("E", "1H", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC))
+    assert permanent.calls == 3
+
+
 def test_gap_report_is_explicit():
     start = datetime(2026, 1, 1, tzinfo=UTC)
     first = Candle("ig:E", "E", "1H", start, start + timedelta(hours=1), Decimal(1), Decimal(2), Decimal(0), Decimal(1), is_closed=True)
@@ -57,6 +120,13 @@ def test_historical_conflict_is_idempotent_and_does_not_replace_live(tmp_path):
     candle = normalize_historical_price(row(), instrument_id="ig:E", epic="E", timeframe="15M")
     database.save_candle(candle)
     assert database.save_historical_candle(candle, provenance={"provider": "IG"}) == "SKIPPED_LIVE_CONFLICT"
+    historical = normalize_historical_price(row(), instrument_id="ig:H", epic="H", timeframe="15M")
+    assert database.save_historical_candle(historical, provenance={"provider": "IG", "CST": "secret", "api_key": "secret"}) == "INSERTED"
+    provenance_text = database.connection.execute("SELECT provenance_json FROM candle_provenance WHERE instrument_id='ig:H'").fetchone()[0]
+    assert "secret" not in provenance_text and "CST" not in provenance_text
+    live = Candle("ig:H", "H", "15M", historical.start, historical.end, Decimal(200), Decimal(202), Decimal(199), Decimal(201), is_closed=True)
+    database.save_candle(live)
+    assert database.connection.execute("SELECT source, close FROM candle_provenance JOIN candles USING (instrument_id, timeframe, start_at) WHERE instrument_id='ig:H'").fetchone() == ("LIVE_AGGREGATED", "201")
     database.close()
 
 
@@ -86,3 +156,82 @@ def test_dry_run_adapter_does_not_require_persistence(tmp_path):
     assert result["status"] == "DRY_RUN"
     assert database.connection.execute("SELECT COUNT(*) FROM candles").fetchone()[0] == 0
     database.close()
+
+
+def test_rate_limit_pause_and_resume_checkpoint(tmp_path):
+    class Candidate:
+        epic = "E"
+        market_name = "US Tech 100"
+        instrument_type = "INDICES"
+        market_status = "CLOSED"
+        metadata = {}
+        classification = "CASH/ROLLING CFD"
+
+    class Provider:
+        client = object()
+        pacing_seconds = 0
+
+        def __init__(self):
+            self.paused = True
+
+        def fetch(self, *args):
+            if self.paused:
+                raise RateLimitError(429, "rate limit", retryable=True)
+            return [row()], {"complete": True, "pages": 1}
+
+    class Service(BackfillService):
+        def resolve(self, _market):
+            return Candidate()
+
+    provider = Provider()
+    database = Database(tmp_path / "pause.sqlite3")
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    first = Service(database, provider).run(market="US Tech 100", timeframe="1H", start=start, end=start + timedelta(days=1))
+    assert first["status"] == "BACKFILL_PAUSED_RATE_LIMIT"
+    provider.paused = False
+    second = Service(database, provider).run(market="US Tech 100", timeframe="1H", start=start, end=start + timedelta(days=1), resume=True)
+    assert second["status"] == "COMPLETE"
+    assert database.connection.execute("SELECT status FROM backfill_jobs").fetchone()[0] == "COMPLETE"
+    database.close()
+
+
+def test_replay_is_bounded_and_resumes_after_interruption(tmp_path, monkeypatch):
+    database = Database(tmp_path / "replay.sqlite3")
+    database.save_instrument("ig:E", "E", "US Tech 100", instrument_type="INDICES")
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    for index in range(4):
+        candle = Candle("ig:E", "E", "1H", start + timedelta(hours=index), start + timedelta(hours=index + 1), Decimal(100), Decimal(102), Decimal(99), Decimal(101 + index), is_closed=True)
+        database.save_candle(candle)
+    original_list = database.list_candles
+    database.list_candles = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("replay must use bounded iterator"))
+    original_checkpoint = database.checkpoint_replay_job
+    calls = {"count": 0}
+
+    def interrupt_once(*args, **kwargs):
+        original_checkpoint(*args, **kwargs)
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("simulated crash")
+
+    monkeypatch.setattr(database, "checkpoint_replay_job", interrupt_once)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        ReplayService(database, max_history=2).run(instrument_id="ig:E", start=start, end=start + timedelta(hours=4))
+    monkeypatch.setattr(database, "checkpoint_replay_job", original_checkpoint)
+    result = ReplayService(database, max_history=2).run(instrument_id="ig:E", start=start, end=start + timedelta(hours=4))
+    assert result["snapshots"] == 3
+    assert database.connection.execute("SELECT COUNT(*) FROM research_snapshots").fetchone()[0] == 4
+    database.list_candles = original_list
+    database.close()
+
+
+def test_replay_excludes_forming_and_future_context_on_all_timeframes():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    target = Candle("ig:E", "E", "1H", start, start + timedelta(hours=1), Decimal(100), Decimal(102), Decimal(99), Decimal(101), is_closed=True)
+    future_15m = Candle("ig:E", "E", "15M", start + timedelta(hours=1), start + timedelta(hours=1, minutes=15), Decimal(1000), Decimal(1002), Decimal(999), Decimal(1001), is_closed=True)
+    forming_4h = Candle("ig:E", "E", "4H", start, start + timedelta(hours=4), Decimal(1000), Decimal(1002), Decimal(999), Decimal(1001), is_closed=False)
+    future_1d = Candle("ig:E", "E", "1D", start, start + timedelta(days=1), Decimal(1000), Decimal(1002), Decimal(999), Decimal(1001), is_closed=True)
+    result = HistoricalReplay(max_history=20).direction_states({"1H": [target], "15M": [future_15m], "4H": [forming_4h], "1D": [future_1d]})
+    assert result[0]["histories"]["15M"] == []
+    assert result[0]["histories"]["4H"] == []
+    assert result[0]["histories"]["1D"] == []
+    assert result[0]["state"]["model_reference"]["information_time"] == (start + timedelta(hours=1)).isoformat()

@@ -4,6 +4,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
+from itertools import pairwise
 from pathlib import Path
 from statistics import median
 
@@ -394,7 +395,7 @@ class Database:
             "SELECT source FROM candle_provenance WHERE instrument_id=? AND timeframe=? AND start_at=?",
             (candle.instrument_id, candle.timeframe, candle.start.isoformat()),
         ).fetchone()
-        if existing_source and existing_source[0] == "IG_HISTORICAL" and candle.is_closed:
+        if existing_source and existing_source[0] == "IG_HISTORICAL" and not candle.is_closed:
             return
         self.connection.execute(
             "INSERT OR REPLACE INTO candles (instrument_id, timeframe, start_at, end_at, epic, open, high, low, close, volume, is_closed, observation_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -417,6 +418,11 @@ class Database:
             "INSERT OR IGNORE INTO candle_provenance VALUES (?, ?, ?, 'LIVE_AGGREGATED', ?, ?)",
             (candle.instrument_id, candle.timeframe, candle.start.isoformat(), json.dumps({"provider": "IG", "asset_source_type": "CFD", "policy": "live_stream"}, sort_keys=True), datetime.now(UTC).isoformat()),
         )
+        if existing_source and existing_source[0] == "IG_HISTORICAL" and candle.is_closed:
+            self.connection.execute(
+                "UPDATE candle_provenance SET source='LIVE_AGGREGATED', provenance_json=?, recorded_at=? WHERE instrument_id=? AND timeframe=? AND start_at=?",
+                (json.dumps({"provider": "IG", "asset_source_type": "CFD", "policy": "live_supersedes_historical"}, sort_keys=True), datetime.now(UTC).isoformat(), candle.instrument_id, candle.timeframe, candle.start.isoformat()),
+            )
         self.connection.commit()
 
     @staticmethod
@@ -444,9 +450,18 @@ class Database:
             "INSERT INTO candles (instrument_id, timeframe, start_at, end_at, epic, open, high, low, close, volume, is_closed, observation_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (candle.instrument_id, candle.timeframe, candle.start.isoformat(), candle.end.isoformat(), candle.epic, str(candle.open), str(candle.high), str(candle.low), str(candle.close), None, 1, 0),
         )
+        sensitive = ("password", "api_key", "apikey", "cst", "security-token", "access_token", "refresh_token", "oauth", "lightstreamer")
+
+        def scrub(value):
+            if isinstance(value, dict):
+                return {key: scrub(item) for key, item in value.items() if not any(token in str(key).lower() for token in sensitive)}
+            if isinstance(value, list):
+                return [scrub(item) for item in value]
+            return value
+
         self.connection.execute(
             "INSERT INTO candle_provenance VALUES (?, ?, ?, ?, ?, ?)",
-            (*identity, "IG_HISTORICAL", json.dumps(provenance, sort_keys=True, separators=(",", ":")), datetime.now(UTC).isoformat()),
+            (*identity, "IG_HISTORICAL", json.dumps(scrub(provenance), sort_keys=True, separators=(",", ":")), datetime.now(UTC).isoformat()),
         )
         self.connection.commit()
         return "INSERTED"
@@ -498,7 +513,13 @@ class Database:
             query += " AND c.instrument_id=?"
             params.append(instrument_id)
         query += " GROUP BY c.instrument_id, c.timeframe, p.source ORDER BY c.instrument_id, c.timeframe"
-        return [{"instrument_id": row[0], "timeframe": row[1], "source": row[2] or "LIVE_AGGREGATED", "earliest": row[3], "latest": row[4], "closed_count": row[5], "market_name": row[6], "epic": row[7]} for row in self.connection.execute(query, params)]
+        output = []
+        for row in self.connection.execute(query, params):
+            jobs = self.connection.execute("SELECT status, requested_start, requested_end, last_successful_range, updated_at FROM backfill_jobs WHERE instrument_id=? AND timeframe=? ORDER BY updated_at DESC LIMIT 1", (row[0], row[1])).fetchone()
+            candles = self.list_candles(row[0], row[1])
+            gaps = [current.start - previous.end for previous, current in pairwise(candles) if current.start > previous.end]
+            output.append({"instrument_id": row[0], "timeframe": row[1], "source": row[2] or "LIVE_AGGREGATED", "earliest": row[3], "latest": row[4], "closed_count": row[5], "market_name": row[6], "epic": row[7], "largest_gap": max(gaps, default=None).total_seconds() if gaps else None, "session_gap_uncertainty": bool(gaps), "backfill_status": jobs[0] if jobs else "NOT_RUN", "requested_start": jobs[1] if jobs else None, "requested_end": jobs[2] if jobs else None, "retrieved_through": jobs[3] if jobs else None, "last_successful_retrieval": jobs[4] if jobs and jobs[0] in {"COMPLETE", "PAUSED"} else None})
+        return output
 
     def list_candles(self, instrument_id: str, timeframe: str, *, through: str | None = None, limit: int | None = None) -> list[Candle]:
         query = (
@@ -522,6 +543,35 @@ class Database:
             Candle(row[0], row[4], row[1], datetime.fromisoformat(row[2]), datetime.fromisoformat(row[3]), Decimal(row[5]), Decimal(row[6]), Decimal(row[7]), Decimal(row[8]), Decimal(row[9]) if row[9] is not None else None, bool(row[10]), int(row[11]))
             for row in rows
         ]
+
+    @staticmethod
+    def _candle_from_row(row: tuple) -> Candle:
+        return Candle(
+            row[0], row[4], row[1], datetime.fromisoformat(row[2]), datetime.fromisoformat(row[3]),
+            Decimal(row[5]), Decimal(row[6]), Decimal(row[7]), Decimal(row[8]),
+            Decimal(row[9]) if row[9] is not None else None, bool(row[10]), int(row[11]),
+        )
+
+    def iter_candles(self, instrument_id: str, timeframe: str, *, start_at: str | None = None, end_at: str | None = None, batch_size: int = 500):
+        """Yield indexed candle batches without materializing a timeframe."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        query = "SELECT instrument_id, timeframe, start_at, end_at, epic, open, high, low, close, volume, is_closed, observation_count FROM candles WHERE instrument_id=? AND timeframe=? AND is_closed=1"
+        params: list[object] = [instrument_id, timeframe]
+        if start_at is not None:
+            query += " AND start_at>=?"
+            params.append(start_at)
+        if end_at is not None:
+            query += " AND start_at<?"
+            params.append(end_at)
+        query += " ORDER BY start_at"
+        cursor = self.connection.execute(query, params)
+        while True:
+            rows = cursor.fetchmany(batch_size)
+            if not rows:
+                break
+            for row in rows:
+                yield self._candle_from_row(row)
 
     def save_technical_features(self, features: dict) -> None:
         self.connection.execute(

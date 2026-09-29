@@ -171,6 +171,20 @@ class HistoricalReplay:
         self.max_history = max_history
         self.phase2b = Phase2BEngine()
 
+    def state_for_aligned(self, target: Candle, aligned: dict[str, list[Candle]]) -> dict[str, Any]:
+        bounded = {
+            timeframe: [candle for candle in candles if candle.is_closed and candle.end <= target.end][-self.max_history:]
+            for timeframe, candles in aligned.items()
+        }
+        analyses = {timeframe: self.phase2b.analyze(items) for timeframe, items in bounded.items() if items}
+        features = {timeframe: {"structure": analysis["structure"], "macd": analysis["context"]["macd"], "rsi14": analysis["context"]["rsi"]} for timeframe, analysis in analyses.items()}
+        divergences = {timeframe: analysis["divergences"] for timeframe, analysis in analyses.items()}
+        direction = DirectionScoreEngine().analyze(analyses)
+        direction["model_reference"] = {"timeframe": "1H", "candle_timestamp": target.start.isoformat(), "candle_state": "CLOSED", "information_time": target.end.isoformat()}
+        direction["replay_reference_time"] = target.end.isoformat()
+        direction["direction_reversal"] = DirectionReversalEngine().classify(features, divergences)
+        return {"state": direction, "reference_candle": target, "histories": bounded}
+
     def direction_states(self, candles_by_timeframe: dict[str, list[Candle]]) -> list[dict[str, Any]]:
         histories = {timeframe: sorted((candle for candle in candles if candle.is_closed), key=lambda candle: candle.end) for timeframe, candles in candles_by_timeframe.items()}
         primary = histories.get("1H", [])
@@ -181,14 +195,7 @@ class HistoricalReplay:
             for timeframe, candles in histories.items():
                 end_index = bisect_right(end_indexes[timeframe], target.end)
                 aligned[timeframe] = candles[max(0, end_index - self.max_history):end_index]
-            analyses = {timeframe: self.phase2b.analyze(items) for timeframe, items in aligned.items() if items}
-            features = {timeframe: {"structure": analysis["structure"], "macd": analysis["context"]["macd"], "rsi14": analysis["context"]["rsi"]} for timeframe, analysis in analyses.items()}
-            divergences = {timeframe: analysis["divergences"] for timeframe, analysis in analyses.items()}
-            direction = DirectionScoreEngine().analyze(analyses)
-            direction["model_reference"] = {"timeframe": "1H", "candle_timestamp": target.start.isoformat(), "candle_state": "CLOSED", "information_time": target.end.isoformat()}
-            direction["replay_reference_time"] = target.end.isoformat()
-            direction["direction_reversal"] = DirectionReversalEngine().classify(features, divergences)
-            output.append({"state": direction, "reference_candle": target, "histories": aligned})
+            output.append(self.state_for_aligned(target, aligned))
         return output
 
 
