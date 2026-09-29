@@ -472,6 +472,9 @@ def main() -> int:
                         "retrieved": "; ".join(str(result.get("retrieved", 0)) for result in results),
                         "inserted": "; ".join(str(result.get("inserted", 0)) for result in results),
                         "skipped": "; ".join(str(result.get("skipped", 0)) for result in results),
+                        "malformed rows": "; ".join(str(result.get("malformed_rows", 0)) for result in results),
+                        "skipped malformed rows": "; ".join(str(result.get("skipped_malformed_rows", 0)) for result in results),
+                        "malformed gap semantics": "PROVIDER_MALFORMED_ROW_GAP when malformed rows are reported; otherwise NONE",
                         "persisted closed candle count": "; ".join(
                             str(result.get("available_range", {}).get("candle_count", 0)) for result in results
                         ),
