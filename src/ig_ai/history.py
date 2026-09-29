@@ -73,11 +73,19 @@ def normalize_historical_price(row: dict[str, Any], *, instrument_id: str, epic:
     if timeframe not in SUPPORTED_TIMEFRAMES:
         raise ValueError(f"unsupported timeframe: {timeframe}")
     timestamp = _field(row, "snapshotTimeUTC")
-    if timestamp is None:
-        timestamp = _field(row, "snapshotTime", "timestamp", "time")
+    if timestamp is not None:
+        # Prefer IG's authoritative UTC field whenever the provider supplies it.
+        start = parse_ig_timestamp(timestamp)
+    elif row.get("snapshotTime") is not None:
+        # The verified v1 response documents snapshotTime without an offset;
+        # IG's general API date semantics make that value UTC.  Do not apply
+        # this interpretation to arbitrary fallback fields.
+        start = parse_ig_timestamp(row["snapshotTime"], allow_naive=True)
+    else:
+        timestamp = _field(row, "timestamp", "time")
         if isinstance(timestamp, str) and ("+" not in timestamp and not timestamp.endswith("Z")):
-            raise MalformedResponseError("IG snapshotTime fallback must include an explicit timezone")
-    start = parse_ig_timestamp(timestamp)
+            raise MalformedResponseError("historical timestamp fallback must include an explicit timezone")
+        start = parse_ig_timestamp(timestamp)
     end = start + TIMEFRAME_DURATION[timeframe]
     opens = _field(row, "openPrice", "open")
     highs = _field(row, "highPrice", "high")

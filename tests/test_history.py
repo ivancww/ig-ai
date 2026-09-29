@@ -57,9 +57,28 @@ def test_four_hour_aggregation_rejects_partial_and_non_contiguous_groups():
     assert aggregate_candles(non_contiguous) == []
 
 
-def test_unzoned_snapshot_fallback_is_rejected():
+def test_v1_unzoned_snapshot_time_is_provider_utc():
+    observed = {
+        **row(),
+        "snapshotTimeUTC": None,
+        "snapshotTime": "2026/01/01 00:00:00",
+    }
+    candle = normalize_historical_price(observed, instrument_id="ig:E", epic="E", timeframe="1H")
+    assert candle.start == datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def test_snapshot_time_utc_is_preferred_over_unzoned_snapshot_time():
+    observed = {
+        **row("2026-01-01T00:15:00Z"),
+        "snapshotTime": "2026/01/01 00:00:00",
+    }
+    candle = normalize_historical_price(observed, instrument_id="ig:E", epic="E", timeframe="15M")
+    assert candle.start == datetime(2026, 1, 1, 0, 15, tzinfo=UTC)
+
+
+def test_unzoned_generic_timestamp_fallback_is_rejected():
     with pytest.raises(MalformedResponseError, match="explicit timezone"):
-        normalize_historical_price({**row(), "snapshotTimeUTC": None, "snapshotTime": "2026-01-01 00:00:00"}, instrument_id="ig:E", epic="E", timeframe="1H")
+        normalize_historical_price({**row(), "snapshotTimeUTC": None, "timestamp": "2026-01-01 00:00:00"}, instrument_id="ig:E", epic="E", timeframe="1H")
 
 
 class PagingClient:
