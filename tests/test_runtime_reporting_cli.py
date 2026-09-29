@@ -18,6 +18,25 @@ def _settings(tmp_path):
     )
 
 
+def test_research_provenance_pass_requires_a_valid_persisted_identity():
+    class Rows:
+        def __init__(self, values):
+            self.values = values
+
+        def fetchall(self):
+            return self.values
+
+    class Connection:
+        def execute(self, _query, _params):
+            return Rows([("ig_cfd|instrument=ig:E|epic=E|market=US Tech 100|type=INDICES",)])
+
+    database = SimpleNamespace(connection=Connection())
+    assert cli.research_provenance_status(database, ["ig:E"]).startswith("PASS:")
+
+    invalid = SimpleNamespace(connection=SimpleNamespace(execute=lambda _query, _params: Rows([("unknown",)])))
+    assert cli.research_provenance_status(invalid, ["ig:E"]) == "NOT VERIFIED"
+
+
 class _Database:
     def __init__(self, _path):
         pass
@@ -109,6 +128,48 @@ def test_history_backfill_pre_request_failure_is_current_and_safe(tmp_path, monk
     assert "safe failure category: RuntimeError" in text
 
 
+def test_history_backfill_dry_run_does_not_claim_authentication_or_provider_access(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+
+    class HistoricalClient:
+        request_count = 0
+
+        def __init__(self, *_args, **_kwargs):
+            self.request_count = 0
+
+    class Service:
+        def __init__(self, *_args):
+            pass
+
+        def run(self, **kwargs):
+            assert kwargs["dry_run"] is True
+            return {
+                "status": "DRY_RUN",
+                "market": "US Tech 100",
+                "epic": "IX.D.NASDAQ.IFMM.IP",
+                "timeframe": "1H",
+                "chunks": [("2026-09-01T00:00:00+00:00", "2026-09-02T00:00:00+00:00")],
+            }
+
+    monkeypatch.setattr(reporting, "STATE_DIR", tmp_path / ".igai")
+    monkeypatch.setattr(reporting, "UNIFIED_REPORT", tmp_path / "igai-report.txt")
+    monkeypatch.setattr(cli.Settings, "from_env", lambda **_kwargs: settings)
+    monkeypatch.setattr(cli, "Database", _Database)
+    monkeypatch.setattr(cli, "IGRestClient", lambda _settings: object())
+    monkeypatch.setattr(cli, "HistoricalIGClient", HistoricalClient)
+    monkeypatch.setattr(cli, "BackfillService", Service)
+    monkeypatch.setattr(sys, "argv", [
+        "ig-ai", "history-backfill", "--market", "US Tech 100", "--days", "1", "--dry-run",
+    ])
+
+    assert cli.main() == 0
+    text = (tmp_path / "igai-report.txt").read_text()
+    assert "Authentication: NOT RUN (dry run)" in text
+    assert "Final state: HISTORICAL BACKFILL DRY RUN" in text
+    assert "historical request issued: NO" in text
+    assert "provenance: NOT APPLICABLE (dry run)" in text
+
+
 def test_replay_and_research_results_update_runtime_report(tmp_path, monkeypatch):
     settings = _settings(tmp_path)
 
@@ -172,9 +233,13 @@ def test_replay_and_research_results_update_runtime_report(tmp_path, monkeypatch
     text = (tmp_path / "igai-report.txt").read_text()
     assert "Command executed: ig-ai history-replay" in text
     assert "candidate snapshots: US Tech 100=3" in text
+    assert "anti-lookahead: NOT INDEPENDENTLY RE-VERIFIED" in text
+    assert "provenance: NOT OBSERVED" in text
 
     monkeypatch.setattr(sys, "argv", ["ig-ai", "research", "--instrument", "ig:E"])
     assert cli.main() == 0
     text = (tmp_path / "igai-report.txt").read_text()
     assert "Command executed: ig-ai research" in text
     assert "completed outcome counts by horizon: 1H=2" in text
+    assert "replay: NOT RUN (research command does not execute Historical Replay)" in text
+    assert "provenance: NOT OBSERVED" in text

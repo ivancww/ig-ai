@@ -37,6 +37,23 @@ def direction_evidence_sections(snapshot: dict) -> tuple[list[dict], list[dict]]
     return supporting, opposing
 
 
+def research_provenance_status(database, instruments: list[str]) -> str:
+    """Report provenance only when persisted source identities are inspected."""
+    connection = getattr(database, "connection", None)
+    if connection is None or not instruments:
+        return "NOT OBSERVED"
+    placeholders = ",".join("?" for _ in instruments)
+    rows = connection.execute(
+        f"SELECT DISTINCT source_identity FROM research_snapshots WHERE instrument_id IN ({placeholders}) ORDER BY source_identity",
+        instruments,
+    ).fetchall()
+    identities = [row[0] for row in rows if row[0]]
+    required_parts = ("ig_cfd|", "instrument=", "epic=", "market=", "type=")
+    if identities and all(all(part in identity for part in required_parts) for identity in identities):
+        return "PASS: " + "; ".join(identities)
+    return "NOT VERIFIED"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="ig-ai")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -290,9 +307,9 @@ def main() -> int:
                             f"{row['horizon']}={row['sample_count']}" for row in summary["rows"]
                         ) or "NONE",
                         "anti-lookahead": "PASS (closed-candle research engine)",
-                        "replay": "PASS (local)",
+                        "replay": "NOT RUN (research command does not execute Historical Replay)",
                         "outcome": "PASS",
-                        "provenance": "PASS (SQLite source identity)" if summary["snapshot_count"] else "NOT OBSERVED",
+                        "provenance": research_provenance_status(database, instruments),
                         "final state": summary["quality"],
                     },
                 )
@@ -383,10 +400,18 @@ def main() -> int:
                             )
                             for instrument, result in replay_results
                         ) or "NONE",
-                        "anti-lookahead": "PASS (point-in-time replay)",
+                        "anti-lookahead": "NOT INDEPENDENTLY RE-VERIFIED (implementation invariant)",
                         "replay": "PASS",
                         "outcome": "PASS",
-                        "provenance": "PASS (SQLite historical source identity)",
+                        "provenance": research_provenance_status(
+                            database,
+                            [
+                                instrument if instrument.startswith("ig:") else next(
+                                    (row[0] for row in instruments if row[2] == instrument), instrument
+                                )
+                                for instrument, _result in replay_results
+                            ],
+                        ),
                         "final state": "PASS",
                     },
                 )
@@ -422,14 +447,15 @@ def main() -> int:
                     print(json.dumps(result, sort_keys=True, default=str))
                 historical_request_issued = historical_request_issued or historical_client.request_count > 0
                 successful = all(result.get("status") in {"COMPLETE", "DRY_RUN"} for result in results)
+                dry_run = bool(results) and all(result.get("status") == "DRY_RUN" for result in results)
                 update_terminal_report(
                     command="ig-ai history-backfill",
                     account_type=settings.account_type,
-                    authentication="PASS (read-only historical workflow)",
-                    runtime_outcome="COMPLETED",
-                    final_state="HISTORICAL BACKFILL PASS" if successful else "HISTORICAL BACKFILL FAIL",
-                    checks="read-only IG historical backfill completed",
-                    not_verified="Trading/order/position endpoints were not used",
+                    authentication="NOT RUN (dry run)" if dry_run else "PASS (read-only historical workflow)",
+                    runtime_outcome="PLANNED" if dry_run else "COMPLETED",
+                    final_state="HISTORICAL BACKFILL DRY RUN" if dry_run else ("HISTORICAL BACKFILL PASS" if successful else "HISTORICAL BACKFILL FAIL"),
+                    checks="dry-run request planning completed; no historical request issued" if dry_run else "read-only IG historical backfill completed",
+                    not_verified="Authentication/provider access and historical request were not verified; trading/order/position endpoints were not used" if dry_run else "Trading/order/position endpoints were not used",
                     details={
                         "stage reached": "historical persistence",
                         "market": "; ".join(result.get("market", market) for result, market in zip(results, markets, strict=True)),
@@ -453,9 +479,9 @@ def main() -> int:
                             f"{result.get('available_range', {}).get('first', 'NONE')} / {result.get('available_range', {}).get('last', 'NONE')}"
                             for result in results
                         ),
-                        "provenance": "IG_HISTORICAL / IG / CFD",
-                        "historical request issued": "YES" if historical_request_issued else "NO",
-                        "final state": "PASS" if successful else "FAIL",
+                        "provenance": "NOT APPLICABLE (dry run)" if dry_run else "IG_HISTORICAL / IG / CFD",
+                        "historical request issued": "NO" if dry_run else ("YES" if historical_request_issued else "NO"),
+                        "final state": "DRY_RUN" if dry_run else ("PASS" if successful else "FAIL"),
                     },
                 )
                 return 0
