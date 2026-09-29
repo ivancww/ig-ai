@@ -113,6 +113,20 @@ class OutcomeClassificationConfig:
             raise ValueError("missing_atr_policy must be PENDING or EXCLUDE")
 
 
+@dataclass(frozen=True)
+class OutcomeClassification:
+    """Explicit classification state for one reference/horizon outcome."""
+
+    label: str | None
+    status: str
+    threshold: float | None
+    reason: str | None
+
+    @property
+    def classified(self) -> bool:
+        return self.status == "CLASSIFIED"
+
+
 def horizon_minutes(horizon: str) -> int:
     if horizon not in HORIZONS:
         raise ValueError(f"unsupported horizon: {horizon}")
@@ -137,11 +151,45 @@ def classify_return(forward_return: float | None, threshold: float | None) -> st
     return "NEUTRAL"
 
 
-def classify_forward_outcome(*, reference_price: float, future_price: float | None, atr14: float | None, horizon: str, config: OutcomeClassificationConfig) -> str | None:
+def classify_forward_outcome(*, reference_price: float, future_price: float | None, atr14: float | None, horizon: str, config: OutcomeClassificationConfig) -> OutcomeClassification:
+    """Classify an outcome while preserving explicit missing-ATR semantics.
+
+    PENDING means the observation may become classifiable later but is not in
+    any classified denominator now. EXCLUDED means the configured policy has
+    removed it from the classification population for this run. Neither path
+    falls back to the legacy descriptive threshold or fabricates ATR.
+    """
     threshold = atr_noise_threshold(atr14=atr14, reference_price=reference_price, horizon=horizon, config=config)
-    if future_price is None or threshold is None:
-        return None
-    return classify_return((future_price - reference_price) / reference_price, threshold)
+    if threshold is None:
+        return OutcomeClassification(
+            label=None,
+            status="EXCLUDED" if config.missing_atr_policy == "EXCLUDE" else "PENDING",
+            threshold=None,
+            reason="MISSING_OR_INVALID_REFERENCE_ATR",
+        )
+    if future_price is None:
+        return OutcomeClassification(
+            label=None,
+            status="PENDING",
+            threshold=threshold,
+            reason="FUTURE_OUTCOME_UNAVAILABLE",
+        )
+    return OutcomeClassification(
+        label=classify_return((future_price - reference_price) / reference_price, threshold),
+        status="CLASSIFIED",
+        threshold=threshold,
+        reason=None,
+    )
+
+
+def classification_counts(results: Iterable[OutcomeClassification]) -> dict[str, int]:
+    counts = Counter(result.status for result in results)
+    return {
+        "total": sum(counts.values()),
+        "classified": counts["CLASSIFIED"],
+        "pending": counts["PENDING"],
+        "excluded": counts["EXCLUDED"],
+    }
 
 
 def sample_warning(sample_count: int) -> str:
@@ -158,7 +206,11 @@ def _safe_mean(values: list[float]) -> float | None:
 
 def summarize_outcomes(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Calculate descriptive metrics with explicit denominators."""
-    complete = [row for row in rows if row.get("status", "COMPLETE") == "COMPLETE"]
+    complete = [
+        row for row in rows
+        if row.get("status", "COMPLETE") == "COMPLETE"
+        and row.get("classification_status", "CLASSIFIED") == "CLASSIFIED"
+    ]
     n = len(complete)
     actual = Counter(row.get("direction_outcome") for row in complete)
     predictions = [row.get("predicted_direction", row.get("direction")) for row in complete]

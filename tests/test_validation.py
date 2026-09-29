@@ -8,6 +8,7 @@ from ig_ai.validation import (
     OutcomeClassificationConfig,
     ValidationSplitConfig,
     atr_noise_threshold,
+    classification_counts,
     classify_forward_outcome,
     classify_return,
     grouped_descriptive_metrics,
@@ -63,7 +64,33 @@ def test_atr_threshold_scales_by_horizon_and_handles_missing_atr():
     assert one_hour == pytest.approx(0.01)
     assert four_hour == pytest.approx(0.02)
     assert atr_noise_threshold(atr14=None, reference_price=100, horizon="1H", config=config) is None
-    assert classify_forward_outcome(reference_price=100, future_price=101, atr14=None, horizon="1H", config=config) is None
+    pending = classify_forward_outcome(reference_price=100, future_price=101, atr14=None, horizon="1H", config=config)
+    assert pending.status == "PENDING"
+    assert pending.label is None
+    assert not pending.classified
+
+
+def test_missing_atr_policies_are_explicit_and_excluded_from_denominators():
+    pending_config = OutcomeClassificationConfig(missing_atr_policy="PENDING")
+    excluded_config = OutcomeClassificationConfig(missing_atr_policy="EXCLUDE")
+    pending = classify_forward_outcome(reference_price=100, future_price=101, atr14=0, horizon="1H", config=pending_config)
+    excluded = classify_forward_outcome(reference_price=100, future_price=101, atr14=None, horizon="1H", config=excluded_config)
+    classified = classify_forward_outcome(reference_price=100, future_price=102, atr14=2, horizon="1H", config=pending_config)
+    assert pending.status == "PENDING" and pending.reason == "MISSING_OR_INVALID_REFERENCE_ATR"
+    assert excluded.status == "EXCLUDED" and excluded.reason == "MISSING_OR_INVALID_REFERENCE_ATR"
+    assert classified.status == "CLASSIFIED" and classified.label == "UP"
+    assert classification_counts([pending, excluded, classified]) == {
+        "total": 3,
+        "classified": 1,
+        "pending": 1,
+        "excluded": 1,
+    }
+    rows = [
+        {"status": "COMPLETE", "classification_status": pending.status, "direction_outcome": "UP"},
+        {"status": "COMPLETE", "classification_status": excluded.status, "direction_outcome": "UP"},
+        {"status": "COMPLETE", "classification_status": classified.status, "direction": "UP", "direction_outcome": "UP"},
+    ]
+    assert summarize_outcomes(rows)["n"] == 1
 
 
 def test_horizon_classification_is_explicit_three_class_and_not_probability():

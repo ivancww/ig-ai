@@ -4,43 +4,34 @@ PHASE 1 DISCOVERY HARDENING: PASS
 
 === TERMINAL / RUNTIME REPORT ===
 
-Command executed: Step 7 statistical validation foundation implementation
-Timestamp (UTC): 2026-09-29T12:58:00+00:00
+Command executed: Update existing PR #10 — explicit missing-ATR classification semantics
+Timestamp (UTC): 2026-09-29T13:05:00+00:00
 Repository: ivancww/ig-ai
-Branch: step7-statistical-validation
+Branch: step7/statistical-validation
 PR: #10 — https://github.com/ivancww/ig-ai/pull/10 (OPEN; do not merge)
-Implementation commit: 3a869e9
-Current PR head: 217aeac
 Runtime outcome: COMPLETED
-Final state: STEP 7 IMPLEMENTATION PASS
-Tests/runtime checks: pytest 250 passed; security tests 2 passed; Ruff passed; git diff --check passed; compileall passed
+Final state: MISSING ATR SEMANTICS FIX PASS
+Tests/runtime checks: pytest 251 passed; security tests 2 passed; Ruff passed; git diff --check passed
 Warnings/errors: NONE
-Anything not verified: No provider request, probability model fit, threshold optimization, or out-of-sample claim was performed
+Anything not verified: Probability calibration and model tuning were not performed
 
 Runtime details:
-STEP 7 IMPLEMENTATION: PASS
-BRANCH: step7-statistical-validation
-FILES CHANGED: igai-report.txt; src/ig_ai/research.py; src/ig_ai/validation.py; tests/test_validation.py
-SCORE REPORTING: PASS — deterministic buckets cover raw [0,100] with preserved score values; scores remain technical evidence, not probabilities
-VALIDATION CONFIG: PASS — chronological development/validation/OOS/forward-test periods with purge/embargo enforcement
-OUTCOME CLASSIFICATION: PASS — configurable UP/DOWN/NEUTRAL horizon classification with explicit missing-ATR handling
-ATR/NOISE FOUNDATION: PASS — ATR14 return-unit conversion, sqrt-horizon scaling, multiplier, and execution/noise floor are configurable; no fitting performed
-STATISTICAL REPORTING: PASS — denominators, hit/precision/balanced metrics, returns, MFE/MAE, continuation/reversal, holding-window, and grouped descriptive metrics
-OVERLAP/DEPENDENCE: PASS — reference-anchor overlap metadata, non-overlap selection, and purge/embargo metadata
-CALIBRATION INTERFACES: PASS — reliability/Brier/log-loss/slope/intercept/ECE placeholders only; no probabilities accepted or calculated
-RESEARCH LABELS: PASS — DESCRIPTIVE / IN-SAMPLE RESEARCH; NOT CALIBRATED PROBABILITY; NOT OUT-OF-SAMPLE PERFORMANCE
+MISSING ATR PENDING: PASS — explicit status PENDING, reason MISSING_OR_INVALID_REFERENCE_ATR, label absent, classified=false
+MISSING ATR EXCLUDE: PASS — explicit status EXCLUDED, same reason, label absent, classified=false
+CLASSIFIED DENOMINATOR SAFETY: PASS — only CLASSIFIED results enter summarize_outcomes; pending/excluded remain separately countable
+ATR FABRICATION: NO
+LEGACY THRESHOLD FALLBACK WHEN ATR MISSING: NO
+EXISTING HISTORICAL OUTCOMES: PRESERVED
 MODEL WEIGHTS CHANGED: NO
 THRESHOLDS OPTIMIZED: NO
-PROBABILITY MODEL FIT: NO
-EXISTING DATA PRESERVED: YES
-ANTI-LOOKAHEAD REGRESSION: PASS
-IDEMPOTENCY REGRESSION: PASS
-PYTEST: PASS — 250 passed
-RUFF: PASS
-DIFF CHECK: PASS
-SECURITY: PASS — 2 security tests passed
+PROBABILITY CALIBRATION: NOT RUN
 IG PROVIDER REQUEST ISSUED: NO
 TRADING/MUTATION ENDPOINT USED: NO
-PR NUMBER: 10
-PR URL: https://github.com/ivancww/ig-ai/pull/10
-STOP STATE: PR OPEN; NOT MERGED
+PYTEST: PASS — 251 passed
+RUFF: PASS
+DIFF CHECK: PASS
+SECURITY: PASS — 2 tests passed
+MERGEABILITY BEFORE PUSH: CLEAN
+MERGEABILITY AFTER PUSH: PENDING
+HEAD SHA BEFORE FIX COMMIT: c83a282
+STOP STATE: Update PR #10 only; do not merge
