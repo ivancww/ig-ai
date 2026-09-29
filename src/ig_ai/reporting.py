@@ -23,8 +23,9 @@ def _safe_text(value: object, secrets: tuple[str, ...] = ()) -> str:
             text = text.replace(secret, "[REDACTED]")
     lines = []
     sensitive_names = (
-        "ig_api_key", "ig_username", "ig_password", "cst", "x-security-token",
-        "ls_password", "access_token", "refresh_token", "authorization", "session_id",
+        "ig_api_key", "ig_username", "ig_password", "api_key", "username", "password",
+        "cst", "x-security-token", "ls_password", "lightstreamer_password", "access_token",
+        "refresh_token", "authorization", "session_id",
     )
     for line in text.splitlines():
         lower = line.lower()
@@ -57,6 +58,7 @@ def update_terminal_report(
     warnings: str = "NONE",
     not_verified: str = "None stated",
     output: str = "",
+    details: dict[str, object] | None = None,
     secrets: tuple[str, ...] = (),
 ) -> None:
     account = account_type.upper() if account_type.upper() in {"LIVE", "DEMO"} else "DEMO"
@@ -79,9 +81,15 @@ def update_terminal_report(
             "Anything not verified: " + _safe_text(not_verified, secrets),
         ]
     )
+    if details:
+        body += "\n\nRuntime details:\n" + "\n".join(
+            f"{_safe_text(key, secrets)}: {_safe_text(value, secrets)}"
+            for key, value in details.items()
+        )
     if output.strip():
         body += "\n\nSafe command output:\n" + _safe_text(output, secrets)
     _write(TERMINAL_REPORT, body)
+    render_report()
 
 
 def update_codex_report(text: str) -> None:

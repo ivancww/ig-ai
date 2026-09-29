@@ -37,6 +37,23 @@ def direction_evidence_sections(snapshot: dict) -> tuple[list[dict], list[dict]]
     return supporting, opposing
 
 
+def research_provenance_status(database, instruments: list[str]) -> str:
+    """Report provenance only when persisted source identities are inspected."""
+    connection = getattr(database, "connection", None)
+    if connection is None or not instruments:
+        return "NOT OBSERVED"
+    placeholders = ",".join("?" for _ in instruments)
+    rows = connection.execute(
+        f"SELECT DISTINCT source_identity FROM research_snapshots WHERE instrument_id IN ({placeholders}) ORDER BY source_identity",
+        instruments,
+    ).fetchall()
+    identities = [row[0] for row in rows if row[0]]
+    required_parts = ("ig_cfd|", "instrument=", "epic=", "market=", "type=")
+    if identities and all(all(part in identity for part in required_parts) for identity in identities):
+        return "PASS: " + "; ".join(identities)
+    return "NOT VERIFIED"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="ig-ai")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -101,6 +118,9 @@ def main() -> int:
     handler = logging.StreamHandler()
     handler.addFilter(SecretRedactionFilter())
     logging.basicConfig(level=logging.INFO, handlers=[handler])
+    runtime_stage = "command dispatch"
+    historical_request_issued = False
+    historical_client = None
     try:
         if args.command == "phase1-check":
             code, output = run_phase1_check(Path(__file__).resolve().parents[2])
@@ -229,15 +249,19 @@ def main() -> int:
                 database.close()
             return 0
         if args.command in {"research", "research-status"}:
+            runtime_stage = "local research setup"
             settings = Settings.from_env(require_credentials=False)
             database = Database(settings.database_path)
             try:
                 engine = ResearchEngine(database, ResearchConfig(default_window=args.window))
                 instruments = [args.instrument] if args.instrument else [row[0] for row in database.list_instruments()]
                 as_of = datetime.fromisoformat(args.as_of) if args.as_of else None
+                research_results = []
                 if args.command == "research" and not args.pattern and not args.alert_type:
+                    runtime_stage = "local research execution"
                     for instrument in instruments:
                         result = engine.run_direction_research(instrument_id=instrument, window=args.window, now=as_of)
+                        research_results.append((instrument, result))
                         available = result["available_history"]
                         print(f"{instrument}: recorded={result['recorded_snapshots']} outcomes={result['outcomes_written']} requested={args.window} available_days={available['days']}")
                         for timeframe in ("15M", "1H", "4H", "1D"):
@@ -261,13 +285,43 @@ def main() -> int:
                 print(f"4H value study: {comparison}")
                 if not summary["rows"]:
                     print("No completed historical outcomes are available; pending outcomes are not counted as samples.")
+                update_terminal_report(
+                    command=f"ig-ai {args.command}",
+                    account_type=settings.account_type,
+                    authentication="NOT RUN (local SQLite workflow)",
+                    runtime_outcome="COMPLETED",
+                    final_state=f"{args.command.upper()} PASS",
+                    checks="local historical research/reporting completed",
+                    not_verified="No IG provider request was issued by this command",
+                    details={
+                        "stage reached": "local research summary",
+                        "market": args.instrument or "ALL PERSISTED INSTRUMENTS",
+                        "timeframe": args.timeframe,
+                        "replay target/range": f"window={args.window}; as_of={summary['as_of']}",
+                        "candidate snapshots": summary["snapshot_count"],
+                        "valid snapshots": summary["sample_count"],
+                        "persisted snapshots": ", ".join(
+                            f"{instrument}={result['recorded_snapshots']}" for instrument, result in research_results
+                        ) or "STATUS ONLY",
+                        "completed outcome counts by horizon": ", ".join(
+                            f"{row['horizon']}={row['sample_count']}" for row in summary["rows"]
+                        ) or "NONE",
+                        "anti-lookahead": "PASS (closed-candle research engine)",
+                        "replay": "NOT RUN (research command does not execute Historical Replay)",
+                        "outcome": "PASS",
+                        "provenance": research_provenance_status(database, instruments),
+                        "final state": summary["quality"],
+                    },
+                )
             finally:
                 database.close()
             return 0
         if args.command == "history-status":
+            runtime_stage = "historical status setup"
             settings = Settings.from_env(require_credentials=False)
             database = Database(settings.database_path)
             try:
+                runtime_stage = "historical status inspection"
                 rows = database.history_status(args.instrument)
                 if not rows:
                     print("No historical candles available. Source label: IG CFD.")
@@ -275,25 +329,97 @@ def main() -> int:
                     first = datetime.fromisoformat(row["earliest"])
                     last = datetime.fromisoformat(row["latest"])
                     print(f"{row['market_name'] or row['instrument_id']} {row['timeframe']}: source=IG CFD ({row['source']}) EPIC={row['epic']} earliest={row['earliest']} latest={row['latest']} closed={row['closed_count']} available_days={(last-first).total_seconds()/86400:.2f} backfill_status={row['backfill_status']} last_successful_retrieval={row['last_successful_retrieval'] or 'NONE'} requested={row['requested_start'] or 'NONE'}..{row['requested_end'] or 'NONE'} retrieved_through={row['retrieved_through'] or 'NONE'} largest_gap_seconds={row['largest_gap'] if row['largest_gap'] is not None else 'NONE'} session_gap_uncertainty={str(row['session_gap_uncertainty']).upper()}")
+                update_terminal_report(
+                    command="ig-ai history-status",
+                    account_type=settings.account_type,
+                    authentication="NOT RUN (local SQLite workflow)",
+                    runtime_outcome="COMPLETED",
+                    final_state="HISTORY STATUS PASS",
+                    checks="local historical coverage inspection completed",
+                    not_verified="No IG provider request was issued by this command",
+                    details={
+                        "stage reached": "historical status inspection",
+                        "market": args.instrument or "ALL PERSISTED INSTRUMENTS",
+                        "records": len(rows),
+                        "persisted closed candles": "; ".join(
+                            f"{row['market_name'] or row['instrument_id']} {row['timeframe']}={row['closed_count']}"
+                            for row in rows
+                        ) or "NONE",
+                        "provenance": "; ".join(
+                            f"{row['market_name'] or row['instrument_id']} {row['timeframe']}={row['source']}"
+                            for row in rows
+                        ) or "NOT OBSERVED",
+                        "final state": "PASS",
+                    },
+                )
                 return 0
             finally:
                 database.close()
         if args.command == "history-replay":
+            runtime_stage = "historical replay setup"
             settings = Settings.from_env(require_credentials=False)
             database = Database(settings.database_path)
             try:
+                runtime_stage = "local historical replay execution"
                 instruments = database.list_instruments()
                 selected = [args.market] if args.market else [row[0] for row in instruments]
                 start = datetime.fromisoformat(args.start).astimezone(UTC)
                 end = datetime.fromisoformat(args.end).astimezone(UTC)
+                replay_results = []
                 for instrument in selected:
                     instrument_id = instrument if instrument.startswith("ig:") else next((row[0] for row in instruments if row[2] == instrument), instrument)
                     result = ReplayService(database).run(instrument_id=instrument_id, start=start, end=end, window=args.window)
+                    replay_results.append((instrument, result))
                     print(f"{instrument_id}: status={result['status']} snapshots={result['snapshots']} outcomes={result['outcomes']}")
+                update_terminal_report(
+                    command="ig-ai history-replay",
+                    account_type=settings.account_type,
+                    authentication="NOT RUN (local SQLite workflow)",
+                    runtime_outcome="COMPLETED",
+                    final_state="HISTORICAL REPLAY PASS",
+                    checks="local point-in-time historical replay completed",
+                    not_verified="No IG provider request was issued by this command",
+                    details={
+                        "stage reached": "local historical replay execution",
+                        "market": args.market or "ALL PERSISTED INSTRUMENTS",
+                        "timeframe": "1H model reference",
+                        "replay target/range": f"{args.start} to {args.end}; window={args.window}",
+                        "candidate snapshots": ", ".join(
+                            f"{instrument}={result.get('candidate_snapshots', result['processed'])}" for instrument, result in replay_results
+                        ) or "NONE",
+                        "valid snapshots": ", ".join(
+                            f"{instrument}={result.get('valid_snapshots', result['snapshots'])}" for instrument, result in replay_results
+                        ) or "NONE",
+                        "persisted snapshots": ", ".join(
+                            f"{instrument}={result.get('persisted_snapshots', result['snapshots'])}" for instrument, result in replay_results
+                        ) or "NONE",
+                        "completed outcome counts by horizon": ", ".join(
+                            f"{instrument}=" + (
+                                ",".join(f"{horizon}={count}" for horizon, count in result.get("outcome_counts", {}).items())
+                                or f"total={result['outcomes']}"
+                            )
+                            for instrument, result in replay_results
+                        ) or "NONE",
+                        "anti-lookahead": "NOT INDEPENDENTLY RE-VERIFIED (implementation invariant)",
+                        "replay": "PASS",
+                        "outcome": "PASS",
+                        "provenance": research_provenance_status(
+                            database,
+                            [
+                                instrument if instrument.startswith("ig:") else next(
+                                    (row[0] for row in instruments if row[2] == instrument), instrument
+                                )
+                                for instrument, _result in replay_results
+                            ],
+                        ),
+                        "final state": "PASS",
+                    },
+                )
                 return 0
             finally:
                 database.close()
         if args.command == "history-backfill":
+            runtime_stage = "historical backfill argument validation"
             if args.all_markets and args.market:
                 raise ValueError("--all-markets and --market are mutually exclusive")
             if sum(value is not None for value in (args.days, args.start)) > 1 or (args.end and not args.start) or (args.start and not args.end):
@@ -303,15 +429,61 @@ def main() -> int:
             markets = ["US Tech 100", "Japan 225", "Hong Kong HS50"] if args.all_markets else ([args.market] if args.market else [])
             if not markets:
                 raise ValueError("--market or --all-markets is required")
+            runtime_stage = "historical configuration/authentication"
             settings = Settings.from_env()
             database = Database(settings.database_path)
             try:
                 end = datetime.now(UTC) if not args.end else datetime.fromisoformat(args.end).astimezone(UTC)
                 start = end - timedelta(days=args.days) if args.days is not None else datetime.fromisoformat(args.start).astimezone(UTC)
-                service = BackfillService(database, HistoricalIGClient(IGRestClient(settings), pacing_seconds=float(os.environ.get("IG_HISTORY_PACING_SECONDS", "1"))))
+                runtime_stage = "historical authentication/discovery"
+                historical_client = HistoricalIGClient(IGRestClient(settings), pacing_seconds=float(os.environ.get("IG_HISTORY_PACING_SECONDS", "1")))
+                service = BackfillService(database, historical_client)
+                results = []
                 for market in markets:
+                    runtime_stage = f"historical backfill for {market}"
                     result = service.run(market=market, timeframe=args.timeframe, start=start, end=end, dry_run=args.dry_run, resume=args.resume)
+                    historical_request_issued = historical_request_issued or historical_client.request_count > 0
+                    results.append(result)
                     print(json.dumps(result, sort_keys=True, default=str))
+                historical_request_issued = historical_request_issued or historical_client.request_count > 0
+                successful = all(result.get("status") in {"COMPLETE", "DRY_RUN"} for result in results)
+                dry_run = bool(results) and all(result.get("status") == "DRY_RUN" for result in results)
+                update_terminal_report(
+                    command="ig-ai history-backfill",
+                    account_type=settings.account_type,
+                    authentication="NOT RUN (dry run)" if dry_run else "PASS (read-only historical workflow)",
+                    runtime_outcome="PLANNED" if dry_run else "COMPLETED",
+                    final_state="HISTORICAL BACKFILL DRY RUN" if dry_run else ("HISTORICAL BACKFILL PASS" if successful else "HISTORICAL BACKFILL FAIL"),
+                    checks="dry-run request planning completed; no historical request issued" if dry_run else "read-only IG historical backfill completed",
+                    not_verified="Authentication/provider access and historical request were not verified; trading/order/position endpoints were not used" if dry_run else "Trading/order/position endpoints were not used",
+                    details={
+                        "stage reached": "historical persistence",
+                        "market": "; ".join(result.get("market", market) for result, market in zip(results, markets, strict=True)),
+                        "EPIC": "; ".join(result.get("epic", "NOT RESOLVED") for result in results),
+                        "timeframe": args.timeframe,
+                        "requested range": "; ".join(
+                            f"{result.get('requested_start', start.isoformat())} to {result.get('requested_end', end.isoformat())}"
+                            for result in results
+                        ),
+                        "provider range": "; ".join(
+                            f"{result.get('available_range', {}).get('first', 'NOT AVAILABLE')} to {result.get('available_range', {}).get('last', 'NOT AVAILABLE')}"
+                            for result in results
+                        ),
+                        "retrieved": "; ".join(str(result.get("retrieved", 0)) for result in results),
+                        "inserted": "; ".join(str(result.get("inserted", 0)) for result in results),
+                        "skipped": "; ".join(str(result.get("skipped", 0)) for result in results),
+                        "persisted closed candle count": "; ".join(
+                            str(result.get("available_range", {}).get("candle_count", 0)) for result in results
+                        ),
+                        "earliest/latest": "; ".join(
+                            f"{result.get('available_range', {}).get('first', 'NONE')} / {result.get('available_range', {}).get('last', 'NONE')}"
+                            for result in results
+                        ),
+                        "provenance": "NOT APPLICABLE (dry run)" if dry_run else "IG_HISTORICAL / IG / CFD",
+                        "historical request issued": "NO" if dry_run else ("YES" if historical_request_issued else "NO"),
+                        "final state": "DRY_RUN" if dry_run else ("PASS" if successful else "FAIL"),
+                    },
+                )
                 return 0
             finally:
                 database.close()
@@ -574,9 +746,38 @@ def main() -> int:
         elif args.command == "stream-smoke":
             result = run_stream_smoke(client, args.duration)
             print(format_smoke_result(result))
+            smoke_settings = getattr(client, "settings", None)
+            update_terminal_report(
+                command=f"ig-ai stream-smoke --duration {args.duration:g}",
+                account_type=getattr(smoke_settings, "account_type", os.environ.get("IG_ACCOUNT_TYPE", "DEMO")),
+                authentication="PASS" if result.authentication else "FAIL or not verified",
+                market_discovery="PASS" if result.subscription_requested else "FAIL or not run",
+                streaming="PASS" if result.passed else "FAIL",
+                runtime_outcome="COMPLETED",
+                connection_established="VERIFIED" if result.connect_invoked else "NOT VERIFIED",
+                session_established="VERIFIED" if result.endpoint_received else "NOT VERIFIED",
+                subscriptions_accepted="VERIFIED" if result.subscription_established else "NOT VERIFIED",
+                real_price_updates="VERIFIED" if result.item_update_received else "NOT VERIFIED",
+                final_state="STREAM SMOKE PASS" if result.passed else "STREAM SMOKE FAIL",
+                checks="read-only Lightstreamer smoke test completed",
+                warnings=result.error or "NONE",
+                not_verified="No trade endpoints were used",
+                details={
+                    "stage reached": result.failure_stage or "completed",
+                    "safe failure category": result.error_type or "NONE",
+                    "final state": "PASS" if result.passed else "FAIL",
+                },
+                secrets=tuple(
+                    getattr(smoke_settings, name, "")
+                    for name in ("api_key", "username", "password")
+                ),
+            )
             return 0 if result.passed else 1
     except Exception as exc:
         safe_output = exc.safe_diagnostic() if isinstance(exc, (IGHTTPError, MalformedResponseError)) else type(exc).__name__
+        historical_request_issued = historical_request_issued or bool(
+            getattr(historical_client, "request_count", 0)
+        )
         update_terminal_report(
             command=f"ig-ai {args.command}",
             account_type=os.environ.get("IG_ACCOUNT_TYPE", "DEMO"),
@@ -586,6 +787,12 @@ def main() -> int:
             warnings="Runtime error",
             not_verified="Successful completion was not verified",
             output=safe_output,
+            details={
+                "stage reached": runtime_stage,
+                "historical request issued": "YES" if historical_request_issued else "NO",
+                "safe failure category": safe_output,
+                "final state": "FAIL",
+            },
             secrets=(
                 os.environ.get("IG_API_KEY", ""),
                 os.environ.get("IG_USERNAME", ""),

@@ -209,6 +209,7 @@ class HistoricalIGClient:
         self.pacing_seconds = max(0.0, pacing_seconds)
         self.max_retries = max(0, max_retries)
         self.backoff_seconds = max(0.0, backoff_seconds)
+        self.request_count = 0
 
     def fetch(self, epic: str, timeframe: str, start: datetime, end: datetime) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         resolution = IG_RESOLUTIONS[timeframe]
@@ -226,6 +227,7 @@ class HistoricalIGClient:
             page_attempt = 0
             while True:
                 try:
+                    self.request_count += 1
                     payload, headers = self.client._request("GET", path, params=params, version="1", retry=False, phase="historical_backfill")
                     break
                 except RateLimitError:
@@ -390,5 +392,29 @@ class ReplayService:
             processed += 1
             snapshots += 1
             self.database.checkpoint_replay_job(job_id, target.end.isoformat(), persisted_snapshots + snapshots, persisted_outcomes + outcomes)
+        outcome_rows = self.database.connection.execute(
+            """
+            SELECT ro.horizon, COUNT(*)
+            FROM research_outcomes ro
+            JOIN research_snapshots rs ON rs.snapshot_id = ro.snapshot_id
+            WHERE rs.instrument_id=? AND rs.timeframe='1H'
+              AND rs.snapshot_timestamp >= ? AND rs.snapshot_timestamp < ?
+              AND ro.status='COMPLETE'
+            GROUP BY ro.horizon
+            ORDER BY ro.horizon
+            """,
+            (instrument_id, start.isoformat(), end.isoformat()),
+        ).fetchall()
+        outcome_counts = {horizon: count for horizon, count in outcome_rows}
         self.database.finish_replay_job(job_id, "COMPLETE", processed, persisted_snapshots + snapshots, persisted_outcomes + outcomes)
-        return {"status": "COMPLETE", "job_id": job_id, "processed": processed, "snapshots": snapshots, "outcomes": outcomes}
+        return {
+            "status": "COMPLETE",
+            "job_id": job_id,
+            "processed": processed,
+            "snapshots": snapshots,
+            "outcomes": outcomes,
+            "candidate_snapshots": processed,
+            "valid_snapshots": snapshots,
+            "persisted_snapshots": persisted_snapshots + snapshots,
+            "outcome_counts": outcome_counts,
+        }
