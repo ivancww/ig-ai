@@ -172,6 +172,8 @@ class HistoricalReplay:
         self.phase2b = Phase2BEngine()
 
     def state_for_aligned(self, target: Candle, aligned: dict[str, list[Candle]]) -> dict[str, Any]:
+        if any(candle.end > target.end for candles in aligned.values() for candle in candles):
+            raise ValueError("replay model input contains a candle after information_time")
         bounded = {
             timeframe: [candle for candle in candles if candle.is_closed and candle.end <= target.end][-self.max_history:]
             for timeframe, candles in aligned.items()

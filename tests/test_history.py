@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -68,7 +69,10 @@ class PagingClient:
 
     def _request(self, method, path, **kwargs):
         self.calls.append((method, path, kwargs))
-        return next(self.responses)
+        response = next(self.responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 def test_provider_paging_is_followed_and_rows_are_combined():
@@ -77,6 +81,15 @@ def test_provider_paging_is_followed_and_rows_are_combined():
     client = PagingClient([(first, {"X-REQUEST-ID": "safe"}), (second, {})])
     rows, metadata = HistoricalIGClient(client, pacing_seconds=0).fetch("E", "1H", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC))
     assert len(rows) == 2 and metadata["pages"] == 2 and len(client.calls) == 2
+
+
+def test_each_provider_page_gets_its_own_retry_budget(monkeypatch):
+    first = {"prices": [row()], "metadata": {"paging": {"next": "/prices/E/HOUR?startdate=a&enddate=b"}}}
+    second = {"prices": [{**row("2026-01-01T01:00:00Z")}], "metadata": {}}
+    client = PagingClient([(first, {}), IGHTTPError(503, "temporary", retryable=True), (second, {})])
+    monkeypatch.setattr("ig_ai.history.time.sleep", lambda _seconds: None)
+    rows, metadata = HistoricalIGClient(client, pacing_seconds=0, max_retries=1).fetch("E", "1H", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC))
+    assert len(rows) == 2 and metadata["pages"] == 2 and len(client.calls) == 3
 
 
 def test_provider_truncation_without_next_link_is_rejected():
@@ -235,3 +248,25 @@ def test_replay_excludes_forming_and_future_context_on_all_timeframes():
     assert result[0]["histories"]["4H"] == []
     assert result[0]["histories"]["1D"] == []
     assert result[0]["state"]["model_reference"]["information_time"] == (start + timedelta(hours=1)).isoformat()
+
+
+def test_future_15m_is_outcome_only_and_cannot_change_frozen_model_state(tmp_path):
+    def run_case(path, extreme):
+        database = Database(path)
+        database.save_instrument("ig:E", "E", "US Tech 100", instrument_type="INDICES")
+        start = datetime(2026, 1, 1, tzinfo=UTC)
+        database.save_candle(Candle("ig:E", "E", "1H", start, start + timedelta(hours=1), Decimal(100), Decimal(102), Decimal(99), Decimal(101), is_closed=True))
+        for index in range(4):
+            point = Decimal("10000") if extreme else Decimal("100")
+            future_start = start + timedelta(hours=1, minutes=15 * index)
+            database.save_candle(Candle("ig:E", "E", "15M", future_start, future_start + timedelta(minutes=15), point, point + 2, point - 1, point + 1, is_closed=True))
+        ReplayService(database).run(instrument_id="ig:E", start=start, end=start + timedelta(hours=1))
+        context = database.connection.execute("SELECT context_json FROM research_snapshots").fetchone()[0]
+        outcome = database.connection.execute("SELECT status FROM research_outcomes WHERE horizon='1H'").fetchone()[0]
+        database.close()
+        return context, outcome
+
+    ordinary_context, ordinary_outcome = run_case(tmp_path / "ordinary.sqlite3", False)
+    extreme_context, extreme_outcome = run_case(tmp_path / "extreme.sqlite3", True)
+    assert json.loads(ordinary_context) == json.loads(extreme_context)
+    assert ordinary_outcome == "COMPLETE" and extreme_outcome == "COMPLETE"

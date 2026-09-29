@@ -170,45 +170,49 @@ class HistoricalIGClient:
         page_count = 0
         path = f"/prices/{epic}/{resolution}"
         params: dict[str, str] = {"startdate": start.isoformat(), "enddate": end.isoformat()}
-        for attempt in range(self.max_retries + 1):
-            try:
-                payload, headers = self.client._request("GET", path, params=params, version="3", retry=False, phase="historical_backfill")
-                rows = payload.get("prices", [])
-                if not isinstance(rows, list):
-                    raise MalformedResponseError("IG historical response has invalid prices")
-                all_rows.extend(row for row in rows if isinstance(row, dict))
-                page_count += 1
-                metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-                paging = metadata.get("paging") if isinstance(metadata.get("paging"), dict) else {}
-                next_url = paging.get("next") or metadata.get("next")
-                if next_url:
-                    parsed = urlsplit(str(next_url))
-                    if not parsed.path.startswith("/prices/"):
-                        raise MalformedResponseError("IG historical paging link is not a price endpoint")
-                    path = parsed.path
-                    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
-                    attempt = 0
-                    continue
-                page_data = metadata.get("pageData") if isinstance(metadata.get("pageData"), dict) else {}
-                total_pages = page_data.get("totalPages") if page_data.get("totalPages") is not None else paging.get("totalPages")
-                page_number = page_data.get("pageNumber") if page_data.get("pageNumber") is not None else paging.get("pageNumber")
-                page_size = page_data.get("pageSize") if page_data.get("pageSize") is not None else paging.get("pageSize")
-                if total_pages is not None and page_number is not None and int(page_number) + 1 < int(total_pages):
-                    raise MalformedResponseError("IG historical response is truncated: paging metadata has no next link")
-                if page_size and len(rows) >= int(page_size):
-                    raise MalformedResponseError("IG historical response may be truncated at provider page size")
-                return all_rows, {"resolution": resolution, "rows": len(all_rows), "pages": page_count, "complete": True, "headers": {key: value for key, value in headers.items() if key.lower() in {"x-request-id", "allowance-remaining", "allowance-limit", "allowance-reset"}}, "metadata": metadata}
-            except RateLimitError:
-                if attempt >= self.max_retries:
-                    raise
-                time.sleep(min(self.backoff_seconds * (2 ** attempt), 30.0))
-            except IGHTTPError as exc:
-                if exc.provider_code in ALLOWANCE_CODES or exc.status == 429:
-                    raise RateLimitError(exc.status, "historical allowance exhausted", retryable=True, provider_code=exc.provider_code, endpoint=exc.endpoint, method=exc.method, phase=exc.phase) from exc
-                if not exc.retryable or attempt >= self.max_retries:
-                    raise
-                time.sleep(min(self.backoff_seconds * (2 ** attempt), 30.0))
-        raise RuntimeError("unreachable historical request state")
+        while True:
+            page_attempt = 0
+            while True:
+                try:
+                    payload, headers = self.client._request("GET", path, params=params, version="3", retry=False, phase="historical_backfill")
+                    break
+                except RateLimitError:
+                    if page_attempt >= self.max_retries:
+                        raise
+                    time.sleep(min(self.backoff_seconds * (2 ** page_attempt), 30.0))
+                    page_attempt += 1
+                except IGHTTPError as exc:
+                    if exc.provider_code in ALLOWANCE_CODES or exc.status == 429:
+                        raise RateLimitError(exc.status, "historical allowance exhausted", retryable=True, provider_code=exc.provider_code, endpoint=exc.endpoint, method=exc.method, phase=exc.phase) from exc
+                    if not exc.retryable or page_attempt >= self.max_retries:
+                        raise
+                    time.sleep(min(self.backoff_seconds * (2 ** page_attempt), 30.0))
+                    page_attempt += 1
+
+            rows = payload.get("prices", [])
+            if not isinstance(rows, list):
+                raise MalformedResponseError("IG historical response has invalid prices")
+            all_rows.extend(row for row in rows if isinstance(row, dict))
+            page_count += 1
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            paging = metadata.get("paging") if isinstance(metadata.get("paging"), dict) else {}
+            next_url = paging.get("next") or metadata.get("next")
+            if next_url:
+                parsed = urlsplit(str(next_url))
+                if not parsed.path.startswith("/prices/"):
+                    raise MalformedResponseError("IG historical paging link is not a price endpoint")
+                path = parsed.path
+                params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+                continue
+            page_data = metadata.get("pageData") if isinstance(metadata.get("pageData"), dict) else {}
+            total_pages = page_data.get("totalPages") if page_data.get("totalPages") is not None else paging.get("totalPages")
+            page_number = page_data.get("pageNumber") if page_data.get("pageNumber") is not None else paging.get("pageNumber")
+            page_size = page_data.get("pageSize") if page_data.get("pageSize") is not None else paging.get("pageSize")
+            if total_pages is not None and page_number is not None and int(page_number) + 1 < int(total_pages):
+                raise MalformedResponseError("IG historical response is truncated: paging metadata has no next link")
+            if page_size and len(rows) >= int(page_size):
+                raise MalformedResponseError("IG historical response may be truncated at provider page size")
+            return all_rows, {"resolution": resolution, "rows": len(all_rows), "pages": page_count, "complete": True, "headers": {key: value for key, value in headers.items() if key.lower() in {"x-request-id", "allowance-remaining", "allowance-limit", "allowance-reset"}}, "metadata": metadata}
 
 
 class BackfillService:
@@ -301,7 +305,9 @@ class ReplayService:
             target = pending["1H"]
             buffers["1H"].append(target)
             pending["1H"] = next(iterators["1H"], None)
-            advance("15M", target.end + timedelta(days=1))
+            # Model input is strictly point-in-time. Future outcome candles
+            # are fetched separately only after the snapshot is persisted.
+            advance("15M", target.end)
             advance("4H", target.end)
             advance("1D", target.end)
             if not (start <= target.start < end):
@@ -323,7 +329,7 @@ class ReplayService:
                 self.database.save_phase2b_analysis(analysis)
             state["model_reference"]["information_time"] = target.end.isoformat()
             snapshot_id = engine.record_snapshot(instrument_id=instrument_id, timeframe="1H", snapshot_timestamp=target.start.isoformat(), reference_time=target.end.isoformat(), reference_price=float(target.close), snapshot_type="DIRECTION_REPLAY", state=state, source_identity=self.database.research_source_identity(instrument_id))
-            outcome_candles = [candle for candle in buffers["15M"] if candle.end > target.end]
+            outcome_candles = list(self.database.iter_candles(instrument_id, "15M", start_at=target.end.isoformat(), end_at=(target.end + timedelta(days=1, minutes=15)).isoformat(), batch_size=128))
             outcomes += engine.complete_snapshot(snapshot_id, reference_time=target.end, reference_price=float(target.close), direction=state.get("direction"), candles=outcome_candles, horizons=HORIZONS)
             processed += 1
             snapshots += 1
