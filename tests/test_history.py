@@ -13,6 +13,7 @@ from ig_ai.history import (
     aggregate_candles,
     normalize_historical_price,
     report_gaps,
+    safe_historical_response_diagnostic,
 )
 from ig_ai.models import Candle
 from ig_ai.research import HistoricalReplay
@@ -79,6 +80,36 @@ def test_snapshot_time_utc_is_preferred_over_unzoned_snapshot_time():
 def test_unzoned_generic_timestamp_fallback_is_rejected():
     with pytest.raises(MalformedResponseError, match="explicit timezone"):
         normalize_historical_price({**row(), "snapshotTimeUTC": None, "timestamp": "2026-01-01 00:00:00"}, instrument_id="ig:E", epic="E", timeframe="1H")
+
+
+@pytest.mark.parametrize(
+    "value,allow_naive,expected",
+    [
+        ("2026-01-01T00:00:00Z", False, datetime(2026, 1, 1, tzinfo=UTC)),
+        ("2026-01-01T01:00:00+01:00", False, datetime(2026, 1, 1, tzinfo=UTC)),
+        ("2026/01/01 00:00:00", True, datetime(2026, 1, 1, tzinfo=UTC)),
+    ],
+)
+def test_supported_ig_timestamp_shapes_are_normalized_to_utc(value, allow_naive, expected):
+    from ig_ai.history import parse_ig_timestamp
+
+    assert parse_ig_timestamp(value, allow_naive=allow_naive) == expected
+
+
+def test_safe_historical_response_diagnostic_masks_values_and_exposes_shape_only():
+    diagnostic = safe_historical_response_diagnostic(
+        {
+            "snapshotTime": "2026/01/01 00:00:00",
+            "openPrice": {"bid": 1, "ask": 2},
+            "closePrice": None,
+        },
+        {"pageData": {"pageNumber": 0, "totalPages": 1}, "allowance": {"remainingAllowance": 99}},
+    )
+    assert diagnostic["timestamp_fields"]["snapshotTime"] == {"type": "str", "length": 19, "masked_shape": "XXXX/XX/XX XX:XX:XX"}
+    assert diagnostic["row_fields"] == {"snapshotTime": "str", "openPrice": "dict", "closePrice": "NoneType"}
+    assert diagnostic["metadata_fields"] == {"allowance": "dict", "pageData": "dict"}
+    assert diagnostic["paging_fields"]["pageData"] == {"pageNumber": "int", "totalPages": "int"}
+    assert "2026" not in json.dumps(diagnostic)
 
 
 class PagingClient:

@@ -7,6 +7,8 @@ UTC fallback for fixtures/providers that omit it.
 """
 from __future__ import annotations
 
+import json
+import re
 import time
 from collections import deque
 from collections.abc import Iterable
@@ -67,6 +69,35 @@ def _field(row: dict[str, Any], *names: str) -> Any:
         if row.get(name) is not None:
             return row[name]
     return None
+
+
+def safe_historical_response_diagnostic(row: dict[str, Any], metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Describe historical response shape without returning provider values."""
+    timestamp_fields = {}
+    for name in ("snapshotTimeUTC", "snapshotTime", "timestamp", "time"):
+        if name not in row:
+            continue
+        value = row[name]
+        item = {"type": type(value).__name__}
+        if isinstance(value, str):
+            item.update({"length": len(value), "masked_shape": re.sub(r"[A-Za-z0-9]", "X", value)})
+        timestamp_fields[name] = item
+
+    def field_types(value: Any) -> dict[str, str]:
+        return {key: type(item).__name__ for key, item in value.items()} if isinstance(value, dict) else {}
+
+    metadata = metadata if isinstance(metadata, dict) else {}
+    metadata_names = {"allowance", "pageData", "paging", "size", "next"}
+    return {
+        "timestamp_fields": timestamp_fields,
+        "row_fields": field_types(row),
+        "metadata_fields": {key: type(metadata[key]).__name__ for key in sorted(metadata_names & metadata.keys())},
+        "paging_fields": {
+            key: field_types(metadata.get(key))
+            for key in ("paging", "pageData")
+            if isinstance(metadata.get(key), dict)
+        },
+    }
 
 
 def normalize_historical_price(row: dict[str, Any], *, instrument_id: str, epic: str, timeframe: str) -> Candle:
@@ -268,7 +299,11 @@ class BackfillService:
                     raise MalformedResponseError("historical provider coverage is incomplete")
                 chunk_inserted = 0
                 for row in sorted(rows, key=lambda value: str(value.get("snapshotTimeUTC") or value.get("snapshotTime") or "")):
-                    candle = normalize_historical_price(row, instrument_id=instrument_id, epic=candidate.epic, timeframe=timeframe)
+                    try:
+                        candle = normalize_historical_price(row, instrument_id=instrument_id, epic=candidate.epic, timeframe=timeframe)
+                    except MalformedResponseError as exc:
+                        diagnostic = safe_historical_response_diagnostic(row, metadata.get("metadata"))
+                        raise MalformedResponseError(f"{exc}; safe_response_shape={json.dumps(diagnostic, sort_keys=True)}") from exc
                     if not (start <= candle.start < end):
                         continue
                     retrieved += 1
