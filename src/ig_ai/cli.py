@@ -54,6 +54,33 @@ def research_provenance_status(database, instruments: list[str]) -> str:
     return "NOT VERIFIED"
 
 
+def _report_value(mapping: dict, key: str, *, missing: str = "UNKNOWN") -> str:
+    value = mapping.get(key)
+    return missing if value is None else str(value)
+
+
+def _history_range_for_report(result: dict) -> str:
+    available = result.get("available_range")
+    if not isinstance(available, dict):
+        return "NOT AVAILABLE"
+    first = available.get("first")
+    last = available.get("last")
+    if first is None and last is None:
+        return "ZERO (no persisted closed candles)" if available.get("candle_count") == 0 else "UNKNOWN"
+    return f"{first or 'UNKNOWN'} to {last or 'UNKNOWN'}"
+
+
+def _history_final_state(results: list[dict], *, dry_run: bool) -> str:
+    if dry_run:
+        return "HISTORICAL BACKFILL DRY RUN"
+    statuses = {result.get("status") for result in results}
+    if statuses == {"COMPLETE"}:
+        return "HISTORICAL BACKFILL COMPLETE"
+    if statuses and statuses <= {"COMPLETE", "PAUSED_RATE_LIMIT"} and "PAUSED_RATE_LIMIT" in statuses:
+        return "HISTORICAL BACKFILL PAUSED_RATE_LIMIT"
+    return "HISTORICAL BACKFILL FAILED"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="ig-ai")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -446,45 +473,50 @@ def main() -> int:
                     results.append(result)
                     print(json.dumps(result, sort_keys=True, default=str))
                 historical_request_issued = historical_request_issued or historical_client.request_count > 0
-                successful = all(result.get("status") in {"COMPLETE", "DRY_RUN"} for result in results)
                 dry_run = bool(results) and all(result.get("status") == "DRY_RUN" for result in results)
                 update_terminal_report(
                     command="ig-ai history-backfill",
                     account_type=settings.account_type,
                     authentication="NOT RUN (dry run)" if dry_run else "PASS (read-only historical workflow)",
                     runtime_outcome="PLANNED" if dry_run else "COMPLETED",
-                    final_state="HISTORICAL BACKFILL DRY RUN" if dry_run else ("HISTORICAL BACKFILL PASS" if successful else "HISTORICAL BACKFILL FAIL"),
+                    final_state=_history_final_state(results, dry_run=dry_run),
                     checks="dry-run request planning completed; no historical request issued" if dry_run else "read-only IG historical backfill completed",
                     not_verified="Authentication/provider access and historical request were not verified; trading/order/position endpoints were not used" if dry_run else "Trading/order/position endpoints were not used",
                     details={
                         "stage reached": "historical persistence",
                         "market": "; ".join(result.get("market", market) for result, market in zip(results, markets, strict=True)),
-                        "EPIC": "; ".join(result.get("epic", "NOT RESOLVED") for result in results),
+                        "EPIC": "; ".join(_report_value(result, "epic", missing="NOT AVAILABLE") for result in results),
                         "timeframe": args.timeframe,
                         "requested range": "; ".join(
                             f"{result.get('requested_start', start.isoformat())} to {result.get('requested_end', end.isoformat())}"
                             for result in results
                         ),
-                        "provider range": "; ".join(
-                            f"{result.get('available_range', {}).get('first', 'NOT AVAILABLE')} to {result.get('available_range', {}).get('last', 'NOT AVAILABLE')}"
-                            for result in results
-                        ),
-                        "retrieved": "; ".join(str(result.get("retrieved", 0)) for result in results),
-                        "inserted": "; ".join(str(result.get("inserted", 0)) for result in results),
-                        "skipped": "; ".join(str(result.get("skipped", 0)) for result in results),
-                        "malformed rows": "; ".join(str(result.get("malformed_rows", 0)) for result in results),
-                        "skipped malformed rows": "; ".join(str(result.get("skipped_malformed_rows", 0)) for result in results),
+                        "provider range": "; ".join(_history_range_for_report(result) for result in results),
+                        "retrieved": "; ".join(_report_value(result, "retrieved") for result in results),
+                        "inserted": "; ".join(_report_value(result, "inserted") for result in results),
+                        "skipped": "; ".join(_report_value(result, "skipped") for result in results),
+                        "malformed rows": "; ".join(_report_value(result, "malformed_rows") for result in results),
+                        "skipped malformed rows": "; ".join(_report_value(result, "skipped_malformed_rows") for result in results),
                         "malformed gap semantics": "PROVIDER_MALFORMED_ROW_GAP when malformed rows are reported; otherwise NONE",
                         "persisted closed candle count": "; ".join(
-                            str(result.get("available_range", {}).get("candle_count", 0)) for result in results
+                            _report_value(result.get("available_range") or {}, "candle_count")
+                            if isinstance(result.get("available_range"), dict) else "NOT AVAILABLE"
+                            for result in results
                         ),
                         "earliest/latest": "; ".join(
-                            f"{result.get('available_range', {}).get('first', 'NONE')} / {result.get('available_range', {}).get('last', 'NONE')}"
+                            f"{(result.get('available_range') or {}).get('first', 'UNKNOWN')} / {(result.get('available_range') or {}).get('last', 'UNKNOWN')}"
+                            if isinstance(result.get("available_range"), dict)
+                            else "UNKNOWN / UNKNOWN"
                             for result in results
                         ),
                         "provenance": "NOT APPLICABLE (dry run)" if dry_run else "IG_HISTORICAL / IG / CFD",
+                        "backfill status": "; ".join(_report_value(result, "backfill_status") for result in results),
+                        "current progress": "; ".join(_report_value(result, "current_progress", missing="NOT RUN") for result in results),
+                        "last successful range": "; ".join(_report_value(result, "last_successful_range", missing="NOT AVAILABLE") for result in results),
+                        "job cumulative accounting": "; ".join(str(result.get("job_cumulative", "UNKNOWN")) for result in results),
+                        "invocation accounting": "; ".join(str(result.get("invocation", "UNKNOWN")) for result in results),
                         "historical request issued": "NO" if dry_run else ("YES" if historical_request_issued else "NO"),
-                        "final state": "DRY_RUN" if dry_run else ("PASS" if successful else "FAIL"),
+                        "final state": _history_final_state(results, dry_run=dry_run),
                     },
                 )
                 return 0
