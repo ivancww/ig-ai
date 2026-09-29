@@ -4,6 +4,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
+from itertools import pairwise
 from pathlib import Path
 from statistics import median
 
@@ -246,6 +247,26 @@ CREATE TABLE IF NOT EXISTS research_regimes (
     methodology_version TEXT NOT NULL,
     FOREIGN KEY (snapshot_id) REFERENCES research_snapshots(snapshot_id)
 );
+CREATE TABLE IF NOT EXISTS candle_provenance (
+    instrument_id TEXT NOT NULL, timeframe TEXT NOT NULL, start_at TEXT NOT NULL,
+    source TEXT NOT NULL, provenance_json TEXT NOT NULL, recorded_at TEXT NOT NULL,
+    PRIMARY KEY (instrument_id, timeframe, start_at)
+);
+CREATE INDEX IF NOT EXISTS candle_provenance_source ON candle_provenance (source, instrument_id, timeframe, start_at);
+CREATE TABLE IF NOT EXISTS backfill_jobs (
+    job_id TEXT PRIMARY KEY, instrument_id TEXT NOT NULL, epic TEXT NOT NULL, market_name TEXT NOT NULL,
+    timeframe TEXT NOT NULL, requested_start TEXT NOT NULL, requested_end TEXT NOT NULL,
+    current_progress TEXT, last_successful_range TEXT, rows_retrieved INTEGER NOT NULL DEFAULT 0,
+    rows_inserted INTEGER NOT NULL DEFAULT 0, rows_skipped INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
+    last_provider_metadata_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS backfill_jobs_lookup ON backfill_jobs (instrument_id, timeframe, status, updated_at);
+CREATE TABLE IF NOT EXISTS replay_jobs (
+    job_id TEXT PRIMARY KEY, instrument_id TEXT NOT NULL, requested_start TEXT NOT NULL, requested_end TEXT NOT NULL,
+    window TEXT NOT NULL, last_information_time TEXT, snapshots_generated INTEGER NOT NULL DEFAULT 0,
+    outcomes_written INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS replay_jobs_lookup ON replay_jobs (instrument_id, status, updated_at);
 """
 
 
@@ -370,6 +391,12 @@ class Database:
         return cursor.rowcount == 1
 
     def save_candle(self, candle: Candle) -> None:
+        existing_source = self.connection.execute(
+            "SELECT source FROM candle_provenance WHERE instrument_id=? AND timeframe=? AND start_at=?",
+            (candle.instrument_id, candle.timeframe, candle.start.isoformat()),
+        ).fetchone()
+        if existing_source and existing_source[0] == "IG_HISTORICAL" and not candle.is_closed:
+            return
         self.connection.execute(
             "INSERT OR REPLACE INTO candles (instrument_id, timeframe, start_at, end_at, epic, open, high, low, close, volume, is_closed, observation_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
@@ -387,7 +414,112 @@ class Database:
                 candle.observation_count,
             ),
         )
+        self.connection.execute(
+            "INSERT OR IGNORE INTO candle_provenance VALUES (?, ?, ?, 'LIVE_AGGREGATED', ?, ?)",
+            (candle.instrument_id, candle.timeframe, candle.start.isoformat(), json.dumps({"provider": "IG", "asset_source_type": "CFD", "policy": "live_stream"}, sort_keys=True), datetime.now(UTC).isoformat()),
+        )
+        if existing_source and existing_source[0] == "IG_HISTORICAL" and candle.is_closed:
+            self.connection.execute(
+                "UPDATE candle_provenance SET source='LIVE_AGGREGATED', provenance_json=?, recorded_at=? WHERE instrument_id=? AND timeframe=? AND start_at=?",
+                (json.dumps({"provider": "IG", "asset_source_type": "CFD", "policy": "live_supersedes_historical"}, sort_keys=True), datetime.now(UTC).isoformat(), candle.instrument_id, candle.timeframe, candle.start.isoformat()),
+            )
         self.connection.commit()
+
+    @staticmethod
+    def deterministic_backfill_job_id(instrument_id: str, timeframe: str, start: str, end: str) -> str:
+        import hashlib
+        return hashlib.sha256(f"backfill:{instrument_id}:{timeframe}:{start}:{end}".encode()).hexdigest()
+
+    @staticmethod
+    def deterministic_replay_job_id(instrument_id: str, start: str, end: str, window: str) -> str:
+        import hashlib
+        return hashlib.sha256(f"replay:{instrument_id}:{start}:{end}:{window}".encode()).hexdigest()
+
+    def save_historical_candle(self, candle: Candle, *, provenance: dict) -> str:
+        """Insert history without overwriting a live candle or its provenance."""
+        identity = (candle.instrument_id, candle.timeframe, candle.start.isoformat())
+        existing = self.connection.execute(
+            "SELECT 1 FROM candles WHERE instrument_id=? AND timeframe=? AND start_at=?", identity
+        ).fetchone()
+        if existing:
+            source = self.connection.execute(
+                "SELECT source FROM candle_provenance WHERE instrument_id=? AND timeframe=? AND start_at=?", identity
+            ).fetchone()
+            return "SKIPPED_LIVE_CONFLICT" if source is None or source[0] == "LIVE_AGGREGATED" else "SKIPPED_DUPLICATE"
+        self.connection.execute(
+            "INSERT INTO candles (instrument_id, timeframe, start_at, end_at, epic, open, high, low, close, volume, is_closed, observation_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (candle.instrument_id, candle.timeframe, candle.start.isoformat(), candle.end.isoformat(), candle.epic, str(candle.open), str(candle.high), str(candle.low), str(candle.close), None, 1, 0),
+        )
+        sensitive = ("password", "api_key", "apikey", "cst", "security-token", "access_token", "refresh_token", "oauth", "lightstreamer")
+
+        def scrub(value):
+            if isinstance(value, dict):
+                return {key: scrub(item) for key, item in value.items() if not any(token in str(key).lower() for token in sensitive)}
+            if isinstance(value, list):
+                return [scrub(item) for item in value]
+            return value
+
+        self.connection.execute(
+            "INSERT INTO candle_provenance VALUES (?, ?, ?, ?, ?, ?)",
+            (*identity, "IG_HISTORICAL", json.dumps(scrub(provenance), sort_keys=True, separators=(",", ":")), datetime.now(UTC).isoformat()),
+        )
+        self.connection.commit()
+        return "INSERTED"
+
+    def start_backfill_job(self, job_id: str, instrument_id: str, epic: str, market_name: str, timeframe: str, requested_start: str, requested_end: str) -> None:
+        now = datetime.now(UTC).isoformat()
+        self.connection.execute("INSERT INTO backfill_jobs (job_id, instrument_id, epic, market_name, timeframe, requested_start, requested_end, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, ?) ON CONFLICT(job_id) DO UPDATE SET status='RUNNING', updated_at=excluded.updated_at", (job_id, instrument_id, epic, market_name, timeframe, requested_start, requested_end, now, now))
+        self.connection.commit()
+
+    def checkpoint_backfill_job(self, job_id: str, progress: str, retrieved: int, inserted: int, skipped: int, metadata: dict) -> None:
+        self.connection.execute("UPDATE backfill_jobs SET current_progress=?, last_successful_range=?, rows_retrieved=?, rows_inserted=?, rows_skipped=?, last_provider_metadata_json=?, updated_at=? WHERE job_id=?", (progress, progress, retrieved, inserted, skipped, json.dumps(metadata, sort_keys=True, separators=(",", ":")), datetime.now(UTC).isoformat(), job_id))
+        self.connection.commit()
+
+    def get_backfill_job(self, job_id: str) -> dict | None:
+        row = self.connection.execute("SELECT job_id, instrument_id, epic, market_name, timeframe, requested_start, requested_end, current_progress, rows_retrieved, rows_inserted, rows_skipped, status FROM backfill_jobs WHERE job_id=?", (job_id,)).fetchone()
+        if row is None:
+            return None
+        names = ("job_id", "instrument_id", "epic", "market_name", "timeframe", "requested_start", "requested_end", "current_progress", "rows_retrieved", "rows_inserted", "rows_skipped", "status")
+        return dict(zip(names, row, strict=True))
+
+    def finish_backfill_job(self, job_id: str, status: str, retrieved: int, inserted: int, skipped: int) -> None:
+        self.connection.execute("UPDATE backfill_jobs SET status=?, rows_retrieved=?, rows_inserted=?, rows_skipped=?, updated_at=? WHERE job_id=?", (status, retrieved, inserted, skipped, datetime.now(UTC).isoformat(), job_id))
+        self.connection.commit()
+
+    def start_replay_job(self, job_id: str, instrument_id: str, requested_start: str, requested_end: str, window: str) -> None:
+        now = datetime.now(UTC).isoformat()
+        self.connection.execute("INSERT INTO replay_jobs (job_id, instrument_id, requested_start, requested_end, window, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, ?) ON CONFLICT(job_id) DO UPDATE SET status='RUNNING', updated_at=excluded.updated_at", (job_id, instrument_id, requested_start, requested_end, window, now, now))
+        self.connection.commit()
+
+    def checkpoint_replay_job(self, job_id: str, information_time: str, snapshots: int, outcomes: int) -> None:
+        self.connection.execute("UPDATE replay_jobs SET last_information_time=?, snapshots_generated=?, outcomes_written=?, updated_at=? WHERE job_id=?", (information_time, snapshots, outcomes, datetime.now(UTC).isoformat(), job_id))
+        self.connection.commit()
+
+    def get_replay_job(self, job_id: str) -> dict | None:
+        row = self.connection.execute("SELECT job_id, instrument_id, requested_start, requested_end, window, last_information_time, snapshots_generated, outcomes_written, status FROM replay_jobs WHERE job_id=?", (job_id,)).fetchone()
+        if row is None:
+            return None
+        names = ("job_id", "instrument_id", "requested_start", "requested_end", "window", "last_information_time", "snapshots_generated", "outcomes_written", "status")
+        return dict(zip(names, row, strict=True))
+
+    def finish_replay_job(self, job_id: str, status: str, processed: int, snapshots: int, outcomes: int) -> None:
+        self.connection.execute("UPDATE replay_jobs SET status=?, snapshots_generated=?, outcomes_written=?, updated_at=? WHERE job_id=?", (status, snapshots, outcomes, datetime.now(UTC).isoformat(), job_id))
+        self.connection.commit()
+
+    def history_status(self, instrument_id: str | None = None) -> list[dict]:
+        query = "SELECT c.instrument_id, c.timeframe, p.source, MIN(c.start_at), MAX(c.start_at), COUNT(*), i.market_name, i.epic FROM candles c LEFT JOIN candle_provenance p ON p.instrument_id=c.instrument_id AND p.timeframe=c.timeframe AND p.start_at=c.start_at LEFT JOIN instruments i ON i.instrument_id=c.instrument_id WHERE c.is_closed=1"
+        params: list[object] = []
+        if instrument_id:
+            query += " AND c.instrument_id=?"
+            params.append(instrument_id)
+        query += " GROUP BY c.instrument_id, c.timeframe, p.source ORDER BY c.instrument_id, c.timeframe"
+        output = []
+        for row in self.connection.execute(query, params):
+            jobs = self.connection.execute("SELECT status, requested_start, requested_end, last_successful_range, updated_at FROM backfill_jobs WHERE instrument_id=? AND timeframe=? ORDER BY updated_at DESC LIMIT 1", (row[0], row[1])).fetchone()
+            candles = self.list_candles(row[0], row[1])
+            gaps = [current.start - previous.end for previous, current in pairwise(candles) if current.start > previous.end]
+            output.append({"instrument_id": row[0], "timeframe": row[1], "source": row[2] or "LIVE_AGGREGATED", "earliest": row[3], "latest": row[4], "closed_count": row[5], "market_name": row[6], "epic": row[7], "largest_gap": max(gaps, default=None).total_seconds() if gaps else None, "session_gap_uncertainty": bool(gaps), "backfill_status": jobs[0] if jobs else "NOT_RUN", "requested_start": jobs[1] if jobs else None, "requested_end": jobs[2] if jobs else None, "retrieved_through": jobs[3] if jobs else None, "last_successful_retrieval": jobs[4] if jobs and jobs[0] in {"COMPLETE", "PAUSED"} else None})
+        return output
 
     def list_candles(self, instrument_id: str, timeframe: str, *, through: str | None = None, limit: int | None = None) -> list[Candle]:
         query = (
@@ -411,6 +543,35 @@ class Database:
             Candle(row[0], row[4], row[1], datetime.fromisoformat(row[2]), datetime.fromisoformat(row[3]), Decimal(row[5]), Decimal(row[6]), Decimal(row[7]), Decimal(row[8]), Decimal(row[9]) if row[9] is not None else None, bool(row[10]), int(row[11]))
             for row in rows
         ]
+
+    @staticmethod
+    def _candle_from_row(row: tuple) -> Candle:
+        return Candle(
+            row[0], row[4], row[1], datetime.fromisoformat(row[2]), datetime.fromisoformat(row[3]),
+            Decimal(row[5]), Decimal(row[6]), Decimal(row[7]), Decimal(row[8]),
+            Decimal(row[9]) if row[9] is not None else None, bool(row[10]), int(row[11]),
+        )
+
+    def iter_candles(self, instrument_id: str, timeframe: str, *, start_at: str | None = None, end_at: str | None = None, batch_size: int = 500):
+        """Yield indexed candle batches without materializing a timeframe."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        query = "SELECT instrument_id, timeframe, start_at, end_at, epic, open, high, low, close, volume, is_closed, observation_count FROM candles WHERE instrument_id=? AND timeframe=? AND is_closed=1"
+        params: list[object] = [instrument_id, timeframe]
+        if start_at is not None:
+            query += " AND start_at>=?"
+            params.append(start_at)
+        if end_at is not None:
+            query += " AND start_at<?"
+            params.append(end_at)
+        query += " ORDER BY start_at"
+        cursor = self.connection.execute(query, params)
+        while True:
+            rows = cursor.fetchmany(batch_size)
+            if not rows:
+                break
+            for row in rows:
+                yield self._candle_from_row(row)
 
     def save_technical_features(self, features: dict) -> None:
         self.connection.execute(

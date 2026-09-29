@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .config import Settings
 from .database import Database
 from .discovery import discover_market_groups, select_stream_instruments
 from .exceptions import IGHTTPError
+from .history import SUPPORTED_TIMEFRAMES, BackfillService, HistoricalIGClient, ReplayService
 from .models import Instrument
 from .phase1 import run_phase1_check
 from .reporting import update_terminal_report, write_runtime_record
@@ -69,6 +71,22 @@ def main() -> int:
     research_status_parser = commands.add_parser("research-status", help="inspect available historical research samples")
     for option, kwargs in research_filters.items():
         research_status_parser.add_argument(option, **kwargs)
+    history_parser = commands.add_parser("history-backfill", help="read-only IG CFD historical price backfill")
+    history_parser.add_argument("--market", choices=("US Tech 100", "Japan 225", "Hong Kong HS50"))
+    history_parser.add_argument("--timeframe", choices=SUPPORTED_TIMEFRAMES, default="1H")
+    history_parser.add_argument("--days", type=int)
+    history_parser.add_argument("--start")
+    history_parser.add_argument("--end")
+    history_parser.add_argument("--resume", action="store_true")
+    history_parser.add_argument("--all-markets", action="store_true")
+    history_parser.add_argument("--dry-run", action="store_true")
+    history_status_parser = commands.add_parser("history-status", help="inspect IG CFD historical coverage")
+    history_status_parser.add_argument("--instrument", default=None)
+    replay_parser = commands.add_parser("history-replay", help="rebuild point-in-time historical model states")
+    replay_parser.add_argument("--market", default=None)
+    replay_parser.add_argument("--start", required=True)
+    replay_parser.add_argument("--end", required=True)
+    replay_parser.add_argument("--window", choices=("1Y", "3Y", "5Y"), default="3Y")
     stream_parser = commands.add_parser("stream")
     stream_parser.add_argument("--duration", type=float, default=300.0)
     stream_parser.add_argument("--markets", default="US Tech 100,Japan 225,Hong Kong HS50")
@@ -246,6 +264,57 @@ def main() -> int:
             finally:
                 database.close()
             return 0
+        if args.command == "history-status":
+            settings = Settings.from_env(require_credentials=False)
+            database = Database(settings.database_path)
+            try:
+                rows = database.history_status(args.instrument)
+                if not rows:
+                    print("No historical candles available. Source label: IG CFD.")
+                for row in rows:
+                    first = datetime.fromisoformat(row["earliest"])
+                    last = datetime.fromisoformat(row["latest"])
+                    print(f"{row['market_name'] or row['instrument_id']} {row['timeframe']}: source=IG CFD ({row['source']}) EPIC={row['epic']} earliest={row['earliest']} latest={row['latest']} closed={row['closed_count']} available_days={(last-first).total_seconds()/86400:.2f} backfill_status={row['backfill_status']} last_successful_retrieval={row['last_successful_retrieval'] or 'NONE'} requested={row['requested_start'] or 'NONE'}..{row['requested_end'] or 'NONE'} retrieved_through={row['retrieved_through'] or 'NONE'} largest_gap_seconds={row['largest_gap'] if row['largest_gap'] is not None else 'NONE'} session_gap_uncertainty={str(row['session_gap_uncertainty']).upper()}")
+                return 0
+            finally:
+                database.close()
+        if args.command == "history-replay":
+            settings = Settings.from_env(require_credentials=False)
+            database = Database(settings.database_path)
+            try:
+                instruments = database.list_instruments()
+                selected = [args.market] if args.market else [row[0] for row in instruments]
+                start = datetime.fromisoformat(args.start).astimezone(UTC)
+                end = datetime.fromisoformat(args.end).astimezone(UTC)
+                for instrument in selected:
+                    instrument_id = instrument if instrument.startswith("ig:") else next((row[0] for row in instruments if row[2] == instrument), instrument)
+                    result = ReplayService(database).run(instrument_id=instrument_id, start=start, end=end, window=args.window)
+                    print(f"{instrument_id}: status={result['status']} snapshots={result['snapshots']} outcomes={result['outcomes']}")
+                return 0
+            finally:
+                database.close()
+        if args.command == "history-backfill":
+            if args.all_markets and args.market:
+                raise ValueError("--all-markets and --market are mutually exclusive")
+            if sum(value is not None for value in (args.days, args.start)) > 1 or (args.end and not args.start) or (args.start and not args.end):
+                raise ValueError("use exactly one of --days or --start/--end")
+            if args.days is not None and args.days <= 0:
+                raise ValueError("--days must be positive")
+            markets = ["US Tech 100", "Japan 225", "Hong Kong HS50"] if args.all_markets else ([args.market] if args.market else [])
+            if not markets:
+                raise ValueError("--market or --all-markets is required")
+            settings = Settings.from_env()
+            database = Database(settings.database_path)
+            try:
+                end = datetime.now(UTC) if not args.end else datetime.fromisoformat(args.end).astimezone(UTC)
+                start = end - timedelta(days=args.days) if args.days is not None else datetime.fromisoformat(args.start).astimezone(UTC)
+                service = BackfillService(database, HistoricalIGClient(IGRestClient(settings), pacing_seconds=float(os.environ.get("IG_HISTORY_PACING_SECONDS", "1"))))
+                for market in markets:
+                    result = service.run(market=market, timeframe=args.timeframe, start=start, end=end, dry_run=args.dry_run, resume=args.resume)
+                    print(json.dumps(result, sort_keys=True, default=str))
+                return 0
+            finally:
+                database.close()
         client = IGRestClient(Settings.from_env())
         if args.command == "rest-check":
             client.authenticate()
