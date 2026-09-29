@@ -22,7 +22,17 @@ RESEARCH_ENGINE_VERSION = "research_engine_v1"
 RESEARCH_SOURCE = "ig_cfd"
 HORIZON_MINUTES = {"15M": 15, "1H": 60, "2H": 120, "4H": 240, "8H": 480, "1D": 1440}
 RESEARCH_WINDOWS_YEARS = (1, 3, 5)
-SCORE_BUCKETS = ((50, 55), (55, 60), (60, 65), (65, 70), (70, 75), (75, 80), (80, 85), (85, 90), (90, 100))
+# The score is technical evidence in the closed interval [0, 100], not a
+# probability.  Keep the historical 5-point upper buckets and add explicit
+# lower-domain buckets so a valid low score is never represented as missing.
+SCORE_BUCKETS = (
+    (0, 10), (10, 20), (20, 30), (30, 40), (40, 50),
+    (50, 55), (55, 60), (60, 65), (65, 70), (70, 75),
+    (75, 80), (80, 85), (85, 90), (90, 100),
+)
+DESCRIPTIVE_RESEARCH_LABEL = "DESCRIPTIVE / IN-SAMPLE RESEARCH"
+NOT_CALIBRATED_PROBABILITY_LABEL = "NOT CALIBRATED PROBABILITY"
+NOT_OUT_OF_SAMPLE_LABEL = "NOT OUT-OF-SAMPLE PERFORMANCE"
 
 
 @dataclass(frozen=True)
@@ -39,6 +49,8 @@ def score_bucket(score: float | int | None) -> str | None:
     if score is None:
         return None
     value = float(score)
+    if value < 0 or value > 100:
+        return None
     for lower, upper in SCORE_BUCKETS:
         if lower <= value < upper or (upper == 100 and lower <= value <= upper):
             return f"{lower}–{upper}"
@@ -317,4 +329,17 @@ class ResearchEngine:
         snapshot_count = len(self.database.get_research_snapshots(**snapshot_filters))
         complete_snapshot_count = self.database.completed_research_snapshot_count(**snapshot_filters)
         outcome_count = sum(row["sample_count"] for row in rows)
-        return {"rows": rows, "sample_count": complete_snapshot_count, "snapshot_count": snapshot_count, "outcome_observation_count": outcome_count, "quality": sample_quality(complete_snapshot_count, self.config), "research_version": self.config.version, "as_of": as_of.isoformat()}
+        return {
+            "rows": rows,
+            "sample_count": complete_snapshot_count,
+            "snapshot_count": snapshot_count,
+            "outcome_observation_count": outcome_count,
+            "quality": sample_quality(complete_snapshot_count, self.config),
+            "research_version": self.config.version,
+            "as_of": as_of.isoformat(),
+            "labels": {
+                "research": DESCRIPTIVE_RESEARCH_LABEL,
+                "probability": NOT_CALIBRATED_PROBABILITY_LABEL,
+                "performance": NOT_OUT_OF_SAMPLE_LABEL,
+            },
+        }
