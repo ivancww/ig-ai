@@ -4,23 +4,42 @@ PHASE 1 DISCOVERY HARDENING: PASS
 
 === TERMINAL / RUNTIME REPORT ===
 
-Command executed: ig-ai stream-smoke --duration 1
-Timestamp (UTC): 2026-09-29T12:58:36.676179+00:00
-IG account environment: DEMO
-Authentication: PASS
-Market discovery: PASS
-Streaming: PASS
+Command executed: Step 7 statistical validation foundation implementation
+Timestamp (UTC): 2026-09-29T12:58:00+00:00
+Repository: ivancww/ig-ai
+Branch: step7-statistical-validation
+PR: #10 — https://github.com/ivancww/ig-ai/pull/10 (OPEN; do not merge)
+Head at implementation commit: 3a869e9
 Runtime outcome: COMPLETED
-Connection established: VERIFIED
-Session established: VERIFIED
-Subscriptions accepted: VERIFIED
-Real price updates received: VERIFIED
-Final state: STREAM SMOKE PASS
-Tests/runtime checks: read-only Lightstreamer smoke test completed
+Final state: STEP 7 IMPLEMENTATION PASS
+Tests/runtime checks: pytest 250 passed; security tests 2 passed; Ruff passed; git diff --check passed; compileall passed
 Warnings/errors: NONE
-Anything not verified: No trade endpoints were used
+Anything not verified: No provider request, probability model fit, threshold optimization, or out-of-sample claim was performed
 
 Runtime details:
-stage reached: completed
-safe failure category: NONE
-final state: PASS
+STEP 7 IMPLEMENTATION: PASS
+BRANCH: step7-statistical-validation
+FILES CHANGED: igai-report.txt; src/ig_ai/research.py; src/ig_ai/validation.py; tests/test_validation.py
+SCORE REPORTING: PASS — deterministic buckets cover raw [0,100] with preserved score values; scores remain technical evidence, not probabilities
+VALIDATION CONFIG: PASS — chronological development/validation/OOS/forward-test periods with purge/embargo enforcement
+OUTCOME CLASSIFICATION: PASS — configurable UP/DOWN/NEUTRAL horizon classification with explicit missing-ATR handling
+ATR/NOISE FOUNDATION: PASS — ATR14 return-unit conversion, sqrt-horizon scaling, multiplier, and execution/noise floor are configurable; no fitting performed
+STATISTICAL REPORTING: PASS — denominators, hit/precision/balanced metrics, returns, MFE/MAE, continuation/reversal, holding-window, and grouped descriptive metrics
+OVERLAP/DEPENDENCE: PASS — reference-anchor overlap metadata, non-overlap selection, and purge/embargo metadata
+CALIBRATION INTERFACES: PASS — reliability/Brier/log-loss/slope/intercept/ECE placeholders only; no probabilities accepted or calculated
+RESEARCH LABELS: PASS — DESCRIPTIVE / IN-SAMPLE RESEARCH; NOT CALIBRATED PROBABILITY; NOT OUT-OF-SAMPLE PERFORMANCE
+MODEL WEIGHTS CHANGED: NO
+THRESHOLDS OPTIMIZED: NO
+PROBABILITY MODEL FIT: NO
+EXISTING DATA PRESERVED: YES
+ANTI-LOOKAHEAD REGRESSION: PASS
+IDEMPOTENCY REGRESSION: PASS
+PYTEST: PASS — 250 passed
+RUFF: PASS
+DIFF CHECK: PASS
+SECURITY: PASS — 2 security tests passed
+IG PROVIDER REQUEST ISSUED: NO
+TRADING/MUTATION ENDPOINT USED: NO
+PR NUMBER: 10
+PR URL: https://github.com/ivancww/ig-ai/pull/10
+STOP STATE: PR OPEN; NOT MERGED
