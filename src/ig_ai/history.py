@@ -307,6 +307,68 @@ class BackfillService:
             raise RuntimeError(f"no provider-verified weekday cash/rolling CFD for {market}")
         return selected[0]
 
+    def _result(
+        self,
+        *,
+        status: str,
+        job_id: str,
+        candidate,
+        market: str,
+        instrument_id: str,
+        timeframe: str,
+        start: datetime,
+        end: datetime,
+        retrieved: int,
+        inserted: int,
+        skipped: int,
+        malformed_rows: int,
+        skipped_malformed_rows: int,
+        malformed_diagnostics: list[dict],
+        initial_counts: dict[str, int],
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        """Build the same safe result shape for every backfill terminal state."""
+        job = self.database.get_backfill_job(job_id) or {}
+        available = self.database.available_history(instrument_id, timeframe)
+        invocation = {
+            "retrieved": retrieved - initial_counts["retrieved"],
+            "inserted": inserted - initial_counts["inserted"],
+            "skipped": skipped - initial_counts["skipped"],
+            "malformed_rows": malformed_rows - initial_counts["malformed_rows"],
+            "skipped_malformed_rows": skipped_malformed_rows - initial_counts["skipped_malformed_rows"],
+        }
+        result = {
+            "status": status,
+            "backfill_status": job.get("status") or status,
+            "job_id": job_id,
+            "market": market,
+            "instrument_id": instrument_id,
+            "epic": candidate.epic,
+            "timeframe": timeframe,
+            "requested_start": start.isoformat(),
+            "requested_end": end.isoformat(),
+            "retrieved": retrieved,
+            "inserted": inserted,
+            "skipped": skipped,
+            "malformed_rows": malformed_rows,
+            "skipped_malformed_rows": skipped_malformed_rows,
+            "malformed_diagnostics": malformed_diagnostics,
+            "available_range": available,
+            "current_progress": job.get("current_progress"),
+            "last_successful_range": job.get("last_successful_range"),
+            "job_cumulative": {
+                "retrieved": retrieved,
+                "inserted": inserted,
+                "skipped": skipped,
+                "malformed_rows": malformed_rows,
+                "skipped_malformed_rows": skipped_malformed_rows,
+            },
+            "invocation": invocation,
+        }
+        if error:
+            result["error"] = error
+        return result
+
     def run(self, *, market: str, timeframe: str, start: datetime, end: datetime, dry_run: bool = False, resume: bool = False, job_id: str | None = None, chunk_days: int | None = None) -> dict[str, Any]:
         if timeframe not in SUPPORTED_TIMEFRAMES:
             raise ValueError(f"unsupported timeframe: {timeframe}")
@@ -327,6 +389,13 @@ class BackfillService:
         skipped = int(prior.get("rows_skipped", 0)) if prior else 0
         malformed_rows = int(prior.get("malformed_rows", 0)) if prior else 0
         skipped_malformed_rows = int(prior.get("skipped_malformed_rows", 0)) if prior else 0
+        initial_counts = {
+            "retrieved": retrieved,
+            "inserted": inserted,
+            "skipped": skipped,
+            "malformed_rows": malformed_rows,
+            "skipped_malformed_rows": skipped_malformed_rows,
+        }
         try:
             malformed_diagnostics = json.loads(prior.get("malformed_diagnostics_json", "[]")) if prior else []
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -357,13 +426,14 @@ class BackfillService:
                 if self.client.pacing_seconds:
                     time.sleep(self.client.pacing_seconds)
             self.database.finish_backfill_job(identity, "COMPLETE", retrieved, inserted, skipped, malformed_rows, skipped_malformed_rows, malformed_diagnostics)
-            return {"status": "COMPLETE", "job_id": identity, "market": market, "instrument_id": instrument_id, "epic": candidate.epic, "timeframe": timeframe, "retrieved": retrieved, "inserted": inserted, "skipped": skipped, "malformed_rows": malformed_rows, "skipped_malformed_rows": skipped_malformed_rows, "malformed_diagnostics": malformed_diagnostics, "requested_start": start.isoformat(), "requested_end": end.isoformat(), "available_range": self.database.available_history(instrument_id, timeframe)}
+            return self._result(status="COMPLETE", job_id=identity, candidate=candidate, market=market, instrument_id=instrument_id, timeframe=timeframe, start=start, end=end, retrieved=retrieved, inserted=inserted, skipped=skipped, malformed_rows=malformed_rows, skipped_malformed_rows=skipped_malformed_rows, malformed_diagnostics=malformed_diagnostics, initial_counts=initial_counts)
         except RateLimitError:
             self.database.finish_backfill_job(identity, "PAUSED", retrieved, inserted, skipped, malformed_rows, skipped_malformed_rows, malformed_diagnostics)
-            return {"status": "BACKFILL_PAUSED_RATE_LIMIT", "job_id": identity, "retrieved": retrieved, "inserted": inserted, "skipped": skipped, "malformed_rows": malformed_rows, "skipped_malformed_rows": skipped_malformed_rows}
-        except Exception:
+            return self._result(status="PAUSED_RATE_LIMIT", job_id=identity, candidate=candidate, market=market, instrument_id=instrument_id, timeframe=timeframe, start=start, end=end, retrieved=retrieved, inserted=inserted, skipped=skipped, malformed_rows=malformed_rows, skipped_malformed_rows=skipped_malformed_rows, malformed_diagnostics=malformed_diagnostics, initial_counts=initial_counts)
+        except Exception as exc:
             self.database.finish_backfill_job(identity, "FAILED", retrieved, inserted, skipped, malformed_rows, skipped_malformed_rows, malformed_diagnostics)
-            raise
+            safe_error = exc.safe_diagnostic() if isinstance(exc, (IGHTTPError, MalformedResponseError)) else type(exc).__name__
+            return self._result(status="FAILED", job_id=identity, candidate=candidate, market=market, instrument_id=instrument_id, timeframe=timeframe, start=start, end=end, retrieved=retrieved, inserted=inserted, skipped=skipped, malformed_rows=malformed_rows, skipped_malformed_rows=skipped_malformed_rows, malformed_diagnostics=malformed_diagnostics, initial_counts=initial_counts, error=safe_error)
 
 
 class ReplayService:

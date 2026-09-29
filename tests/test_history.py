@@ -156,8 +156,11 @@ def test_malformed_provider_response_still_fails_and_does_not_checkpoint(tmp_pat
 
     database = Database(tmp_path / "response.sqlite3")
     start = datetime(2026, 1, 1, tzinfo=UTC)
-    with pytest.raises(MalformedResponseError, match="coverage is incomplete"):
-        Service(database, Provider()).run(market="US Tech 100", timeframe="1H", start=start, end=start + timedelta(days=1))
+    result = Service(database, Provider()).run(market="US Tech 100", timeframe="1H", start=start, end=start + timedelta(days=1))
+    assert result["status"] == "FAILED"
+    assert result["backfill_status"] == "FAILED"
+    assert result["epic"] == "E"
+    assert result["available_range"]["candle_count"] == 0
     job = database.connection.execute("SELECT status, current_progress, malformed_rows FROM backfill_jobs").fetchone()
     assert job == ("FAILED", None, 0)
     assert database.connection.execute("SELECT COUNT(*) FROM candles").fetchone()[0] == 0
@@ -391,11 +394,62 @@ def test_rate_limit_pause_and_resume_checkpoint(tmp_path):
     database = Database(tmp_path / "pause.sqlite3")
     start = datetime(2026, 1, 1, tzinfo=UTC)
     first = Service(database, provider).run(market="US Tech 100", timeframe="1H", start=start, end=start + timedelta(days=1))
-    assert first["status"] == "BACKFILL_PAUSED_RATE_LIMIT"
+    assert first["status"] == "PAUSED_RATE_LIMIT"
+    assert first["backfill_status"] == "PAUSED"
+    assert first["epic"] == "E"
+    assert first["available_range"]["candle_count"] == 0
+    assert first["current_progress"] is None
+    assert first["last_successful_range"] is None
+    assert first["job_cumulative"] == first["invocation"] == {
+        "retrieved": 0, "inserted": 0, "skipped": 0, "malformed_rows": 0, "skipped_malformed_rows": 0,
+    }
     provider.paused = False
     second = Service(database, provider).run(market="US Tech 100", timeframe="1H", start=start, end=start + timedelta(days=1), resume=True)
     assert second["status"] == "COMPLETE"
+    assert second["job_cumulative"]["inserted"] == 1
+    assert second["invocation"]["inserted"] == 1
     assert database.connection.execute("SELECT status FROM backfill_jobs").fetchone()[0] == "COMPLETE"
+    database.close()
+
+
+def test_paused_result_reports_persisted_history_and_checkpoint(tmp_path):
+    class Candidate:
+        epic = "E"
+        market_name = "US Tech 100"
+        instrument_type = "INDICES"
+        market_status = "CLOSED"
+        metadata = {}
+        classification = "CASH/ROLLING CFD"
+
+    class Provider:
+        client = object()
+        pacing_seconds = 0
+
+        def __init__(self):
+            self.calls = 0
+
+        def fetch(self, *_args):
+            self.calls += 1
+            if self.calls == 1:
+                return [row("2026-01-01T00:00:00Z")], {"complete": True, "pages": 1}
+            raise RateLimitError(429, "rate limit", retryable=True)
+
+    class Service(BackfillService):
+        def resolve(self, _market):
+            return Candidate()
+
+    database = Database(tmp_path / "paused-report.sqlite3")
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    result = Service(database, Provider()).run(market="US Tech 100", timeframe="1H", start=start, end=start + timedelta(days=2), chunk_days=1)
+    assert result["status"] == "PAUSED_RATE_LIMIT"
+    assert result["available_range"]["candle_count"] == 1
+    assert result["available_range"]["first"] == "2026-01-01T00:00:00+00:00"
+    assert result["available_range"]["last"] == "2026-01-01T00:00:00+00:00"
+    assert result["current_progress"] == "2026-01-02T00:00:00+00:00"
+    assert result["last_successful_range"] == result["current_progress"]
+    assert result["job_cumulative"]["inserted"] == 1
+    assert result["invocation"]["inserted"] == 1
+    assert database.connection.execute("SELECT COUNT(*) FROM candles").fetchone()[0] == 1
     database.close()
 
 

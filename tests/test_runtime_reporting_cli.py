@@ -94,6 +94,71 @@ def test_history_backfill_success_updates_runtime_report(tmp_path, monkeypatch):
     assert "IG_HISTORICAL / IG / CFD" in text
 
 
+def test_history_backfill_paused_report_preserves_identity_history_and_state(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+
+    class HistoricalClient:
+        request_count = 1
+
+        def __init__(self, *_args, **_kwargs):
+            self.request_count = 1
+
+    class Service:
+        def __init__(self, *_args):
+            pass
+
+        def run(self, **_kwargs):
+            return {
+                "status": "PAUSED_RATE_LIMIT",
+                "backfill_status": "PAUSED",
+                "market": "US Tech 100",
+                "instrument_id": "ig:E",
+                "epic": "E",
+                "timeframe": "1H",
+                "requested_start": "2025-09-29T10:00:00+00:00",
+                "requested_end": "2026-09-29T10:00:00+00:00",
+                "retrieved": 5798,
+                "inserted": 5560,
+                "skipped": 238,
+                "malformed_rows": 1,
+                "skipped_malformed_rows": 1,
+                "available_range": {
+                    "first": "2025-09-29T10:00:00+00:00",
+                    "last": "2026-08-25T09:00:00+00:00",
+                    "candle_count": 6067,
+                },
+                "current_progress": "2026-08-25T10:00:00+00:00",
+                "last_successful_range": "2026-08-25T10:00:00+00:00",
+                "job_cumulative": {"retrieved": 5798, "inserted": 5560},
+                "invocation": {"retrieved": 5798, "inserted": 5560},
+            }
+
+    monkeypatch.setattr(reporting, "STATE_DIR", tmp_path / ".igai")
+    monkeypatch.setattr(reporting, "UNIFIED_REPORT", tmp_path / "igai-report.txt")
+    monkeypatch.setattr(cli.Settings, "from_env", lambda **_kwargs: settings)
+    monkeypatch.setattr(cli, "Database", _Database)
+    monkeypatch.setattr(cli, "IGRestClient", lambda _settings: object())
+    monkeypatch.setattr(cli, "HistoricalIGClient", HistoricalClient)
+    monkeypatch.setattr(cli, "BackfillService", Service)
+    monkeypatch.setattr(sys, "argv", ["ig-ai", "history-backfill", "--market", "US Tech 100", "--days", "30"])
+
+    assert cli.main() == 0
+    text = (tmp_path / "igai-report.txt").read_text()
+    assert "EPIC: E" in text
+    assert "persisted closed candle count: 6067" in text
+    assert "earliest/latest: 2025-09-29T10:00:00+00:00 / 2026-08-25T09:00:00+00:00" in text
+    assert "Final state: HISTORICAL BACKFILL PAUSED_RATE_LIMIT" in text
+    assert "backfill status: PAUSED" in text
+    assert "current progress: 2026-08-25T10:00:00+00:00" in text
+
+
+def test_history_report_distinguishes_unknown_from_verified_zero():
+    assert cli._history_range_for_report({}) == "NOT AVAILABLE"
+    assert cli._history_range_for_report({"available_range": {"candle_count": 0, "first": None, "last": None}}) == "ZERO (no persisted closed candles)"
+    assert cli._history_final_state([{"status": "PAUSED_RATE_LIMIT"}], dry_run=False) == "HISTORICAL BACKFILL PAUSED_RATE_LIMIT"
+    assert cli._history_final_state([{"status": "FAILED"}], dry_run=False) == "HISTORICAL BACKFILL FAILED"
+
+
 def test_history_backfill_pre_request_failure_is_current_and_safe(tmp_path, monkeypatch):
     settings = _settings(tmp_path)
 

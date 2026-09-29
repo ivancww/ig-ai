@@ -491,10 +491,10 @@ class Database:
         self.connection.commit()
 
     def get_backfill_job(self, job_id: str) -> dict | None:
-        row = self.connection.execute("SELECT job_id, instrument_id, epic, market_name, timeframe, requested_start, requested_end, current_progress, rows_retrieved, rows_inserted, rows_skipped, malformed_rows, skipped_malformed_rows, malformed_diagnostics_json, status FROM backfill_jobs WHERE job_id=?", (job_id,)).fetchone()
+        row = self.connection.execute("SELECT job_id, instrument_id, epic, market_name, timeframe, requested_start, requested_end, current_progress, last_successful_range, rows_retrieved, rows_inserted, rows_skipped, malformed_rows, skipped_malformed_rows, malformed_diagnostics_json, status FROM backfill_jobs WHERE job_id=?", (job_id,)).fetchone()
         if row is None:
             return None
-        names = ("job_id", "instrument_id", "epic", "market_name", "timeframe", "requested_start", "requested_end", "current_progress", "rows_retrieved", "rows_inserted", "rows_skipped", "malformed_rows", "skipped_malformed_rows", "malformed_diagnostics_json", "status")
+        names = ("job_id", "instrument_id", "epic", "market_name", "timeframe", "requested_start", "requested_end", "current_progress", "last_successful_range", "rows_retrieved", "rows_inserted", "rows_skipped", "malformed_rows", "skipped_malformed_rows", "malformed_diagnostics_json", "status")
         return dict(zip(names, row, strict=True))
 
     def finish_backfill_job(self, job_id: str, status: str, retrieved: int, inserted: int, skipped: int, malformed_rows: int = 0, skipped_malformed_rows: int = 0, malformed_diagnostics: list[dict] | None = None) -> None:
