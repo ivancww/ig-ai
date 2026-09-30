@@ -12,6 +12,7 @@ from datetime import datetime
 from .alerts import AlertEngine, monitor_state
 from .candles import CandleAggregator
 from .database import Database
+from .forward import ForwardTestEngine
 from .models import Instrument
 from .normalization import normalize_price_update
 from .patterns import MultiTimeframeCoordinator, Phase2BEngine
@@ -57,6 +58,9 @@ class PersistedStream:
         self.alert_engine = AlertEngine()
         self.alert_engine.restore(self.database.list_alerts(limit=100000))
         self.alerts_emitted = 0
+        self.forward_engine = ForwardTestEngine(self.database)
+        self.forward_snapshots_written = 0
+        self.forward_outcomes_completed = 0
         self.aggregators = {
             timeframe: CandleAggregator(timeframe, market_timezone=self.market_timezone)
             for timeframe in self.timeframes
@@ -225,6 +229,19 @@ class PersistedStream:
                 previous = self.database.get_monitor_state(state["instrument"])
                 alerts = self.alert_engine.evaluate(previous, state)
                 self.alerts_emitted += self.database.save_monitor_evaluation(state, alerts)
+            if candle.timeframe == "1H" and candle.is_closed:
+                self.forward_engine.record_snapshot(
+                    reference_candle=candle, coordinated=coordinated
+                )
+                self.forward_snapshots_written += int(self.forward_engine.last_inserted)
+            # Outcomes are calculated only from complete 15M candles.  The
+            # exact-end requirement in OutcomeCalculator keeps all other
+            # horizons PENDING until their future data actually exists.
+            if candle.is_closed and candle.timeframe == "15M":
+                self.forward_outcomes_completed += self.forward_engine.update_outcomes(
+                    instrument_id=candle.instrument_id,
+                    candles=self.database.list_candles(candle.instrument_id, "15M"),
+                )
 
     @staticmethod
     def _exit_reason(stream: IGStreamService) -> str | None:

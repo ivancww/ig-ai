@@ -137,8 +137,10 @@ def main() -> int:
     stream_parser.add_argument("--verbose", action="store_true")
     monitor_parser = commands.add_parser("monitor", help="run the read-only monitor for a wall-clock duration in seconds")
     monitor_parser.add_argument("--duration", type=float, default=3600.0)
-    monitor_parser.add_argument("--markets", default="US Tech 100,Japan 225,Hong Kong HS50")
+    monitor_parser.add_argument("--markets", default="US Tech 100")
     monitor_parser.add_argument("--verbose", action="store_true")
+    live_state_parser = commands.add_parser("live-state", help="show the latest persisted LIVE_FORWARD state")
+    live_state_parser.add_argument("--instrument", default=None)
     smoke_parser = commands.add_parser("stream-smoke")
     smoke_parser.add_argument("--duration", type=float, default=60.0)
     args = parser.parse_args()
@@ -272,6 +274,37 @@ def main() -> int:
                 if status["last_alert"]:
                     print(f"Last alert: {status['last_alert']['alert_type']} ({status['last_alert']['priority']}) at {status['last_alert']['created_at']}")
                 print("Process liveness is not reported unless an external monitor provides it.")
+            finally:
+                database.close()
+            return 0
+        if args.command == "live-state":
+            settings = Settings.from_env(require_credentials=False)
+            database = Database(settings.database_path)
+            try:
+                state = database.get_forward_state(args.instrument)
+                if state is None:
+                    print("No LIVE_FORWARD state available.")
+                    return 0
+                pattern = json.loads(state["pattern_state_json"])
+                technical = json.loads(state["technical_state_json"])
+                reversal = json.loads(state["reversal_state_json"])
+                early = pattern.get("early_15M", []) + pattern.get("divergences_15M", [])
+                last = database.connection.execute(
+                    "SELECT MAX(observed_at) FROM observations WHERE instrument_id=?", (state["instrument_id"],)
+                ).fetchone()[0]
+                print(f"Market: {state['market']}")
+                print(f"Reference time: {state['reference_time']}")
+                print(f"1H Direction: {state.get('direction') or 'NEUTRAL'}")
+                print(f"Direction Score: UP={state.get('up_score')} DOWN={state.get('down_score')}")
+                print(f"Trend Stage: {state.get('trend_stage') or 'UNKNOWN'}")
+                print(f"Reversal Risk: {(reversal or {}).get('category', 'UNKNOWN')}")
+                print(f"Holding Window: {state.get('holding_window') or 'UNKNOWN'}")
+                print(f"15M Early Warning: {'YES' if early else 'NO'}")
+                print(f"Important technical structure: {technical.get('structure', 'UNKNOWN')}")
+                print(f"Pattern state: {len(pattern.get('primary_1H', []))} x 1H; {len(early)} x 15M")
+                print(f"Data freshness: {last or 'UNKNOWN'}")
+                print(f"Source identity: {state['source_identity']}")
+                print("Technical scores only — not calibrated probabilities or trading instructions.")
             finally:
                 database.close()
             return 0
@@ -775,6 +808,8 @@ def main() -> int:
             print(f"STREAMING: {'PASS' if validation_passed else 'FAIL'}")
             print(f"PERSISTENCE: {'PASS' if persistence_passed else 'FAIL'}")
             print(f"CANDLE PIPELINE: {'PASS' if candle_pipeline_passed else 'NOT VERIFIED'}")
+            print(f"LIVE_FORWARD snapshots: {sink.forward_snapshots_written}")
+            print(f"Forward outcomes completed: {sink.forward_outcomes_completed}")
             print(f"LONG-RUN: {'PASS' if long_run_passed else 'FAIL'}")
             print(f"LIVE MULTI-MARKET STREAM VALIDATION: {'PASS' if validation_passed else 'FAIL'}")
             return 0 if validation_passed and long_run_passed else 1
