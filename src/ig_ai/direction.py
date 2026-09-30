@@ -11,7 +11,7 @@ from typing import Any
 
 DIRECTION_SCHEMA_VERSION = "direction_score_v1"
 TIMEFRAMES = ("15M", "1H", "4H", "1D")
-STAGES = ("EARLY", "CONFIRMED", "MATURE", "EXHAUSTION_RISK", "REVERSAL_WATCH", "REVERSAL_CONFIRMED")
+STAGES = ("INSUFFICIENT_EVIDENCE", "EARLY", "CONFIRMED", "MATURE", "EXHAUSTION_RISK", "REVERSAL_WATCH", "REVERSAL_CONFIRMED")
 RISK_LEVELS = ("LOW", "MODERATE", "HIGH", "VERY_HIGH")
 
 
@@ -141,12 +141,18 @@ class DirectionScoreEngine:
         direction = primary_trend if primary_trend != "NEUTRAL" else "UP" if up_score > down_score else "DOWN" if down_score > up_score else "NEUTRAL"
 
         warning = self._warning_evidence(timeframes, primary_trend)
+        agreement = self._agreement(timeframes, primary_trend)
         closed_primary = primary.get("candle_state") == "CLOSED"
         current_direction = primary_structure.get("current_direction") or primary_trend
         prior_direction = self._prior_direction(primary_structure)
         reversal = prior_direction in {"UP", "DOWN"} and current_direction in {"UP", "DOWN"} and prior_direction != current_direction
         bos_against_prior = primary_structure.get("break_of_structure") and primary_structure.get("breakout_direction") in {"UP", "DOWN"} and prior_direction in {"UP", "DOWN"} and primary_structure.get("breakout_direction") != prior_direction
-        if closed_primary and reversal:
+        if directional_weight == 0:
+            stage = "INSUFFICIENT_EVIDENCE"
+            risk = "UNKNOWN"
+            risk_score = None
+            holding = "UNKNOWN"
+        elif closed_primary and reversal:
             stage = "REVERSAL_CONFIRMED"
         elif closed_primary and bos_against_prior:
             stage = "REVERSAL_WATCH"
@@ -159,10 +165,10 @@ class DirectionScoreEngine:
         else:
             stage = "EARLY"
 
-        risk_score = min(100, warning["score"] + (20 if warning["strong"] else 0) + (35 if stage == "REVERSAL_WATCH" else 60 if stage == "REVERSAL_CONFIRMED" else 0))
-        risk = "VERY_HIGH" if risk_score >= 75 else "HIGH" if risk_score >= 50 else "MODERATE" if risk_score >= 25 else "LOW"
-        agreement = self._agreement(timeframes, primary_trend)
-        holding = self._holding_window(stage, risk, agreement, technical.get("atr14", {}))
+        if directional_weight != 0:
+            risk_score = min(100, warning["score"] + (20 if warning["strong"] else 0) + (35 if stage == "REVERSAL_WATCH" else 60 if stage == "REVERSAL_CONFIRMED" else 0))
+            risk = "VERY_HIGH" if risk_score >= 75 else "HIGH" if risk_score >= 50 else "MODERATE" if risk_score >= 25 else "LOW"
+            holding = self._holding_window(stage, risk, agreement, technical.get("atr14", {}))
         reference_timestamp = primary.get("candle_timestamp")
         return {"schema_version": DIRECTION_SCHEMA_VERSION, "score_version": self.weights.version, "instrument": primary.get("instrument"), "timeframe": "1H", "candle_timestamp": reference_timestamp, "model_reference": {"timeframe": "1H", "candle_timestamp": reference_timestamp, "candle_state": primary.get("candle_state", "FORMING")}, "candle_state": primary.get("candle_state", "FORMING"), "direction": direction, "up_score": up_score, "down_score": down_score, "coverage": coverage, "trend_stage": stage, "holding_window": holding, "reversal_risk": {"category": risk, "score": risk_score, "evidence": warning["items"]}, "timeframe_agreement": agreement, "evidence_ledger": ledger, "technical_score_only": True, "calibrated_probability": None, "recommendation": None}
 
@@ -183,7 +189,7 @@ class DirectionScoreEngine:
         warning_score = 0
         early = timeframes.get("15M", {})
         opposite = "DOWN" if primary_trend == "UP" else "UP" if primary_trend == "DOWN" else "NEUTRAL"
-        if self._trend(early.get("structure")) == opposite:
+        if primary_trend in {"UP", "DOWN"} and self._trend(early.get("structure")) == opposite:
             items.append({"type": "15M_STRUCTURE_OPPOSITE", "timeframe": "15M", "confirmed": early.get("candle_state") == "CLOSED"})
             warning_score += 20 if early.get("candle_state") == "CLOSED" else 10
         if any(("Bearish" if primary_trend == "UP" else "Bullish") in item.get("pattern", "") for item in early.get("divergences", [])):

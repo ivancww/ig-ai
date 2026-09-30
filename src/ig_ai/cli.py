@@ -283,7 +283,7 @@ def main() -> int:
             try:
                 state = database.get_forward_state(args.instrument)
                 if state is None:
-                    print("No LIVE_FORWARD state available.")
+                    print("NO ELIGIBLE LIVE_FORWARD STATE YET")
                     return 0
                 pattern = json.loads(state["pattern_state_json"])
                 technical = json.loads(state["technical_state_json"])
@@ -656,7 +656,12 @@ def main() -> int:
                         f"PRICE:{account_id}:{instrument.epic}",
                     )
                 )
-            sink = PersistedStream(database, instruments, client.settings.market_timezone)
+            sink = PersistedStream(
+                database,
+                instruments,
+                client.settings.market_timezone,
+                session_started_at=datetime.now(UTC),
+            )
             write_runtime_record({
                 "status": "RUNNING",
                 "requested_duration": args.duration,

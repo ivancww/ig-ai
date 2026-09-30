@@ -98,7 +98,7 @@ def test_repeated_ticks_are_one_forming_candle_and_boundary_finalizes_one(timefr
     assert closed[0].observation_count == 2
 
 
-def test_controlled_shutdown_persists_incomplete_candle_as_forming_and_restart_continues(tmp_path):
+def test_controlled_shutdown_persists_incomplete_candle_as_audit_only_on_restart(tmp_path):
     db, sink = _sink(tmp_path)
     update = {"instrument_id": "EPIC", "BIDPRICE1": "100", "ASKPRICE1": "102", "TIMESTAMP": "1760000000000"}
     sink.on_update(update)
@@ -115,7 +115,13 @@ def test_controlled_shutdown_persists_incomplete_candle_as_forming_and_restart_c
         "FROM candles GROUP BY timeframe"
     ).fetchall()
     assert len(rows) == 4
-    assert all(row[1:] == (1, 1, 0, 2) for row in rows)
+    assert all(row[1:] == (1, 1, 0, 1) for row in rows)
+    assert all(
+        row[0] in {"15M", "1H", "4H", "1D"}
+        for row in db.connection.execute(
+            "SELECT timeframe FROM candle_quality WHERE eligibility='AUDIT_ONLY'"
+        )
+    )
     db.close()
 
 
@@ -124,7 +130,7 @@ def test_controlled_shutdown_persists_incomplete_candle_as_forming_and_restart_c
     (("15M", "2026-01-01T00:15:00"), ("1H", "2026-01-01T01:00:00"),
      ("4H", "2026-01-01T04:00:00"), ("1D", "2026-01-02T00:00:00")),
 )
-def test_restart_later_bucket_finalizes_previous_forming_candle_once(tmp_path, timeframe, later_timestamp):
+def test_restart_later_bucket_preserves_previous_partial_candle_as_audit_only(tmp_path, timeframe, later_timestamp):
     path = tmp_path / f"restart-{timeframe}.sqlite3"
     instrument = Instrument("EPIC", "EPIC", "Market")
     db = Database(path)
@@ -142,7 +148,11 @@ def test_restart_later_bucket_finalizes_previous_forming_candle_once(tmp_path, t
         "SELECT is_closed, observation_count FROM candles WHERE timeframe = ? ORDER BY start_at",
         (timeframe,),
     ).fetchall()
-    assert rows == [(1, 1), (0, 1)]
+    assert rows == [(0, 1), (0, 1)]
+    assert db.connection.execute(
+        "SELECT COUNT(*) FROM candle_quality WHERE timeframe=? AND eligibility='AUDIT_ONLY'",
+        (timeframe,),
+    ).fetchone()[0] == 1
     assert db.connection.execute("SELECT COUNT(*) FROM candles WHERE timeframe = ?", (timeframe,)).fetchone()[0] == 2
     db.close()
 
