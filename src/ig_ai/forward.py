@@ -87,6 +87,5 @@ class ForwardTestEngine:
                 )
                 for horizon in FORWARD_HORIZONS
             }
-            self.database.save_forward_outcomes(snapshot["snapshot_id"], outcomes)
-            updated += sum(item.get("status") == "COMPLETE" for item in outcomes.values())
+            updated += self.database.save_forward_outcomes(snapshot["snapshot_id"], outcomes)
         return updated

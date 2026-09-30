@@ -821,10 +821,19 @@ class Database:
         query += " GROUP BY s.snapshot_id ORDER BY s.reference_time"
         return [dict(zip(("snapshot_id", "reference_time", "reference_price", "direction"), row, strict=True)) for row in self.connection.execute(query, params)]
 
-    def save_forward_outcomes(self, snapshot_id: str, outcomes: dict[str, dict]) -> None:
+    def save_forward_outcomes(self, snapshot_id: str, outcomes: dict[str, dict]) -> int:
+        """Persist mutable outcomes and return newly committed completions only."""
+        existing = {
+            row[0]: row[1]
+            for row in self.connection.execute(
+                "SELECT horizon, status FROM forward_outcomes WHERE snapshot_id=?",
+                (snapshot_id,),
+            ).fetchall()
+        }
+        completed_transitions = 0
         with self.connection:
             for horizon, outcome in outcomes.items():
-                self.connection.execute(
+                cursor = self.connection.execute(
                     """INSERT INTO forward_outcomes
                     (snapshot_id, horizon, status, future_return, future_timestamp, future_price,
                      directional_outcome, mfe, mae, continuation_timing, reversal_timing, updated_at)
@@ -842,6 +851,11 @@ class Database:
                      outcome.get("continuation_duration"), outcome.get("time_to_reversal"),
                      datetime.now(UTC).isoformat()),
                 )
+                if (existing.get(horizon) == "PENDING"
+                        and outcome.get("status", "PENDING") == "COMPLETE"
+                        and cursor.rowcount == 1):
+                    completed_transitions += 1
+        return completed_transitions
 
     def get_forward_state(self, instrument_id: str | None = None) -> dict | None:
         query = "SELECT * FROM forward_snapshots"
