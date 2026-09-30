@@ -269,6 +269,25 @@ CREATE TABLE IF NOT EXISTS replay_jobs (
     outcomes_written INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS replay_jobs_lookup ON replay_jobs (instrument_id, status, updated_at);
+CREATE TABLE IF NOT EXISTS forward_snapshots (
+    snapshot_id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, reference_time TEXT NOT NULL,
+    market TEXT NOT NULL, instrument_id TEXT NOT NULL, epic TEXT NOT NULL,
+    source_identity TEXT NOT NULL, provenance TEXT NOT NULL, timeframe TEXT NOT NULL,
+    technical_state_json TEXT NOT NULL, pattern_state_json TEXT NOT NULL,
+    direction_state_json TEXT NOT NULL, reference_price REAL NOT NULL,
+    direction TEXT, up_score REAL, down_score REAL, trend_stage TEXT,
+    reversal_state_json TEXT, holding_window TEXT, model_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (instrument_id, timeframe, reference_time, provenance, model_version)
+);
+CREATE INDEX IF NOT EXISTS forward_snapshots_lookup ON forward_snapshots (instrument_id, reference_time);
+CREATE TABLE IF NOT EXISTS forward_outcomes (
+    snapshot_id TEXT NOT NULL, horizon TEXT NOT NULL, status TEXT NOT NULL,
+    future_return REAL, future_timestamp TEXT, future_price REAL,
+    directional_outcome TEXT, mfe REAL, mae REAL, continuation_timing REAL,
+    reversal_timing REAL, updated_at TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, horizon), FOREIGN KEY (snapshot_id) REFERENCES forward_snapshots(snapshot_id)
+);
 """
 
 
@@ -766,6 +785,79 @@ class Database:
             count = self.connection.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
             last = self.connection.execute("SELECT payload_json FROM alerts ORDER BY created_at DESC LIMIT 1").fetchone()
         return {"states": [json.loads(row[0]) for row in states], "alert_count": count, "last_alert": json.loads(last[0]) if last else None}
+
+    def save_forward_snapshot(self, snapshot: dict) -> bool:
+        """Insert once.  LIVE_FORWARD prediction fields are immutable."""
+        cursor = self.connection.execute(
+            """INSERT OR IGNORE INTO forward_snapshots
+            (snapshot_id, timestamp, reference_time, market, instrument_id, epic,
+             source_identity, provenance, timeframe, technical_state_json,
+             pattern_state_json, direction_state_json, reference_price, direction,
+             up_score, down_score, trend_stage, reversal_state_json, holding_window,
+             model_version, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'LIVE_FORWARD', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (snapshot["snapshot_id"], snapshot["timestamp"], snapshot["reference_time"],
+             snapshot["market"], snapshot["instrument_id"], snapshot["epic"],
+             snapshot["source_identity"], snapshot["timeframe"],
+             json.dumps(snapshot.get("technical_state", {}), sort_keys=True, separators=(",", ":")),
+             json.dumps(snapshot.get("pattern_state", {}), sort_keys=True, separators=(",", ":")),
+             json.dumps(snapshot.get("direction_state", {}), sort_keys=True, separators=(",", ":")),
+             snapshot["reference_price"], snapshot.get("direction"), snapshot.get("up_score"),
+             snapshot.get("down_score"), snapshot.get("trend_stage"),
+             json.dumps(snapshot.get("reversal_state"), sort_keys=True, separators=(",", ":")),
+             snapshot.get("holding_window"), snapshot["model_version"], datetime.now(UTC).isoformat()),
+        )
+        self.connection.commit()
+        return cursor.rowcount == 1
+
+    def pending_forward_snapshots(self, instrument_id: str | None = None) -> list[dict]:
+        query = """SELECT s.snapshot_id, s.reference_time, s.reference_price, s.direction
+                   FROM forward_snapshots s JOIN forward_outcomes o ON o.snapshot_id=s.snapshot_id
+                   WHERE o.status='PENDING'"""
+        params: list[object] = []
+        if instrument_id is not None:
+            query += " AND s.instrument_id=?"
+            params.append(instrument_id)
+        query += " GROUP BY s.snapshot_id ORDER BY s.reference_time"
+        return [dict(zip(("snapshot_id", "reference_time", "reference_price", "direction"), row, strict=True)) for row in self.connection.execute(query, params)]
+
+    def save_forward_outcomes(self, snapshot_id: str, outcomes: dict[str, dict]) -> None:
+        with self.connection:
+            for horizon, outcome in outcomes.items():
+                self.connection.execute(
+                    """INSERT INTO forward_outcomes
+                    (snapshot_id, horizon, status, future_return, future_timestamp, future_price,
+                     directional_outcome, mfe, mae, continuation_timing, reversal_timing, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(snapshot_id, horizon) DO UPDATE SET
+                      status=excluded.status, future_return=excluded.future_return,
+                      future_timestamp=excluded.future_timestamp, future_price=excluded.future_price,
+                      directional_outcome=excluded.directional_outcome, mfe=excluded.mfe,
+                      mae=excluded.mae, continuation_timing=excluded.continuation_timing,
+                      reversal_timing=excluded.reversal_timing, updated_at=excluded.updated_at
+                    WHERE forward_outcomes.status != 'COMPLETE'""",
+                    (snapshot_id, horizon, outcome.get("status", "PENDING"), outcome.get("percentage_move"),
+                     outcome.get("future_timestamp"), outcome.get("future_price"),
+                     outcome.get("direction_outcome"), outcome.get("mfe"), outcome.get("mae"),
+                     outcome.get("continuation_duration"), outcome.get("time_to_reversal"),
+                     datetime.now(UTC).isoformat()),
+                )
+
+    def get_forward_state(self, instrument_id: str | None = None) -> dict | None:
+        query = "SELECT * FROM forward_snapshots"
+        params: list[object] = []
+        if instrument_id:
+            query += " WHERE instrument_id=?"
+            params.append(instrument_id)
+        query += " ORDER BY reference_time DESC LIMIT 1"
+        row = self.connection.execute(query, params).fetchone()
+        if row is None:
+            return None
+        columns = [item[1] for item in self.connection.execute("PRAGMA table_info(forward_snapshots)")]
+        result = dict(zip(columns, row, strict=True))
+        for key in ("technical_state_json", "pattern_state_json", "direction_state_json", "reversal_state_json"):
+            result[key.removesuffix("_json")] = json.loads(result[key])
+        return result
 
     def research_source_identity(self, instrument_id: str) -> str:
         row = self.connection.execute("SELECT epic, market_name, instrument_type, metadata_json FROM instruments WHERE instrument_id=?", (instrument_id,)).fetchone()
