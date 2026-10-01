@@ -249,7 +249,7 @@ def test_three_market_counters_distinguish_received_normalized_persisted_and_fai
     db.close()
 
 
-def test_restart_restores_forming_candles_and_deduplicates_existing_observation(tmp_path):
+def test_restart_keeps_partial_forming_candle_audit_only_and_deduplicates_existing_observation(tmp_path):
     path = tmp_path / "restart.sqlite3"
     instrument = Instrument("EPIC", "EPIC", "US Tech 100")
     db = Database(path)
@@ -269,6 +269,10 @@ def test_restart_restores_forming_candles_and_deduplicates_existing_observation(
         normalize_price_update({**update, "BIDPRICE1": "104", "ASKPRICE1": "106", "TIMESTAMP": "1760000060000"}, instrument_id="EPIC", epic="EPIC", market_name="US Tech 100")
     )
     assert forming is not None
-    assert forming.observation_count == 2
+    assert forming.observation_count == 1
+    assert db.connection.execute(
+        "SELECT eligibility FROM candle_quality WHERE instrument_id='EPIC' AND timeframe='15M'"
+    ).fetchone()[0] == "AUDIT_ONLY"
+    assert db.list_candles("EPIC", "15M") == []
     assert db.connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 2
     db.close()

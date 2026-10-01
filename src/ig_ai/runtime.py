@@ -13,7 +13,7 @@ from .alerts import AlertEngine, monitor_state
 from .candles import CandleAggregator
 from .database import Database
 from .forward import ForwardTestEngine
-from .models import Instrument
+from .models import Instrument, as_utc
 from .normalization import normalize_price_update
 from .patterns import MultiTimeframeCoordinator, Phase2BEngine
 from .streaming import IGStreamService
@@ -47,8 +47,11 @@ class PersistedStream:
     database: Database
     instruments: dict[str, Instrument]
     market_timezone: str = "UTC"
+    session_started_at: datetime | None = None
 
     def __post_init__(self) -> None:
+        if self.session_started_at is not None:
+            self.session_started_at = as_utc(self.session_started_at)
         self.timeframes = ("15M", "1H", "4H", "1D")
         self.feature_engine = TechnicalFeatureEngine()
         self.phase2b_engine = Phase2BEngine(self.feature_engine)
@@ -91,6 +94,10 @@ class PersistedStream:
         self._seen_observations: set[tuple] = set()
         self.safe_skip_diagnostics: list[dict[str, str]] = []
         self.runtime_failures: list[dict[str, str]] = []
+        self.stale_forming_candles: list[dict[str, str]] = []
+        self._restored_forming_keys: set[tuple[str, str, str]] = set()
+        self._session_candle_starts: set[tuple[str, str, str]] = set()
+        self.forward_snapshots_skipped_ineligible = 0
         # SQLite connections are deliberately owned by the thread that created
         # them.  SDK callbacks are delivered on an SDK-owned thread, so those
         # callbacks only enqueue immutable update dictionaries.
@@ -98,9 +105,15 @@ class PersistedStream:
         for candle in self.database.load_forming_candles():
             aggregator = self.aggregators.get(candle.timeframe)
             if aggregator is not None and candle.instrument_id in self.instruments:
-                aggregator.restore(candle)
-                self._forming_keys.add((candle.instrument_id, candle.timeframe, candle.start.isoformat()))
-                self._refresh_forming_count(candle.instrument_id, candle.timeframe)
+                self.database.mark_candle_audit_only(
+                    candle, reason="restored_partial_without_session_coverage"
+                )
+                self.stale_forming_candles.append({
+                    "instrument_id": candle.instrument_id,
+                    "timeframe": candle.timeframe,
+                    "start": candle.start.isoformat(),
+                    "reason": "restored_partial_without_session_coverage",
+                })
 
     def on_update(self, update: dict) -> dict[str, str]:
         if update.get("type") in {"PROBE", "SUB", "UNSUB"}:
@@ -144,18 +157,33 @@ class PersistedStream:
         self.observations_persisted[instrument_id] += 1
         self.last_update[instrument_id] = observation.timestamp
         for timeframe, aggregator in self.aggregators.items():
+            previous_forming = aggregator.forming(observation)
             for candle in aggregator.update(observation):
                 self.database.save_candle(candle)
-                self.database.save_features_for_candle(candle, self.feature_engine)
-                self._save_phase2b_for_candle(candle)
+                if self.database.is_candle_eligible(candle):
+                    self.database.save_features_for_candle(candle, self.feature_engine)
+                    self._save_phase2b_for_candle(candle)
                 self._record_candle_upsert(candle)
                 self.finalized_candles_by_instrument[instrument_id][timeframe] += 1
             forming = aggregator.forming(observation)
             if forming:
+                forming_key = (instrument_id, timeframe, forming.start.isoformat())
+                if (
+                    previous_forming is None
+                    or previous_forming.start != forming.start
+                ):
+                    self._restored_forming_keys.discard(forming_key)
+                    if self.session_started_at is None or forming.start >= self.session_started_at:
+                        self._session_candle_starts.add(forming_key)
+                    else:
+                        self.database.mark_candle_audit_only(
+                            forming, reason="partial_first_bucket_without_session_coverage"
+                        )
                 self._forming_keys.add((instrument_id, timeframe, forming.start.isoformat()))
                 self.database.save_candle(forming)
-                self.database.save_features_for_candle(forming, self.feature_engine)
-                self._save_phase2b_for_candle(forming)
+                if self.database.is_candle_eligible(forming):
+                    self.database.save_features_for_candle(forming, self.feature_engine)
+                    self._save_phase2b_for_candle(forming)
                 self._record_candle_upsert(forming)
                 self._refresh_forming_count(instrument_id, timeframe)
         return {"observation_created": "true", "skip_reason": "none"}
@@ -200,6 +228,8 @@ class PersistedStream:
         )
 
     def _save_phase2b_for_candle(self, candle) -> None:
+        if not self.database.is_candle_eligible(candle):
+            return
         if not candle.is_closed and candle.observation_count > 1 and candle.observation_count % 10 != 0:
             self.phase2b_skipped_forming += 1
             return
@@ -230,10 +260,19 @@ class PersistedStream:
                 alerts = self.alert_engine.evaluate(previous, state)
                 self.alerts_emitted += self.database.save_monitor_evaluation(state, alerts)
             if candle.timeframe == "1H" and candle.is_closed:
-                self.forward_engine.record_snapshot(
-                    reference_candle=candle, coordinated=coordinated
-                )
-                self.forward_snapshots_written += int(self.forward_engine.last_inserted)
+                candle_key = (candle.instrument_id, candle.timeframe, candle.start.isoformat())
+                if candle_key in self._session_candle_starts and candle_key not in self._restored_forming_keys:
+                    self.forward_engine.record_snapshot(
+                        reference_candle=candle, coordinated=coordinated
+                    )
+                    self.forward_snapshots_written += int(self.forward_engine.last_inserted)
+                else:
+                    self.forward_snapshots_skipped_ineligible += 1
+                    self.safe_skip_diagnostics.append({
+                        "instrument_id": candle.instrument_id,
+                        "timeframe": candle.timeframe,
+                        "reason": "ineligible_forward_reference",
+                    })
             # Outcomes are calculated only from complete 15M candles.  The
             # exact-end requirement in OutcomeCalculator keeps all other
             # horizons PENDING until their future data actually exists.
@@ -299,8 +338,9 @@ class PersistedStream:
         for aggregator in self.aggregators.values():
             for candle in aggregator.flush():
                 self.database.save_candle(candle)
-                self.database.save_features_for_candle(candle, self.feature_engine)
-                self._save_phase2b_for_candle(candle)
+                if self.database.is_candle_eligible(candle):
+                    self.database.save_features_for_candle(candle, self.feature_engine)
+                    self._save_phase2b_for_candle(candle)
                 self._forming_keys.add((candle.instrument_id, candle.timeframe, candle.start.isoformat()))
                 self._record_candle_upsert(candle)
                 self._refresh_forming_count(candle.instrument_id, candle.timeframe)

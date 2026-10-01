@@ -31,10 +31,12 @@ class CandleAggregator:
             raise ValueError("timeframe must be 15M, 1H, 4H, or 1D")
         self._working: dict[str, _Working] = {}
 
-    def restore(self, candle: Candle) -> None:
-        """Restore one incomplete candle loaded from SQLite after restart."""
+    def restore(self, candle: Candle, *, session_started_at: datetime | None = None) -> bool:
+        """Restore one incomplete candle when it is still open for this session."""
         if candle.is_closed or candle.timeframe != self.timeframe:
-            return
+            return False
+        if session_started_at is not None and candle.end <= as_utc(session_started_at):
+            return False
         self._working[candle.instrument_id] = _Working(
             candle.start,
             candle.end,
@@ -46,6 +48,7 @@ class CandleAggregator:
             candle.epic,
             candle.observation_count,
         )
+        return True
 
     def _bounds(self, timestamp: datetime) -> tuple[datetime, datetime]:
         local = as_utc(timestamp).astimezone(self.market_timezone)

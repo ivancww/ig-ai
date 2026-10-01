@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
@@ -253,6 +253,12 @@ CREATE TABLE IF NOT EXISTS candle_provenance (
     PRIMARY KEY (instrument_id, timeframe, start_at)
 );
 CREATE INDEX IF NOT EXISTS candle_provenance_source ON candle_provenance (source, instrument_id, timeframe, start_at);
+CREATE TABLE IF NOT EXISTS candle_quality (
+    instrument_id TEXT NOT NULL, timeframe TEXT NOT NULL, start_at TEXT NOT NULL,
+    eligibility TEXT NOT NULL, reason TEXT, recorded_at TEXT NOT NULL,
+    PRIMARY KEY (instrument_id, timeframe, start_at)
+);
+CREATE INDEX IF NOT EXISTS candle_quality_lookup ON candle_quality (instrument_id, timeframe, eligibility, start_at);
 CREATE TABLE IF NOT EXISTS backfill_jobs (
     job_id TEXT PRIMARY KEY, instrument_id TEXT NOT NULL, epic TEXT NOT NULL, market_name TEXT NOT NULL,
     timeframe TEXT NOT NULL, requested_start TEXT NOT NULL, requested_end TEXT NOT NULL,
@@ -281,6 +287,10 @@ CREATE TABLE IF NOT EXISTS forward_snapshots (
     UNIQUE (instrument_id, timeframe, reference_time, provenance, model_version)
 );
 CREATE INDEX IF NOT EXISTS forward_snapshots_lookup ON forward_snapshots (instrument_id, reference_time);
+CREATE TABLE IF NOT EXISTS forward_snapshot_status (
+    snapshot_id TEXT PRIMARY KEY, eligibility TEXT NOT NULL, reason TEXT,
+    audited_at TEXT NOT NULL, FOREIGN KEY (snapshot_id) REFERENCES forward_snapshots(snapshot_id)
+);
 CREATE TABLE IF NOT EXISTS forward_outcomes (
     snapshot_id TEXT NOT NULL, horizon TEXT NOT NULL, status TEXT NOT NULL,
     future_return REAL, future_timestamp TEXT, future_price REAL,
@@ -300,6 +310,9 @@ class Database:
         self.connection.executescript(SCHEMA)
         self._ensure_research_columns()
         self._ensure_backfill_columns()
+        self._ensure_candle_quality()
+        self._ensure_forward_snapshot_status()
+        self.connection.commit()
         pattern_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(pattern_observations)")}
         if pattern_columns and "pattern_instance_id" not in pattern_columns:
             self.connection.execute("BEGIN")
@@ -330,6 +343,45 @@ class Database:
         elif version == 0:
             self.connection.execute("INSERT INTO schema_version VALUES (1)")
         self.connection.commit()
+
+    def _ensure_forward_snapshot_status(self) -> None:
+        """Quarantine legacy snapshots that were created materially late.
+
+        The original schema had no eligibility marker, so old rows are kept
+        intact and classified from their immutable timestamps.  This is an
+        audit classification only; no snapshot or outcome rows are deleted.
+        """
+        rows = self.connection.execute(
+            "SELECT snapshot_id, reference_time, created_at FROM forward_snapshots"
+        ).fetchall()
+        now = datetime.now(UTC).isoformat()
+        for snapshot_id, reference_time, created_at in rows:
+            existing = self.connection.execute(
+                "SELECT 1 FROM forward_snapshot_status WHERE snapshot_id=?", (snapshot_id,)
+            ).fetchone()
+            if existing:
+                continue
+            eligibility, reason = "ELIGIBLE", None
+            try:
+                reference = datetime.fromisoformat(reference_time).astimezone(UTC)
+                created = datetime.fromisoformat(created_at).astimezone(UTC)
+                if created - reference > timedelta(minutes=15):
+                    eligibility, reason = "INVALID_STALE", "created materially after reference_time"
+            except (TypeError, ValueError):
+                eligibility, reason = "INVALID_STALE", "invalid snapshot timestamp"
+            self.connection.execute(
+                "INSERT INTO forward_snapshot_status (snapshot_id, eligibility, reason, audited_at) VALUES (?, ?, ?, ?)",
+                (snapshot_id, eligibility, reason, now),
+            )
+
+    def _ensure_candle_quality(self) -> None:
+        """Backfill neutral quality metadata without changing candle rows."""
+        now = datetime.now(UTC).isoformat()
+        self.connection.execute(
+            "INSERT OR IGNORE INTO candle_quality (instrument_id, timeframe, start_at, eligibility, reason, recorded_at) "
+            "SELECT instrument_id, timeframe, start_at, 'ELIGIBLE', NULL, ? FROM candles",
+            (now,),
+        )
 
     def _ensure_research_columns(self) -> None:
         """Add non-destructive columns for databases created by an earlier 5A build."""
@@ -452,6 +504,10 @@ class Database:
             "INSERT OR IGNORE INTO candle_provenance VALUES (?, ?, ?, 'LIVE_AGGREGATED', ?, ?)",
             (candle.instrument_id, candle.timeframe, candle.start.isoformat(), json.dumps({"provider": "IG", "asset_source_type": "CFD", "policy": "live_stream"}, sort_keys=True), datetime.now(UTC).isoformat()),
         )
+        self.connection.execute(
+            "INSERT OR IGNORE INTO candle_quality VALUES (?, ?, ?, 'ELIGIBLE', NULL, ?)",
+            (candle.instrument_id, candle.timeframe, candle.start.isoformat(), datetime.now(UTC).isoformat()),
+        )
         if existing_source and existing_source[0] == "IG_HISTORICAL" and candle.is_closed:
             self.connection.execute(
                 "UPDATE candle_provenance SET source='LIVE_AGGREGATED', provenance_json=?, recorded_at=? WHERE instrument_id=? AND timeframe=? AND start_at=?",
@@ -497,8 +553,34 @@ class Database:
             "INSERT INTO candle_provenance VALUES (?, ?, ?, ?, ?, ?)",
             (*identity, "IG_HISTORICAL", json.dumps(scrub(provenance), sort_keys=True, separators=(",", ":")), datetime.now(UTC).isoformat()),
         )
+        self.connection.execute(
+            "INSERT OR IGNORE INTO candle_quality VALUES (?, ?, ?, 'ELIGIBLE', NULL, ?)",
+            (*identity, datetime.now(UTC).isoformat()),
+        )
         self.connection.commit()
         return "INSERTED"
+
+    def mark_candle_audit_only(self, candle: Candle, *, reason: str) -> None:
+        """Preserve a candle while excluding it from analytical histories."""
+        source = self.connection.execute(
+            "SELECT source FROM candle_provenance WHERE instrument_id=? AND timeframe=? AND start_at=?",
+            (candle.instrument_id, candle.timeframe, candle.start.isoformat()),
+        ).fetchone()
+        if source and source[0] == "IG_HISTORICAL":
+            return
+        self.connection.execute(
+            "INSERT INTO candle_quality (instrument_id, timeframe, start_at, eligibility, reason, recorded_at) VALUES (?, ?, ?, 'AUDIT_ONLY', ?, ?) "
+            "ON CONFLICT(instrument_id, timeframe, start_at) DO UPDATE SET eligibility='AUDIT_ONLY', reason=excluded.reason, recorded_at=excluded.recorded_at",
+            (candle.instrument_id, candle.timeframe, candle.start.isoformat(), reason, datetime.now(UTC).isoformat()),
+        )
+        self.connection.commit()
+
+    def is_candle_eligible(self, candle: Candle) -> bool:
+        row = self.connection.execute(
+            "SELECT eligibility FROM candle_quality WHERE instrument_id=? AND timeframe=? AND start_at=?",
+            (candle.instrument_id, candle.timeframe, candle.start.isoformat()),
+        ).fetchone()
+        return row is None or row[0] == "ELIGIBLE"
 
     def start_backfill_job(self, job_id: str, instrument_id: str, epic: str, market_name: str, timeframe: str, requested_start: str, requested_end: str) -> None:
         now = datetime.now(UTC).isoformat()
@@ -541,7 +623,7 @@ class Database:
         self.connection.commit()
 
     def history_status(self, instrument_id: str | None = None) -> list[dict]:
-        query = "SELECT c.instrument_id, c.timeframe, p.source, MIN(c.start_at), MAX(c.start_at), COUNT(*), i.market_name, i.epic FROM candles c LEFT JOIN candle_provenance p ON p.instrument_id=c.instrument_id AND p.timeframe=c.timeframe AND p.start_at=c.start_at LEFT JOIN instruments i ON i.instrument_id=c.instrument_id WHERE c.is_closed=1"
+        query = "SELECT c.instrument_id, c.timeframe, p.source, MIN(c.start_at), MAX(c.start_at), COUNT(*), i.market_name, i.epic FROM candles c JOIN candle_quality q ON q.instrument_id=c.instrument_id AND q.timeframe=c.timeframe AND q.start_at=c.start_at AND q.eligibility='ELIGIBLE' LEFT JOIN candle_provenance p ON p.instrument_id=c.instrument_id AND p.timeframe=c.timeframe AND p.start_at=c.start_at LEFT JOIN instruments i ON i.instrument_id=c.instrument_id WHERE c.is_closed=1"
         params: list[object] = []
         if instrument_id:
             query += " AND c.instrument_id=?"
@@ -557,21 +639,21 @@ class Database:
 
     def list_candles(self, instrument_id: str, timeframe: str, *, through: str | None = None, limit: int | None = None) -> list[Candle]:
         query = (
-            "SELECT instrument_id, timeframe, start_at, end_at, epic, open, high, low, close, volume, is_closed, observation_count "
-            "FROM candles WHERE instrument_id = ? AND timeframe = ?"
+            "SELECT c.instrument_id, c.timeframe, c.start_at, c.end_at, c.epic, c.open, c.high, c.low, c.close, c.volume, c.is_closed, c.observation_count "
+            "FROM candles c JOIN candle_quality q ON q.instrument_id=c.instrument_id AND q.timeframe=c.timeframe AND q.start_at=c.start_at AND q.eligibility='ELIGIBLE' WHERE c.instrument_id = ? AND c.timeframe = ?"
         )
         params: list[str] = [instrument_id, timeframe]
         if through is not None:
-            query += " AND start_at <= ?"
+            query += " AND c.start_at <= ?"
             params.append(through)
         if limit is not None:
             if limit <= 0:
                 return []
-            query += " ORDER BY start_at DESC LIMIT ?"
+            query += " ORDER BY c.start_at DESC LIMIT ?"
             params.append(str(limit))
             rows = list(reversed(self.connection.execute(query, params).fetchall()))
         else:
-            query += " ORDER BY start_at"
+            query += " ORDER BY c.start_at"
             rows = self.connection.execute(query, params).fetchall()
         return [
             Candle(row[0], row[4], row[1], datetime.fromisoformat(row[2]), datetime.fromisoformat(row[3]), Decimal(row[5]), Decimal(row[6]), Decimal(row[7]), Decimal(row[8]), Decimal(row[9]) if row[9] is not None else None, bool(row[10]), int(row[11]))
@@ -590,15 +672,15 @@ class Database:
         """Yield indexed candle batches without materializing a timeframe."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        query = "SELECT instrument_id, timeframe, start_at, end_at, epic, open, high, low, close, volume, is_closed, observation_count FROM candles WHERE instrument_id=? AND timeframe=? AND is_closed=1"
+        query = "SELECT c.instrument_id, c.timeframe, c.start_at, c.end_at, c.epic, c.open, c.high, c.low, c.close, c.volume, c.is_closed, c.observation_count FROM candles c JOIN candle_quality q ON q.instrument_id=c.instrument_id AND q.timeframe=c.timeframe AND q.start_at=c.start_at AND q.eligibility='ELIGIBLE' WHERE c.instrument_id=? AND c.timeframe=? AND c.is_closed=1"
         params: list[object] = [instrument_id, timeframe]
         if start_at is not None:
-            query += " AND start_at>=?"
+            query += " AND c.start_at>=?"
             params.append(start_at)
         if end_at is not None:
-            query += " AND start_at<?"
+            query += " AND c.start_at<?"
             params.append(end_at)
-        query += " ORDER BY start_at"
+        query += " ORDER BY c.start_at"
         cursor = self.connection.execute(query, params)
         while True:
             rows = cursor.fetchmany(batch_size)
@@ -788,6 +870,7 @@ class Database:
 
     def save_forward_snapshot(self, snapshot: dict) -> bool:
         """Insert once.  LIVE_FORWARD prediction fields are immutable."""
+        created_at = datetime.now(UTC).isoformat()
         cursor = self.connection.execute(
             """INSERT OR IGNORE INTO forward_snapshots
             (snapshot_id, timestamp, reference_time, market, instrument_id, epic,
@@ -805,14 +888,21 @@ class Database:
              snapshot["reference_price"], snapshot.get("direction"), snapshot.get("up_score"),
              snapshot.get("down_score"), snapshot.get("trend_stage"),
              json.dumps(snapshot.get("reversal_state"), sort_keys=True, separators=(",", ":")),
-             snapshot.get("holding_window"), snapshot["model_version"], datetime.now(UTC).isoformat()),
+             snapshot.get("holding_window"), snapshot["model_version"], created_at),
         )
+        if cursor.rowcount == 1:
+            self.connection.execute(
+                "INSERT OR IGNORE INTO forward_snapshot_status (snapshot_id, eligibility, reason, audited_at) VALUES (?, ?, ?, ?)",
+                (snapshot["snapshot_id"], snapshot.get("eligibility", "ELIGIBLE"), snapshot.get("eligibility_reason"), created_at),
+            )
         self.connection.commit()
         return cursor.rowcount == 1
 
     def pending_forward_snapshots(self, instrument_id: str | None = None) -> list[dict]:
         query = """SELECT s.snapshot_id, s.reference_time, s.reference_price, s.direction
-                   FROM forward_snapshots s JOIN forward_outcomes o ON o.snapshot_id=s.snapshot_id
+                   FROM forward_snapshots s
+                   JOIN forward_snapshot_status v ON v.snapshot_id=s.snapshot_id AND v.eligibility='ELIGIBLE'
+                   JOIN forward_outcomes o ON o.snapshot_id=s.snapshot_id
                    WHERE o.status='PENDING'"""
         params: list[object] = []
         if instrument_id is not None:
@@ -858,7 +948,7 @@ class Database:
         return completed_transitions
 
     def get_forward_state(self, instrument_id: str | None = None) -> dict | None:
-        query = "SELECT * FROM forward_snapshots"
+        query = "SELECT s.* FROM forward_snapshots s JOIN forward_snapshot_status v ON v.snapshot_id=s.snapshot_id AND v.eligibility='ELIGIBLE'"
         params: list[object] = []
         if instrument_id:
             query += " WHERE instrument_id=?"
