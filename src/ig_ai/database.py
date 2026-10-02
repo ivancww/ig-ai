@@ -982,16 +982,7 @@ class Database:
         import hashlib
 
         telemetry = decision.get("telemetry", {})
-        identity = "|".join(
-            str(value)
-            for value in (
-                telemetry.get("instrument"),
-                telemetry.get("timestamp"),
-                telemetry.get("side"),
-                telemetry.get("primary_action_state"),
-                telemetry.get("model_version"),
-            )
-        )
+        identity = json.dumps(telemetry, sort_keys=True, separators=(",", ":"))
         telemetry_id = hashlib.sha256(identity.encode()).hexdigest()
         self.connection.execute(
             """INSERT OR IGNORE INTO decision_telemetry

@@ -159,6 +159,78 @@ def test_i_bearish_bias_can_still_be_do_not_chase():
     assert decision["primary_action_state"] == "DO_NOT_CHASE"
 
 
+def test_long_entry_uses_resistance_rejection_in_bearish_direction():
+    state = market_state(
+        rejection={
+            "support": {"state": "STABLE_REJECTION"},
+            "resistance": {"state": "STRENGTHENING_REJECTION"},
+        },
+        technical={
+            "current_price": 100,
+            "atr": 100,
+            "support": 0,
+            "resistance": 130,
+            "momentum_state": "strengthening",
+        },
+    )
+    result = TradingDecisionEngine().analyze(state)
+    assert result["market_bias"] == "BEARISH"
+    assert result["entry_quality"]["LONG"]["action_qualifier"] == "DO_NOT_CHASE"
+
+
+def test_short_entry_uses_support_rejection_in_bullish_direction():
+    state = market_state(
+        direction={"direction": "UP", "up_score": 75, "down_score": 10},
+        rejection={
+            "support": {"state": "STRENGTHENING_REJECTION"},
+            "resistance": {"state": "STABLE_REJECTION"},
+        },
+        technical={
+            "current_price": 100,
+            "atr": 100,
+            "support": 70,
+            "resistance": 250,
+            "momentum_state": "strengthening",
+        },
+    )
+    result = TradingDecisionEngine().analyze(state)
+    assert result["market_bias"] == "BULLISH"
+    assert result["entry_quality"]["SHORT"]["action_qualifier"] == "DO_NOT_CHASE"
+
+
+def test_active_short_uses_support_rejection_during_bullish_transition():
+    state = market_state(
+        direction={"direction": "UP", "up_score": 75, "down_score": 10},
+        position=position_context(side="SHORT", entry=180, current_price=100, mfe=90, mae=5),
+        rejection={
+            "support": {"state": "STRENGTHENING_REJECTION"},
+            "resistance": {"state": "STABLE_REJECTION"},
+        },
+        technical={"current_price": 100, "atr": 100, "support": 200, "resistance": 250},
+    )
+    result = ProfitProtectionEngine().analyze(
+        state, {"invalidation_state": "ORIGINAL_STRUCTURE_VALID", "invalidation_evidence": []}
+    )
+    assert result["state"] == "PROFIT_PROTECTION"
+    assert "OPPOSING_REJECTION" in result["evidence"]
+
+
+def test_active_long_uses_resistance_rejection_during_bearish_transition():
+    state = market_state(
+        position=position_context(side="LONG", entry=20, current_price=100, mfe=90, mae=5),
+        rejection={
+            "support": {"state": "STABLE_REJECTION"},
+            "resistance": {"state": "STRENGTHENING_REJECTION"},
+        },
+        technical={"current_price": 100, "atr": 100, "support": 0, "resistance": 200},
+    )
+    result = ProfitProtectionEngine().analyze(
+        state, {"invalidation_state": "ORIGINAL_STRUCTURE_VALID", "invalidation_evidence": []}
+    )
+    assert result["state"] == "PROFIT_PROTECTION"
+    assert "OPPOSING_REJECTION" in result["evidence"]
+
+
 def test_j_structure_invalidated_does_not_confirm_long_or_keep_short_valid():
     state = market_state(
         structure={
@@ -228,4 +300,25 @@ def test_decision_telemetry_is_append_safe_and_keeps_future_expectancy_fields(tm
         "time_of_day",
         "event_day",
     } <= rows[0].keys()
+    database.close()
+
+
+def test_decision_telemetry_appends_materially_changed_state_without_overwriting(tmp_path):
+    database = Database(tmp_path / "decision-evolution.sqlite3")
+    first_decision = TradingDecisionEngine().analyze(
+        market_state(position=position_context(side="SHORT", entry=250, current_price=130, mfe=150))
+    )
+    second_decision = TradingDecisionEngine().analyze(
+        market_state(position=position_context(side="SHORT", entry=250, current_price=170, mfe=170))
+    )
+    first_id = database.save_decision_telemetry(first_decision)
+    second_id = database.save_decision_telemetry(second_decision)
+    assert first_id != second_id
+    rows = database.get_decision_telemetry("ig:NDX")
+    assert len(rows) == 2
+    by_mfe = {row["mfe"]: row for row in rows}
+    assert by_mfe[150]["give_back_points"] == 30.0
+    assert by_mfe[170]["give_back_points"] == 90.0
+    assert all(row["model_version"] == "trading_decision_v1" for row in rows)
+    assert all(row["source"] == "IG_LIVE" for row in rows)
     database.close()

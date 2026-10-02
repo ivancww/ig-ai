@@ -172,6 +172,12 @@ def _last_price(point_list: list[dict[str, Any]]) -> float | None:
     return None if value is None else float(value)
 
 
+def _side_rejection(raw: dict[str, Any], side: str) -> dict[str, Any]:
+    """Return only the rejection evidence relevant to the evaluated side."""
+    key = "resistance" if side.upper() == "LONG" else "support"
+    return raw.get("rejection", {}).get(key, {})
+
+
 class RejectionEngine:
     def __init__(self, config: DecisionConfig | None = None):
         self.config = config or DecisionConfig()
@@ -415,7 +421,7 @@ class EntryQualityEngine:
             and atr
             and obstacle_distance <= atr * self.config.obstacle_atr_ratio.value
         )
-        rejection = raw.get("rejection", {}).get("state")
+        rejection = _side_rejection(raw, side).get("state")
         weakening = technical.get("momentum_state") == "weakening"
         if nearby and (weakening or rejection in {"STRENGTHENING_REJECTION", "POSSIBLE_ABSORPTION"}):
             qualifier = "DO_NOT_CHASE"
@@ -535,7 +541,7 @@ class ProfitProtectionEngine:
         give_back_ratio = position.get("give_back_ratio")
         obstacle = self._obstacle_distance(raw, position.get("side"))
         weakening = raw.get("technical", {}).get("momentum_state") == "weakening"
-        rejection = raw.get("rejection", {}).get("state")
+        rejection = _side_rejection(raw, position.get("side", "")).get("state")
         meaningful = profit > 0 and (not atr or profit >= atr * self.config.protection_atr_profit.value)
         nearby = obstacle is not None and (not atr or obstacle <= atr * self.config.obstacle_atr_ratio.value)
         give_back_warning = give_back_ratio is not None and give_back_ratio >= self.config.give_back_warning_ratio.value
@@ -753,6 +759,8 @@ def decision_telemetry(raw: dict[str, Any], decision: dict[str, Any]) -> dict[st
         "nearest_support_distance": technical.get("support_distance"),
         "nearest_resistance_distance": technical.get("resistance_distance"),
         "rejection_state": raw.get("rejection", {}).get("state"),
+        "support_rejection_state": raw.get("rejection", {}).get("support", {}).get("state"),
+        "resistance_rejection_state": raw.get("rejection", {}).get("resistance", {}).get("state"),
         "gap_state": technical.get("gap_state"),
         "event_state": raw.get("event", {}).get("state"),
         "direction_score": raw.get("direction", {}).get("up_score") if side == "LONG" else raw.get("direction", {}).get("down_score"),
