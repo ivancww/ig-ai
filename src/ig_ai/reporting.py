@@ -9,11 +9,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
-STATE_DIR = PROJECT_DIR / ".igai"
+DEFAULT_STATE_DIR = PROJECT_DIR / ".igai"
+STATE_DIR = DEFAULT_STATE_DIR
 CODEX_REPORT = STATE_DIR / "codex-report.txt"
 TERMINAL_REPORT = STATE_DIR / "terminal-report.txt"
 RUNTIME_RECORD = STATE_DIR / "stream-runtime.json"
 UNIFIED_REPORT = PROJECT_DIR / "igai-report.txt"
+
+
+def _state_file(configured: Path, name: str) -> Path:
+    """Follow a redirected STATE_DIR unless a file path was redirected explicitly."""
+    return STATE_DIR / name if configured.parent == DEFAULT_STATE_DIR else configured
 
 
 def _safe_text(value: object, secrets: tuple[str, ...] = ()) -> str:
@@ -37,7 +43,10 @@ def _safe_text(value: object, secrets: tuple[str, ...] = ()) -> str:
 
 
 def _write(path: Path, text: str) -> None:
-    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Tests and embedded callers may redirect an individual report path.  The
+    # write target, rather than the module's default state directory, owns the
+    # parent-directory requirement.
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     path.write_text(text.rstrip() + "\n", encoding="utf-8")
 
 
@@ -88,32 +97,36 @@ def update_terminal_report(
         )
     if output.strip():
         body += "\n\nSafe command output:\n" + _safe_text(output, secrets)
-    _write(TERMINAL_REPORT, body)
+    _write(_state_file(TERMINAL_REPORT, "terminal-report.txt"), body)
     render_report()
 
 
 def update_codex_report(text: str) -> None:
-    _write(CODEX_REPORT, _safe_text(text))
+    _write(_state_file(CODEX_REPORT, "codex-report.txt"), _safe_text(text))
 
 
 def write_runtime_record(record: dict) -> None:
     """Persist a safe lifecycle marker; RUNNING remains if the VM dies externally."""
     STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    RUNTIME_RECORD.write_text(json.dumps(record, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    _state_file(RUNTIME_RECORD, "stream-runtime.json").write_text(
+        json.dumps(record, sort_keys=True, default=str) + "\n", encoding="utf-8"
+    )
 
 
 def render_report() -> str:
     secrets = tuple(
         os.environ.get(name, "") for name in ("IG_API_KEY", "IG_USERNAME", "IG_PASSWORD", "CST", "X-SECURITY-TOKEN")
     )
+    codex_report = _state_file(CODEX_REPORT, "codex-report.txt")
+    terminal_report = _state_file(TERMINAL_REPORT, "terminal-report.txt")
     codex = (
-        _safe_text(CODEX_REPORT.read_text(encoding="utf-8"), secrets).strip()
-        if CODEX_REPORT.exists()
+        _safe_text(codex_report.read_text(encoding="utf-8"), secrets).strip()
+        if codex_report.exists()
         else "Not available."
     )
     terminal = (
-        _safe_text(TERMINAL_REPORT.read_text(encoding="utf-8"), secrets).strip()
-        if TERMINAL_REPORT.exists()
+        _safe_text(terminal_report.read_text(encoding="utf-8"), secrets).strip()
+        if terminal_report.exists()
         else "Not available."
     )
     report = (

@@ -298,6 +298,20 @@ CREATE TABLE IF NOT EXISTS forward_outcomes (
     reversal_timing REAL, updated_at TEXT NOT NULL,
     PRIMARY KEY (snapshot_id, horizon), FOREIGN KEY (snapshot_id) REFERENCES forward_snapshots(snapshot_id)
 );
+CREATE TABLE IF NOT EXISTS decision_telemetry (
+    telemetry_id TEXT PRIMARY KEY,
+    reference_time TEXT NOT NULL,
+    instrument_id TEXT NOT NULL,
+    side TEXT,
+    regime TEXT,
+    primary_action_state TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    source_identity TEXT,
+    telemetry_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS decision_telemetry_lookup
+ON decision_telemetry (instrument_id, reference_time, primary_action_state);
 """
 
 
@@ -962,6 +976,51 @@ class Database:
         for key in ("technical_state_json", "pattern_state_json", "direction_state_json", "reversal_state_json"):
             result[key.removesuffix("_json")] = json.loads(result[key])
         return result
+
+    def save_decision_telemetry(self, decision: dict) -> str:
+        """Persist an append-safe decision snapshot without changing market history."""
+        import hashlib
+
+        telemetry = decision.get("telemetry", {})
+        identity = "|".join(
+            str(value)
+            for value in (
+                telemetry.get("instrument"),
+                telemetry.get("timestamp"),
+                telemetry.get("side"),
+                telemetry.get("primary_action_state"),
+                telemetry.get("model_version"),
+            )
+        )
+        telemetry_id = hashlib.sha256(identity.encode()).hexdigest()
+        self.connection.execute(
+            """INSERT OR IGNORE INTO decision_telemetry
+            (telemetry_id, reference_time, instrument_id, side, regime,
+             primary_action_state, model_version, source_identity, telemetry_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                telemetry_id,
+                telemetry.get("timestamp") or decision.get("reference_time"),
+                telemetry.get("instrument") or decision.get("instrument"),
+                telemetry.get("side"),
+                telemetry.get("1H_regime"),
+                telemetry.get("primary_action_state") or decision["primary_action_state"],
+                telemetry.get("model_version") or decision.get("schema_version"),
+                telemetry.get("provenance") or decision.get("source"),
+                json.dumps(telemetry, sort_keys=True, separators=(",", ":")),
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        self.connection.commit()
+        return telemetry_id
+
+    def get_decision_telemetry(self, instrument_id: str, *, limit: int = 20) -> list[dict]:
+        rows = self.connection.execute(
+            "SELECT telemetry_json FROM decision_telemetry WHERE instrument_id=? "
+            "ORDER BY reference_time DESC LIMIT ?",
+            (instrument_id, max(1, limit)),
+        ).fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     def research_source_identity(self, instrument_id: str) -> str:
         row = self.connection.execute("SELECT epic, market_name, instrument_type, metadata_json FROM instruments WHERE instrument_id=?", (instrument_id,)).fetchone()
