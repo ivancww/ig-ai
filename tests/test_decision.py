@@ -289,6 +289,8 @@ def test_decision_telemetry_is_append_safe_and_keeps_future_expectancy_fields(tm
     assert first == second
     assert len(rows) == 1
     assert {
+        "current_price",
+        "unrealized_points",
         "mfe",
         "mae",
         "give_back_points",
@@ -300,6 +302,26 @@ def test_decision_telemetry_is_append_safe_and_keeps_future_expectancy_fields(tm
         "time_of_day",
         "event_day",
     } <= rows[0].keys()
+    database.close()
+
+
+def test_decision_telemetry_appends_changed_current_price_with_same_mfe(tmp_path):
+    database = Database(tmp_path / "decision-price-evolution.sqlite3")
+    first_decision = TradingDecisionEngine().analyze(
+        market_state(position=position_context(side="SHORT", entry=250, current_price=100, mfe=150))
+    )
+    second_decision = TradingDecisionEngine().analyze(
+        market_state(position=position_context(side="SHORT", entry=250, current_price=120, mfe=150))
+    )
+    first_id = database.save_decision_telemetry(first_decision)
+    second_id = database.save_decision_telemetry(second_decision)
+    assert first_id != second_id
+    rows = database.get_decision_telemetry("ig:NDX")
+    assert len(rows) == 2
+    by_price = {row["current_price"]: row for row in rows}
+    assert by_price[100]["unrealized_points"] == 150
+    assert by_price[120]["unrealized_points"] == 130
+    assert by_price[100]["mfe"] == by_price[120]["mfe"] == 150
     database.close()
 
 
@@ -322,3 +344,45 @@ def test_decision_telemetry_appends_materially_changed_state_without_overwriting
     assert all(row["model_version"] == "trading_decision_v1" for row in rows)
     assert all(row["source"] == "IG_LIVE" for row in rows)
     database.close()
+
+
+def test_pre_entry_telemetry_selects_short_score_for_bearish_bias():
+    decision = TradingDecisionEngine().analyze(market_state())
+    telemetry = decision["telemetry"]
+    assert telemetry["evaluated_side"] == "SHORT"
+    assert telemetry["entry_quality_score"] == decision["entry_quality"]["SHORT"]["entry_quality_score"]
+    assert telemetry["long_entry_quality_score"] == decision["entry_quality"]["LONG"]["entry_quality_score"]
+    assert telemetry["short_entry_quality_score"] == decision["entry_quality"]["SHORT"]["entry_quality_score"]
+
+
+def test_pre_entry_telemetry_selects_long_score_for_bullish_bias():
+    decision = TradingDecisionEngine().analyze(
+        market_state(direction={"direction": "UP", "up_score": 75, "down_score": 10})
+    )
+    telemetry = decision["telemetry"]
+    assert telemetry["evaluated_side"] == "LONG"
+    assert telemetry["entry_quality_score"] == decision["entry_quality"]["LONG"]["entry_quality_score"]
+
+
+def test_transition_and_neutral_pre_entry_telemetry_have_no_selected_score():
+    transition = market_state(
+        structure={
+            "1H": {
+                "direction": "RANGE",
+                "prior_direction": "DOWN",
+                "failed_breakdown": True,
+                "previous_lh_broken": True,
+                "reclaim": True,
+                "opposite_trend_confirmed": False,
+            },
+            "15M": {"direction": "UP_STRUCTURE"},
+        }
+    )
+    neutral = market_state(
+        structure={"1H": {"direction": "RANGE"}, "15M": {}},
+        direction={},
+    )
+    for decision in (TradingDecisionEngine().analyze(transition), TradingDecisionEngine().analyze(neutral)):
+        assert decision["market_bias"] in {"TRANSITION", "NEUTRAL"}
+        assert decision["telemetry"]["evaluated_side"] is None
+        assert decision["telemetry"]["entry_quality_score"] is None

@@ -738,12 +738,17 @@ def decision_telemetry(raw: dict[str, Any], decision: dict[str, Any]) -> dict[st
     technical = raw.get("technical", {})
     position = raw.get("position", {})
     structures = raw.get("structure", {})
-    side = position.get("side")
-    selected = decision["entry_quality"].get(side or "LONG", {})
+    position_side = position.get("side")
+    evaluated_side = position_side if position_side in {"LONG", "SHORT"} else {
+        "BULLISH": "LONG",
+        "BEARISH": "SHORT",
+    }.get(decision.get("market_bias"))
+    selected = decision["entry_quality"].get(evaluated_side, {}) if evaluated_side else {}
     return {
         "timestamp": raw.get("reference_time"),
         "instrument": raw.get("instrument"),
-        "side": side,
+        "side": position_side,
+        "evaluated_side": evaluated_side,
         "entry": position.get("entry"),
         "exit": position.get("exit"),
         "1H_regime": decision["regime"]["regime"],
@@ -763,10 +768,14 @@ def decision_telemetry(raw: dict[str, Any], decision: dict[str, Any]) -> dict[st
         "resistance_rejection_state": raw.get("rejection", {}).get("resistance", {}).get("state"),
         "gap_state": technical.get("gap_state"),
         "event_state": raw.get("event", {}).get("state"),
-        "direction_score": raw.get("direction", {}).get("up_score") if side == "LONG" else raw.get("direction", {}).get("down_score"),
+        "direction_score": raw.get("direction", {}).get("up_score") if evaluated_side == "LONG" else raw.get("direction", {}).get("down_score") if evaluated_side == "SHORT" else None,
         "entry_quality_score": selected.get("entry_quality_score"),
+        "long_entry_quality_score": decision["entry_quality"].get("LONG", {}).get("entry_quality_score"),
+        "short_entry_quality_score": decision["entry_quality"].get("SHORT", {}).get("entry_quality_score"),
         "big_wave_score": decision["big_wave"].get("big_wave_score"),
         "primary_action_state": decision["primary_action_state"],
+        "current_price": position.get("current_price"),
+        "unrealized_points": position.get("unrealized_points"),
         "mfe": position.get("mfe"),
         "mae": position.get("mae"),
         "realized_points": position.get("realized_points"),
