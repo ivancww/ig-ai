@@ -10,6 +10,12 @@ from pathlib import Path
 
 from .config import Settings
 from .database import Database
+from .decision import (
+    StaticEventContextProvider,
+    TradingDecisionEngine,
+    normalized_state_from_database,
+    position_context,
+)
 from .discovery import discover_market_groups, select_stream_instruments
 from .exceptions import IGHTTPError, MalformedResponseError
 from .history import SUPPORTED_TIMEFRAMES, BackfillService, HistoricalIGClient, ReplayService
@@ -141,6 +147,22 @@ def main() -> int:
     monitor_parser.add_argument("--verbose", action="store_true")
     live_state_parser = commands.add_parser("live-state", help="show the latest persisted LIVE_FORWARD state")
     live_state_parser.add_argument("--instrument", default=None)
+    decision_parser = commands.add_parser(
+        "decision-state", help="show the read-only integrated CFD decision state"
+    )
+    decision_parser.add_argument("--instrument", default=None)
+    decision_parser.add_argument("--side", choices=("LONG", "SHORT"), default=None)
+    decision_parser.add_argument("--entry", type=float, default=None)
+    decision_parser.add_argument("--current", type=float, default=None)
+    decision_parser.add_argument("--mfe", type=float, default=None)
+    decision_parser.add_argument("--mae", type=float, default=None)
+    decision_parser.add_argument("--holding-minutes", type=float, default=None)
+    decision_parser.add_argument(
+        "--event-state",
+        choices=("UNAVAILABLE", "NONE_CONFIRMED", "ACTIVE"),
+        default="UNAVAILABLE",
+    )
+    decision_parser.add_argument("--event-source", default=None)
     smoke_parser = commands.add_parser("stream-smoke")
     smoke_parser.add_argument("--duration", type=float, default=60.0)
     args = parser.parse_args()
@@ -305,6 +327,102 @@ def main() -> int:
                 print(f"Data freshness: {last or 'UNKNOWN'}")
                 print(f"Source identity: {state['source_identity']}")
                 print("Technical scores only — not calibrated probabilities or trading instructions.")
+            finally:
+                database.close()
+            return 0
+        if args.command == "decision-state":
+            settings = Settings.from_env(require_credentials=False)
+            database = Database(settings.database_path)
+            try:
+                instruments = database.list_instruments()
+                selected = args.instrument or (instruments[0][0] if instruments else None)
+                if selected is None:
+                    print("No instruments or persisted analysis available.")
+                    return 0
+                if args.event_state == "ACTIVE" and not args.event_source:
+                    parser.error("--event-source is required for an ACTIVE verified event")
+                features = database.get_technical_features(selected, "1H")
+                persisted_price = features[0].get("candle", {}).get("close") if features else None
+                current_price = args.current if args.current is not None else persisted_price
+                manual_position = position_context(
+                    side=args.side,
+                    entry=args.entry,
+                    current_price=current_price,
+                    mfe=args.mfe,
+                    mae=args.mae,
+                    holding_duration=args.holding_minutes,
+                )
+                event_provider = StaticEventContextProvider(
+                    args.event_state,
+                    source=args.event_source,
+                    reason=(
+                        "verified event context active; technical confidence reduced"
+                        if args.event_state == "ACTIVE"
+                        else "no verified active event"
+                        if args.event_state == "NONE_CONFIRMED"
+                        else "no verified event provider configured"
+                    ),
+                    verified=args.event_state == "ACTIVE" and bool(args.event_source),
+                )
+                normalized = normalized_state_from_database(
+                    database,
+                    selected,
+                    event_provider=event_provider,
+                    position=manual_position,
+                )
+                if args.current is not None:
+                    normalized.technical["current_price"] = args.current
+                    support = normalized.technical.get("support")
+                    resistance = normalized.technical.get("resistance")
+                    normalized.technical["support_distance"] = (
+                        None if support is None else args.current - support
+                    )
+                    normalized.technical["resistance_distance"] = (
+                        None if resistance is None else resistance - args.current
+                    )
+                decision = TradingDecisionEngine().analyze(normalized)
+                database.save_decision_telemetry(decision)
+                chosen_side = args.side or (
+                    "LONG" if decision["market_bias"] == "BULLISH" else "SHORT"
+                )
+                entry = decision["entry_quality"][chosen_side]
+                position = decision["position"]
+                technical = normalized.technical
+                print(f"Instrument: {decision['instrument']} ({decision.get('market') or 'UNKNOWN'})")
+                print(f"Reference time: {decision['reference_time']}")
+                print(f"MARKET BIAS: {decision['market_bias']}")
+                print(f"REGIME: {decision['regime']['regime']}")
+                print(f"1H STRUCTURE: {normalized.timeframes['1H']['direction']}")
+                print(f"15M STRUCTURE: {normalized.timeframes['15M']['direction']}")
+                print(f"ENTRY QUALITY ({chosen_side}): {entry['entry_quality_score']} / 100")
+                print(f"ENTRY QUALIFIER: {entry['action_qualifier']}")
+                print(f"BIG-WAVE: {decision['big_wave']['qualification_state']}")
+                if position.get("state") == "ACTIVE":
+                    print("POSITION: ACTIVE")
+                    print(f"Entry: {position['entry']}")
+                    print(f"Current: {position['current_price']}")
+                    print(f"P/L: {position['unrealized_points']} points")
+                    print(f"MFE / MAE: {position['mfe']} / {position['mae']}")
+                    print(
+                        f"Give-back: {position['give_back_points']} points "
+                        f"({position['give_back_ratio']})"
+                    )
+                else:
+                    print("POSITION: NONE")
+                print(f"Nearest Support: {technical.get('support')} ({technical.get('support_distance')} pts)")
+                print(f"Nearest Resistance: {technical.get('resistance')} ({technical.get('resistance_distance')} pts)")
+                print(f"VWAP: {decision['vwap']['state']}")
+                print(f"PRIMARY ACTION STATE: {decision['primary_action_state']}")
+                print("Supporting evidence:")
+                for item in entry["supporting_evidence"]:
+                    print(f"  - {item}")
+                print("Opposing evidence:")
+                for item in entry["opposing_evidence"]:
+                    print(f"  - {item}")
+                print(f"Confirmation: {entry['confirmation_trigger']}")
+                print(f"Invalidation: {entry['invalidation_trigger']}")
+                print("Scores are provisional technical evidence scores, not probabilities.")
+                print("Read-only decision support; no order or position mutation performed.")
             finally:
                 database.close()
             return 0
