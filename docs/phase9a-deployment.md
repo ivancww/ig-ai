@@ -16,7 +16,7 @@ Use `journalctl -u ig-ai -f` for bounded host-managed logs. The process handles 
 
 `ig-ai service-status` reads only persisted state and safely prints `UNKNOWN` or `NOT AVAILABLE` when evidence is absent. `ig-ai db-init` can initialize a new database without credentials. `ig-ai service` discovers provider-verified weekday cash instruments, starts the existing `PersistedStream`, and remains read-only.
 
-`IGAI_MONITORING_MODE` supports `24_7`, `MARKET_HOURS`, and `CUSTOM`. `24_7` is the safe default. `MARKET_HOURS` has no fabricated official session rules and therefore reports `UNKNOWN`/does not analyze until verified rules are supplied. Custom windows use `DAYS HH:MM-HH:MM` in the configured `IGAI_TIMEZONE`, for example `1,2,3,4,5 09:00-17:00`; the current service template uses no custom windows, so custom scheduling is available through the internal model and future configuration surface.
+`IGAI_MONITORING_MODE` supports `24_7`, `MARKET_HOURS`, and `CUSTOM`. `24_7` is the safe default. `MARKET_HOURS` has no fabricated official session rules and therefore reports `UNKNOWN`/does not analyze until verified rules are supplied. For `CUSTOM`, set required `IGAI_CUSTOM_WINDOWS` as semicolon-separated `DAYS HH:MM-HH:MM` windows, for example `1,2,3,4,5 09:00-17:00;6 10:00-12:00`. ISO weekdays are `1=Monday` through `7=Sunday`; `5 20:00-05:00` includes Friday evening through Saturday 05:00. Windows are evaluated in `IGAI_TIMEZONE`, validated at startup, persisted in `runtime_schedule`, and displayed by `service-status`.
 
 ## Readiness boundaries
 

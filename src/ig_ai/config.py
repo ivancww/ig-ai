@@ -6,6 +6,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .exceptions import ConfigurationError
+from .runtime_service import parse_custom_windows
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class Settings:
     monitoring_mode: str = "24_7"
     runtime_timezone: str = "UTC"
     stale_data_seconds: float = 900.0
+    custom_windows: tuple[str, ...] = ()
 
     @classmethod
     def from_env(
@@ -61,6 +63,13 @@ class Settings:
         monitoring_mode = env.get("IGAI_MONITORING_MODE", "24_7").strip().upper()
         if monitoring_mode not in {"24_7", "MARKET_HOURS", "CUSTOM"}:
             raise ConfigurationError("IGAI_MONITORING_MODE must be 24_7, MARKET_HOURS, or CUSTOM")
+        raw_custom_windows = env.get("IGAI_CUSTOM_WINDOWS", "").strip()
+        try:
+            custom_windows = parse_custom_windows(raw_custom_windows) if raw_custom_windows else ()
+        except ValueError as exc:
+            raise ConfigurationError(str(exc)) from exc
+        if monitoring_mode == "CUSTOM" and not custom_windows:
+            raise ConfigurationError("IGAI_CUSTOM_WINDOWS is required when IGAI_MONITORING_MODE=CUSTOM")
         if timeout <= 0 or discovery_detail_budget <= 0 or reconnect < 0 or heartbeat <= 0 or stale_seconds <= 0:
             raise ConfigurationError(
                 "IG timeout must be positive, discovery detail budget must be positive, "
@@ -84,4 +93,5 @@ class Settings:
             monitoring_mode=monitoring_mode,
             runtime_timezone=runtime_timezone,
             stale_data_seconds=stale_seconds,
+            custom_windows=custom_windows,
         )

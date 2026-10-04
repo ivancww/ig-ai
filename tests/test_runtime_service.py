@@ -1,6 +1,10 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
+from ig_ai.config import Settings
 from ig_ai.database import Database
+from ig_ai.exceptions import ConfigurationError
 from ig_ai.runtime_service import RuntimeService, Schedule, format_service_status
 
 
@@ -23,10 +27,12 @@ def test_restart_restores_runtime_market_state_and_status_is_safe(tmp_path):
     path = tmp_path / "runtime.sqlite3"
     first = Database(path)
     first.save_runtime_market_state("EPIC", {"instrument_id": "EPIC", "monitoring_state": "MONITORING"})
+    first.save_runtime_schedule("EPIC", Schedule("CUSTOM", ("5 20:00-05:00",), "UTC").as_dict())
     first.close()
     reopened = Database(path)
-    text = format_service_status({"service": {}, "markets": reopened.list_runtime_market_states()})
+    text = format_service_status({"service": {}, "markets": reopened.list_runtime_market_states(), "schedules": reopened.list_runtime_schedules()})
     assert "EPIC:" in text
+    assert "CUSTOM" in text and "5 20:00-05:00" in text
     assert "Last Decision: NOT AVAILABLE" in text
     reopened.close()
 
@@ -39,6 +45,27 @@ def test_schedule_modes_and_unknown_market_hours():
     assert custom.is_active(monday) is True
     assert custom.is_active(sunday) is False
     assert Schedule("MARKET_HOURS").is_active(monday) is None
+
+
+def test_custom_schedule_overnight_weekday_semantics_and_timezone_conversion():
+    overnight = Schedule("CUSTOM", ("5 20:00-05:00",), "UTC")
+    assert overnight.is_active(datetime(2026, 10, 9, 21, tzinfo=UTC)) is True  # Friday
+    assert overnight.is_active(datetime(2026, 10, 10, 1, tzinfo=UTC)) is True  # Saturday
+    assert overnight.is_active(datetime(2026, 10, 10, 5, tzinfo=UTC)) is False
+    normal = Schedule("CUSTOM", ("1,3 09:00-17:00",), "UTC")
+    assert normal.is_active(datetime(2026, 10, 5, 16, tzinfo=UTC)) is True
+    assert normal.is_active(datetime(2026, 10, 6, 10, tzinfo=UTC)) is False
+    hong_kong = Schedule("CUSTOM", ("1 09:00-10:00",), "Asia/Hong_Kong")
+    assert hong_kong.is_active(datetime(2026, 10, 5, 1, tzinfo=UTC)) is True
+
+
+def test_custom_windows_configuration_is_validated_and_external():
+    base = {"IG_API_KEY": "key", "IG_USERNAME": "user", "IG_PASSWORD": "pass", "IGAI_MONITORING_MODE": "CUSTOM"}
+    settings = Settings.from_env({**base, "IGAI_CUSTOM_WINDOWS": "1,2,3,4,5 20:00-05:00;6 10:00-12:00"})
+    assert settings.custom_windows == ("1,2,3,4,5 20:00-05:00", "6 10:00-12:00")
+    for value in ("", "1,8 20:00-05:00", "1 25:00-05:00", "1 20:00-05:00;"):
+        with pytest.raises(ConfigurationError):
+            Settings.from_env({**base, "IGAI_CUSTOM_WINDOWS": value})
 
 
 def test_market_stale_and_scheduled_off_are_distinct(tmp_path):

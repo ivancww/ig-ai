@@ -20,6 +20,17 @@ MARKET_STATES = {"MONITORING", "MARKET_CLOSED", "SCHEDULED_OFF", "STALE_DATA", "
 SCHEDULE_MODES = {"24_7", "MARKET_HOURS", "CUSTOM"}
 
 
+def parse_custom_windows(raw: str) -> tuple[str, ...]:
+    """Parse the external schedule contract: semicolon-separated windows."""
+    parts = raw.split(";")
+    windows = tuple(part.strip() for part in parts)
+    if not windows or any(not window for window in windows):
+        raise ValueError("IGAI_CUSTOM_WINDOWS must contain one or more ';'-separated windows")
+    for window in windows:
+        _parse_window(window)
+    return windows
+
+
 @dataclass(frozen=True)
 class Schedule:
     mode: str = "24_7"
@@ -29,6 +40,8 @@ class Schedule:
     def __post_init__(self) -> None:
         if self.mode not in SCHEDULE_MODES:
             raise ValueError(f"unsupported monitoring mode: {self.mode}")
+        if self.mode == "CUSTOM" and not self.windows:
+            raise ValueError("CUSTOM schedules require at least one window")
         try:
             ZoneInfo(self.timezone)
         except ZoneInfoNotFoundError as exc:
@@ -63,10 +76,16 @@ def _parse_window(window: str) -> tuple[set[int], clock_time, clock_time]:
 
 def _window_active(window: str, local: datetime) -> bool:
     weekdays, start, end = _parse_window(window)
-    if local.isoweekday() not in weekdays:
-        return False
     current = local.timetz().replace(tzinfo=None)
-    return start <= current < end if start <= end else current >= start or current < end
+    weekday = local.isoweekday()
+    if start <= end:
+        return weekday in weekdays and start <= current < end
+    # The after-midnight portion belongs to the session that started on the
+    # prior configured weekday (Friday 20:00-05:00 includes Saturday 01:00).
+    previous_weekday = 7 if weekday == 1 else weekday - 1
+    return (weekday in weekdays and current >= start) or (
+        previous_weekday in weekdays and current < end
+    )
 
 
 class RuntimeService:
@@ -154,6 +173,7 @@ class RuntimeService:
 
 def format_service_status(read_model: dict) -> str:
     service = read_model.get("service", {})
+    schedules = {item.get("instrument_id"): item for item in read_model.get("schedules", [])}
     started = service.get("service_started_at")
     uptime = "NOT AVAILABLE"
     if started:
@@ -163,7 +183,11 @@ def format_service_status(read_model: dict) -> str:
             pass
     lines = [f"Service: {service.get('status', 'UNKNOWN')}", f"Uptime: {uptime}", f"IG Connection: {service.get('ig_connection', 'UNKNOWN')}", f"Last Heartbeat: {service.get('last_heartbeat_at', 'NOT AVAILABLE')}", f"Last Market Data: {service.get('last_market_data_at', 'NOT AVAILABLE')}"]
     for market in read_model.get("markets", []):
-        lines.extend(["", f"{market.get('instrument_id', 'UNKNOWN')}:", f"Monitoring State: {market.get('monitoring_state', 'UNKNOWN')}", f"Last Tick: {market.get('last_tick') or 'NOT AVAILABLE'}", f"Last 15M: {market.get('last_closed_15m_at') or 'NOT AVAILABLE'}", f"Last 1H: {market.get('last_closed_1h_at') or 'NOT AVAILABLE'}", f"Last Decision: {market.get('last_decision_at') or 'NOT AVAILABLE'}", f"Last Alert: {market.get('last_alert_at') or 'NOT AVAILABLE'}"])
+        schedule = schedules.get(market.get("instrument_id"), {})
+        schedule_text = "NOT AVAILABLE"
+        if schedule:
+            schedule_text = f"{schedule.get('mode', 'UNKNOWN')} {schedule.get('windows', [])} ({schedule.get('timezone', 'UNKNOWN')})"
+        lines.extend(["", f"{market.get('instrument_id', 'UNKNOWN')}:", f"Schedule: {schedule_text}", f"Monitoring State: {market.get('monitoring_state', 'UNKNOWN')}", f"Last Tick: {market.get('last_tick') or 'NOT AVAILABLE'}", f"Last 15M: {market.get('last_closed_15m_at') or 'NOT AVAILABLE'}", f"Last 1H: {market.get('last_closed_1h_at') or 'NOT AVAILABLE'}", f"Last Decision: {market.get('last_decision_at') or 'NOT AVAILABLE'}", f"Last Alert: {market.get('last_alert_at') or 'NOT AVAILABLE'}"])
     return "\n".join(lines)
 
 
@@ -197,8 +221,8 @@ def run_live_service(settings, markets: str = "US Tech 100,Japan 225,Hong Kong H
     instruments = {candidate.epic: Instrument(candidate.epic, candidate.epic, candidate.market_name, candidate.instrument_type, candidate.market_status, candidate.metadata) for candidate in selected}
     for instrument in instruments.values():
         database.save_instrument_model(instrument)
-        database.save_runtime_schedule(instrument.instrument_id, Schedule(settings.monitoring_mode, (), settings.runtime_timezone).as_dict())
-    schedules = {instrument_id: Schedule(settings.monitoring_mode, (), settings.runtime_timezone) for instrument_id in instruments}
+        database.save_runtime_schedule(instrument.instrument_id, Schedule(settings.monitoring_mode, settings.custom_windows, settings.runtime_timezone).as_dict())
+    schedules = {instrument_id: Schedule(settings.monitoring_mode, settings.custom_windows, settings.runtime_timezone) for instrument_id in instruments}
     stream = IGStreamService(session.lightstreamer_endpoint, session.account_id, lightstreamer_password(session.cst, session.security_token), OfficialLightstreamerTransport(), reconnect_seconds=settings.stream_reconnect_seconds)
     for instrument in instruments.values():
         stream.add_subscription(Subscription(instrument.instrument_id, f"PRICE:{session.account_id}:{instrument.epic}"))
