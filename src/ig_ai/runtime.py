@@ -48,6 +48,8 @@ class PersistedStream:
     instruments: dict[str, Instrument]
     market_timezone: str = "UTC"
     session_started_at: datetime | None = None
+    update_filter: Callable[[dict], bool] | None = None
+    heartbeat_callback: Callable[[dict[str, datetime]], None] | None = None
 
     def __post_init__(self) -> None:
         if self.session_started_at is not None:
@@ -201,6 +203,8 @@ class PersistedStream:
         )
 
     def _process_update_safely(self, update: dict) -> None:
+        if self.update_filter is not None and not self.update_filter(update):
+            return
         instrument_id = str(update.get("instrument_id") or "")
         if instrument_id in self.received_item_updates and update.get("type") not in {"PROBE", "SUB", "UNSUB"}:
             self.received_item_updates[instrument_id] += 1
@@ -303,6 +307,8 @@ class PersistedStream:
         deadline = started + duration
         worker.start()
         while time.monotonic() < deadline or not updates.empty():
+            if self.heartbeat_callback is not None:
+                self.heartbeat_callback(self.last_update)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 diagnostics = getattr(getattr(stream, "stats", None), "diagnostics", None)

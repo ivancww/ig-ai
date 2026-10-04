@@ -1,0 +1,23 @@
+[Unit]
+Description=IG AI read-only market analysis service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=igai
+Group=igai
+WorkingDirectory=/opt/ig-ai
+EnvironmentFile=/etc/ig-ai/ig-ai.env
+ExecStart=/opt/ig-ai/.venv/bin/ig-ai service
+Restart=on-failure
+RestartSec=15
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

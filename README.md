@@ -44,6 +44,8 @@ ig-ai decision-state --side SHORT --entry 30500 --current 30420 --mfe 150 --mae 
 ig-ai monitor --duration 3600  # LIVE read-only monitoring for 3600 wall-clock seconds
 ig-ai alerts --limit 20       # inspect persisted deterministic alerts
 ig-ai monitor-status           # inspect accepted monitor states and alert count
+ig-ai service                  # continuous read-only service for systemd
+ig-ai service-status           # persisted service/market health read model
 ig-ai research-status          # inspect available historical samples and history coverage
 ig-ai research --window 3Y    # explicit local outcome-completion job (no live tick work)
 ig-ai history-backfill --market "US Tech 100" --timeframe 1H --days 1 --dry-run
@@ -55,6 +57,8 @@ igai-report --run ruff check .
 ```
 
 The unified report is also saved as `igai-report.txt` for Cloud Shell Editor copy/paste. Runtime commands update only the Terminal section; Codex updates update only the Codex section. Report state is local and ignored by Git.
+
+Phase 9A deployment templates and the systemd runbook are in `deploy/` and `docs/phase9a-deployment.md`. Service settings are external (`IGAI_SERVICE_HEARTBEAT_SECONDS`, `IGAI_STALE_DATA_SECONDS`, `IGAI_MONITORING_MODE`, and `IGAI_TIMEZONE`); no credentials or real `.env` are committed.
 
 `monitor --duration N` uses the same duration semantics as `stream`: `N` is a positive wall-clock number of seconds. It authenticates read-only, discovers the provider-verified three-market set, and sends the same single Lightstreamer stream through candle, technical, pattern, direction, and alert persistence. It does not create a second market-data pipeline. A closed market may produce no updates and therefore no fabricated alerts.
 

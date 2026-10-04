@@ -6,6 +6,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .exceptions import ConfigurationError
+from .runtime_service import parse_custom_windows
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,11 @@ class Settings:
     stream_reconnect_seconds: float = 5.0
     market_timezone: str = "Asia/Hong_Kong"
     discovery_detail_budget: int = 3
+    service_heartbeat_seconds: float = 30.0
+    monitoring_mode: str = "24_7"
+    runtime_timezone: str = "UTC"
+    stale_data_seconds: float = 900.0
+    custom_windows: tuple[str, ...] = ()
 
     @classmethod
     def from_env(
@@ -48,9 +54,23 @@ class Settings:
             reconnect = float(env.get("IG_STREAM_RECONNECT_SECONDS", "5"))
             timezone = env.get("IG_MARKET_TIMEZONE", "Asia/Hong_Kong")
             ZoneInfo(timezone)
+            heartbeat = float(env.get("IGAI_SERVICE_HEARTBEAT_SECONDS", "30"))
+            stale_seconds = float(env.get("IGAI_STALE_DATA_SECONDS", "900"))
+            runtime_timezone = env.get("IGAI_TIMEZONE", "UTC")
+            ZoneInfo(runtime_timezone)
         except (ValueError, TypeError) as exc:
             raise ConfigurationError("IG numeric settings or market timezone are invalid") from exc
-        if timeout <= 0 or discovery_detail_budget <= 0 or reconnect < 0:
+        monitoring_mode = env.get("IGAI_MONITORING_MODE", "24_7").strip().upper()
+        if monitoring_mode not in {"24_7", "MARKET_HOURS", "CUSTOM"}:
+            raise ConfigurationError("IGAI_MONITORING_MODE must be 24_7, MARKET_HOURS, or CUSTOM")
+        raw_custom_windows = env.get("IGAI_CUSTOM_WINDOWS", "").strip()
+        try:
+            custom_windows = parse_custom_windows(raw_custom_windows) if raw_custom_windows else ()
+        except ValueError as exc:
+            raise ConfigurationError(str(exc)) from exc
+        if monitoring_mode == "CUSTOM" and not custom_windows:
+            raise ConfigurationError("IGAI_CUSTOM_WINDOWS is required when IGAI_MONITORING_MODE=CUSTOM")
+        if timeout <= 0 or discovery_detail_budget <= 0 or reconnect < 0 or heartbeat <= 0 or stale_seconds <= 0:
             raise ConfigurationError(
                 "IG timeout must be positive, discovery detail budget must be positive, "
                 "and reconnect delay non-negative"
@@ -69,4 +89,9 @@ class Settings:
             discovery_detail_budget=discovery_detail_budget,
             stream_reconnect_seconds=reconnect,
             market_timezone=timezone,
+            service_heartbeat_seconds=heartbeat,
+            monitoring_mode=monitoring_mode,
+            runtime_timezone=runtime_timezone,
+            stale_data_seconds=stale_seconds,
+            custom_windows=custom_windows,
         )
