@@ -20,6 +20,10 @@ class Settings:
     stream_reconnect_seconds: float = 5.0
     market_timezone: str = "Asia/Hong_Kong"
     discovery_detail_budget: int = 3
+    service_heartbeat_seconds: float = 30.0
+    monitoring_mode: str = "24_7"
+    runtime_timezone: str = "UTC"
+    stale_data_seconds: float = 900.0
 
     @classmethod
     def from_env(
@@ -48,9 +52,16 @@ class Settings:
             reconnect = float(env.get("IG_STREAM_RECONNECT_SECONDS", "5"))
             timezone = env.get("IG_MARKET_TIMEZONE", "Asia/Hong_Kong")
             ZoneInfo(timezone)
+            heartbeat = float(env.get("IGAI_SERVICE_HEARTBEAT_SECONDS", "30"))
+            stale_seconds = float(env.get("IGAI_STALE_DATA_SECONDS", "900"))
+            runtime_timezone = env.get("IGAI_TIMEZONE", "UTC")
+            ZoneInfo(runtime_timezone)
         except (ValueError, TypeError) as exc:
             raise ConfigurationError("IG numeric settings or market timezone are invalid") from exc
-        if timeout <= 0 or discovery_detail_budget <= 0 or reconnect < 0:
+        monitoring_mode = env.get("IGAI_MONITORING_MODE", "24_7").strip().upper()
+        if monitoring_mode not in {"24_7", "MARKET_HOURS", "CUSTOM"}:
+            raise ConfigurationError("IGAI_MONITORING_MODE must be 24_7, MARKET_HOURS, or CUSTOM")
+        if timeout <= 0 or discovery_detail_budget <= 0 or reconnect < 0 or heartbeat <= 0 or stale_seconds <= 0:
             raise ConfigurationError(
                 "IG timeout must be positive, discovery detail budget must be positive, "
                 "and reconnect delay non-negative"
@@ -69,4 +80,8 @@ class Settings:
             discovery_detail_budget=discovery_detail_budget,
             stream_reconnect_seconds=reconnect,
             market_timezone=timezone,
+            service_heartbeat_seconds=heartbeat,
+            monitoring_mode=monitoring_mode,
+            runtime_timezone=runtime_timezone,
+            stale_data_seconds=stale_seconds,
         )

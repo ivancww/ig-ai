@@ -25,6 +25,7 @@ from .reporting import update_terminal_report, write_runtime_record
 from .research import ResearchConfig, ResearchEngine
 from .rest import IGRestClient
 from .runtime import PersistedStream
+from .runtime_service import format_service_status, run_live_service
 from .security import SecretRedactionFilter
 from .stream_smoke import format_smoke_result, run_stream_smoke
 from .streaming import (
@@ -165,6 +166,9 @@ def main() -> int:
     decision_parser.add_argument("--event-source", default=None)
     smoke_parser = commands.add_parser("stream-smoke")
     smoke_parser.add_argument("--duration", type=float, default=60.0)
+    service_parser = commands.add_parser("service", help="run the continuous read-only service")
+    service_parser.add_argument("--markets", default="US Tech 100,Japan 225,Hong Kong HS50")
+    commands.add_parser("service-status", help="show persisted service and market health")
     args = parser.parse_args()
     handler = logging.StreamHandler()
     handler.addFilter(SecretRedactionFilter())
@@ -189,6 +193,17 @@ def main() -> int:
             )
             print(f"Database initialized at {settings.database_path}")
             return 0
+        if args.command == "service-status":
+            settings = Settings.from_env(require_credentials=False)
+            database = Database(settings.database_path)
+            try:
+                print(format_service_status({"service": database.get_runtime_state("service") or {}, "markets": database.list_runtime_market_states(), "schedules": database.list_runtime_schedules()}))
+            finally:
+                database.close()
+            return 0
+        if args.command == "service":
+            settings = Settings.from_env()
+            return run_live_service(settings, args.markets)
         if args.command == "technical-status":
             settings = Settings.from_env(require_credentials=False)
             database = Database(settings.database_path)

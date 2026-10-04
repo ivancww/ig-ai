@@ -312,6 +312,15 @@ CREATE TABLE IF NOT EXISTS decision_telemetry (
 );
 CREATE INDEX IF NOT EXISTS decision_telemetry_lookup
 ON decision_telemetry (instrument_id, reference_time, primary_action_state);
+CREATE TABLE IF NOT EXISTS runtime_state (
+    state_key TEXT PRIMARY KEY, state_value_json TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_market_state (
+    instrument_id TEXT PRIMARY KEY, state_json TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_schedule (
+    instrument_id TEXT PRIMARY KEY, mode TEXT NOT NULL, windows_json TEXT NOT NULL, timezone TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 """
 
 
@@ -434,6 +443,51 @@ class Database:
 
     def close(self) -> None:
         self.connection.close()
+
+    def save_runtime_state(self, key: str, value: dict) -> None:
+        now = datetime.now(UTC).isoformat()
+        self.connection.execute(
+            "INSERT INTO runtime_state VALUES (?, ?, ?) ON CONFLICT(state_key) DO UPDATE SET state_value_json=excluded.state_value_json, updated_at=excluded.updated_at",
+            (key, json.dumps(value, sort_keys=True, separators=(",", ":")), now),
+        )
+        self.connection.commit()
+
+    def get_runtime_state(self, key: str) -> dict | None:
+        row = self.connection.execute(
+            "SELECT state_value_json FROM runtime_state WHERE state_key=?", (key,)
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def save_runtime_market_state(self, instrument_id: str, state: dict) -> None:
+        now = datetime.now(UTC).isoformat()
+        self.connection.execute(
+            "INSERT INTO runtime_market_state VALUES (?, ?, ?) ON CONFLICT(instrument_id) DO UPDATE SET state_json=excluded.state_json, updated_at=excluded.updated_at",
+            (instrument_id, json.dumps(state, sort_keys=True, separators=(",", ":")), now),
+        )
+        self.connection.commit()
+
+    def list_runtime_market_states(self) -> list[dict]:
+        rows = self.connection.execute(
+            "SELECT state_json FROM runtime_market_state ORDER BY instrument_id"
+        ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def save_runtime_schedule(self, instrument_id: str, schedule: dict) -> None:
+        now = datetime.now(UTC).isoformat()
+        self.connection.execute(
+            "INSERT INTO runtime_schedule VALUES (?, ?, ?, ?, ?) ON CONFLICT(instrument_id) DO UPDATE SET mode=excluded.mode, windows_json=excluded.windows_json, timezone=excluded.timezone, updated_at=excluded.updated_at",
+            (instrument_id, schedule["mode"], json.dumps(schedule.get("windows", [])), schedule["timezone"], now),
+        )
+        self.connection.commit()
+
+    def list_runtime_schedules(self) -> list[dict]:
+        rows = self.connection.execute(
+            "SELECT instrument_id, mode, windows_json, timezone, updated_at FROM runtime_schedule ORDER BY instrument_id"
+        ).fetchall()
+        return [
+            {"instrument_id": row[0], "mode": row[1], "windows": json.loads(row[2]), "timezone": row[3], "updated_at": row[4]}
+            for row in rows
+        ]
 
     def save_instrument(
         self,

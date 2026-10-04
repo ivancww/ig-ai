@@ -1,0 +1,64 @@
+from datetime import UTC, datetime, timedelta
+
+from ig_ai.database import Database
+from ig_ai.runtime_service import RuntimeService, Schedule, format_service_status
+
+
+def test_service_start_heartbeat_and_graceful_shutdown_persist_state(tmp_path):
+    database = Database(tmp_path / "runtime.sqlite3")
+    service = RuntimeService(database, heartbeat_seconds=1)
+    service.start(["EPIC"])
+    assert database.get_runtime_state("service")["status"] == "STARTING"
+    service.heartbeat(connection="CONNECTED")
+    assert database.get_runtime_state("service")["status"] == "HEALTHY"
+    assert database.get_runtime_state("service").get("last_heartbeat_at")
+    service.request_shutdown()
+    assert service.stop_requested.is_set()
+    service.stop()
+    assert database.get_runtime_state("service")["status"] == "STOPPING"
+    database.close()
+
+
+def test_restart_restores_runtime_market_state_and_status_is_safe(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    first = Database(path)
+    first.save_runtime_market_state("EPIC", {"instrument_id": "EPIC", "monitoring_state": "MONITORING"})
+    first.close()
+    reopened = Database(path)
+    text = format_service_status({"service": {}, "markets": reopened.list_runtime_market_states()})
+    assert "EPIC:" in text
+    assert "Last Decision: NOT AVAILABLE" in text
+    reopened.close()
+
+
+def test_schedule_modes_and_unknown_market_hours():
+    assert Schedule("24_7").is_active() is True
+    custom = Schedule("CUSTOM", ("1,2,3,4,5 09:00-17:00",), "UTC")
+    monday = datetime(2026, 10, 5, 10, tzinfo=UTC)
+    sunday = datetime(2026, 10, 4, 10, tzinfo=UTC)
+    assert custom.is_active(monday) is True
+    assert custom.is_active(sunday) is False
+    assert Schedule("MARKET_HOURS").is_active(monday) is None
+
+
+def test_market_stale_and_scheduled_off_are_distinct(tmp_path):
+    database = Database(tmp_path / "runtime.sqlite3")
+    service = RuntimeService(database, stale_seconds=60)
+    service.start(["EPIC"])
+    old = datetime.now(UTC) - timedelta(minutes=5)
+    assert service.update_market("EPIC", schedule=Schedule("24_7"), last_data=old)["monitoring_state"] == "STALE_DATA"
+    assert service.update_market("EPIC", schedule=Schedule("24_7"), last_data=datetime.now(UTC), market_status="CLOSED")["monitoring_state"] == "MARKET_CLOSED"
+    assert service.update_market("EPIC", schedule=Schedule("CUSTOM", ("1,2,3,4,5 00:00-00:01",)), last_data=datetime.now(UTC))["monitoring_state"] == "SCHEDULED_OFF"
+    assert service.update_market("EPIC", schedule=Schedule("MARKET_HOURS"), last_data=datetime.now(UTC))["monitoring_state"] == "UNKNOWN"
+    database.close()
+
+
+def test_connection_loss_degrades_and_reconnect_recovers(tmp_path):
+    database = Database(tmp_path / "runtime.sqlite3")
+    service = RuntimeService(database)
+    service.start()
+    service.update_connection("DISCONNECTED")
+    assert database.get_runtime_state("service")["status"] == "DEGRADED"
+    service.update_connection("CONNECTED")
+    assert database.get_runtime_state("service")["status"] == "HEALTHY"
+    database.close()
