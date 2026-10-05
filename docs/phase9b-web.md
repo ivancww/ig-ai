@@ -15,6 +15,6 @@ service or VM. The service worker caches only the application shell; API
 requests bypass the cache so an offline shell cannot represent old market
 data as current.
 
-`web/icons/` contains clearly marked development placeholders. The manifest
-reserves 192/512, maskable 192/512, and favicon slots for replacement by the
-approved production logo source.
+`web/icons/` contains the approved production PNG artwork for the manifest,
+Apple touch icon, favicon, and header. Non-selected SVG files remain only as
+development/reference artifacts.
