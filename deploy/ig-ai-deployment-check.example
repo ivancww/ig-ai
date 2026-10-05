@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Local-only readiness check. It never creates cloud resources and never
+# prints environment values or credentials.
+service_name="${IGAI_SERVICE_NAME:-ig-ai}"
+web_service_name="${IGAI_WEB_SERVICE_NAME:-ig-ai-web}"
+web_host="${IGAI_WEB_HOST:-127.0.0.1}"
+web_port="${IGAI_WEB_PORT:-8080}"
+database_path="${IG_DATABASE_PATH:-/var/lib/ig-ai/data/ig_ai.sqlite3}"
+web_url="http://${web_host}:${web_port}"
+
+case "$web_host" in
+  127.0.0.1|localhost|::1) ;;
+  *) echo "FAIL: web host must remain loopback" >&2; exit 1 ;;
+esac
+
+systemctl is-active --quiet "$service_name" || { echo "FAIL: backend service is not active" >&2; exit 1; }
+systemctl is-active --quiet "$web_service_name" || { echo "FAIL: web service is not active" >&2; exit 1; }
+test -r "$database_path" || { echo "FAIL: persistent database is not readable" >&2; exit 1; }
+
+python3 - "$database_path" <<'PY'
+import sqlite3
+import sys
+
+path = sys.argv[1]
+connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+connection.execute("SELECT 1")
+connection.close()
+print("database: accessible (read-only check)")
+PY
+
+health="$(curl --fail --silent --show-error --max-time 5 "$web_url/api/health")"
+curl --fail --silent --show-error --max-time 5 "$web_url/api/dashboard" >/dev/null
+printf '%s' "$health" | python3 -c '
+import json
+import sys
+from datetime import UTC, datetime
+
+payload = json.load(sys.stdin)
+service = payload.get("service", {})
+markets = payload.get("markets", [])
+heartbeat = service.get("last_heartbeat")
+if not heartbeat:
+    raise SystemExit("FAIL: heartbeat is unavailable")
+try:
+    age = (datetime.now(UTC) - datetime.fromisoformat(heartbeat).astimezone(UTC)).total_seconds()
+except ValueError as exc:
+    raise SystemExit("FAIL: heartbeat timestamp is invalid") from exc
+if age > 180:
+    raise SystemExit("FAIL: heartbeat is stale")
+print("backend status: " + str(service.get("status", "UNKNOWN")))
+print("IG connection: " + str(service.get("ig_connection", "UNKNOWN")))
+print("monitored markets visible: " + str(len(markets)))
+print("dashboard API: reachable on loopback")
+'
