@@ -1,10 +1,15 @@
 import json
+import struct
+import threading
+import urllib.error
+import urllib.request
 from datetime import UTC, datetime, timedelta
+from http.server import HTTPServer
 from pathlib import Path
 
 from ig_ai.database import Database
 from ig_ai.direction import DIRECTION_SCHEMA_VERSION
-from ig_ai.web import WEB_DIR, WebReadModel
+from ig_ai.web import WEB_DIR, WebHandler, WebReadModel
 
 
 def _seed_market(database: Database, *, stale: bool = False) -> None:
@@ -38,6 +43,36 @@ def test_dashboard_complete_and_missing_markets_are_explicit(tmp_path):
     database.close()
 
 
+def test_dashboard_surfaces_persisted_phase8b_decision_telemetry(tmp_path):
+    database = Database(tmp_path / "phase8b.sqlite3")
+    _seed_market(database)
+    database.save_decision_telemetry({
+        "instrument": "EPIC",
+        "reference_time": "2026-10-05T10:00:00+00:00",
+        "primary_action_state": "ENTRY_QUALIFIED",
+        "telemetry": {
+            "instrument": "EPIC", "timestamp": "2099-10-05T10:00:00+00:00",
+            "market_bias": "BULLISH", "evaluated_side": "LONG", "1H_regime": "TREND_UP",
+            "entry_quality_score": 85, "entry_quality_qualifier": "ENTRY_QUALIFIED", "model_version": "trading_decision_v1",
+            "primary_action_state": "ENTRY_QUALIFIED",
+            "structure_invalidation_state": "ORIGINAL_STRUCTURE_VALID",
+            "profit_protection_state": "NORMAL",
+            "big_wave_qualification_state": "RUNNER_ELIGIBLE",
+        },
+    })
+    market = WebReadModel(database).dashboard()["markets"][0]
+    assert market["regime"] == "TREND_UP"
+    assert market["market_bias"] == "BULLISH"
+    assert market["evaluated_side"] == "LONG"
+    assert market["entry_quality"] == 85
+    assert market["entry_quality_state"] == "ENTRY_QUALIFIED"
+    assert market["primary_action"] == "ENTRY_QUALIFIED"
+    assert market["structure_invalidation"] == "ORIGINAL_STRUCTURE_VALID"
+    assert market["profit_protection"] == "NORMAL"
+    assert market["runner_state"] == "RUNNER_ELIGIBLE"
+    database.close()
+
+
 def test_stale_market_is_not_reported_as_live(tmp_path):
     database = Database(tmp_path / "stale.sqlite3")
     _seed_market(database, stale=True)
@@ -63,6 +98,22 @@ def test_alert_ui_read_state_is_separate_and_survives_restart(tmp_path):
     reopened.close()
 
 
+def test_alert_filter_resolves_display_market_to_persisted_instrument_id(tmp_path):
+    database = Database(tmp_path / "identity.sqlite3")
+    database.save_instrument("EPIC.NDX", "IX.D.NASDAQ.IFMM.IP", "US Tech 100", market_status="OPEN")
+    alert = {
+        "alert_id": "real-id-alert", "instrument": "EPIC.NDX", "alert_type": "DIRECTION_SHIFT",
+        "priority": "WATCH", "event_identity": "real-id-event", "created_at": "2026-01-01T00:00:00+00:00",
+        "confirmed": True, "message": "identity test", "alert_engine_version": "test",
+    }
+    assert database.save_alert(alert)
+    result = WebReadModel(database).alerts(market="US Tech 100")
+    assert [item["alert_id"] for item in result["alerts"]] == ["real-id-alert"]
+    assert result["alerts"][0]["market"] == "US Tech 100"
+    assert "instrument" not in result["alerts"][0]
+    database.close()
+
+
 def test_web_contract_has_no_trading_mutation_and_pwa_offline_safety():
     source = (Path(__file__).parents[1] / "src/ig_ai/web.py").read_text()
     js = (WEB_DIR / "assets/app.js").read_text()
@@ -73,4 +124,63 @@ def test_web_contract_has_no_trading_mutation_and_pwa_offline_safety():
     assert "/api/" in sw and "cached" in sw
     assert manifest["name"] == "IG AI" and manifest["display"] == "standalone"
     assert {"192x192", "512x512"} <= {icon["sizes"] for icon in manifest["icons"]}
-    assert {"/icons/maskable-192.svg", "/icons/maskable-512.svg"} <= {icon["src"] for icon in manifest["icons"]}
+    assert {"/icons/maskable-192.png", "/icons/maskable-512.png"} <= {icon["src"] for icon in manifest["icons"]}
+    assert all(icon["type"] == "image/png" for icon in manifest["icons"])
+    assert all((WEB_DIR / icon["src"].lstrip("/")).is_file() for icon in manifest["icons"])
+    for icon in manifest["icons"]:
+        png = (WEB_DIR / icon["src"].lstrip("/")).read_bytes()
+        assert png.startswith(b"\x89PNG\r\n\x1a\n")
+        assert struct.unpack(">II", png[16:24]) == tuple(int(size) for size in icon["sizes"].split("x"))
+
+
+def test_responsive_layout_contract_covers_folded_and_unfolded_viewports():
+    css = (WEB_DIR / "assets/app.css").read_text()
+    assert "grid-template-columns:1fr" in css
+    assert "grid-template-columns:repeat(3,minmax(0,1fr))" in css
+    assert "overflow-x:hidden" in css
+    assert "min-height:48px" in css
+    assert "position:fixed" in css and "top:64px" in css
+    assert "device" not in css.lower()
+
+
+def test_static_path_traversal_is_not_resolvable():
+    source = (Path(__file__).parents[1] / "src/ig_ai/web.py").read_text()
+    assert "resolve()" in source and "WEB_DIR not in path.parents" in source
+
+
+def test_http_api_is_sanitized_no_store_and_has_no_mutation_routes(tmp_path):
+    path = tmp_path / "http.sqlite3"
+    database = Database(path)
+    _seed_market(database)
+    database.close()
+    server = HTTPServer(("127.0.0.1", 0), WebHandler)
+
+    ready = threading.Event()
+
+    def run_server():
+        owner_database = Database(path)
+        server.model = WebReadModel(owner_database)
+        ready.set()
+        server.serve_forever()
+        owner_database.close()
+
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=2)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        response = urllib.request.urlopen(f"{base}/api/dashboard")
+        payload = response.read().decode()
+        assert response.headers["Cache-Control"] == "no-store"
+        assert "IG_PASSWORD" not in payload and "X-SECURITY-TOKEN" not in payload and "EPIC" not in payload
+        for path in ("/api/orders", "/api/deals", "/../pyproject.toml"):
+            try:
+                urllib.request.urlopen(base + path)
+            except urllib.error.HTTPError as error:
+                assert error.code == 404
+            else:
+                raise AssertionError(f"unsafe route unexpectedly succeeded: {path}")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

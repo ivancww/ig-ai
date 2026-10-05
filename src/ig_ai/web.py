@@ -8,7 +8,7 @@ import mimetypes
 import re
 from datetime import UTC, datetime
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -57,14 +57,27 @@ class WebReadModel:
         ).fetchall()
         return {row[1]: (row[0], row[3], row[2]) for row in rows}
 
+    def _instrument_id(self, market: str, instruments: dict[str, tuple[str, str, str | None]]) -> str | None:
+        """Resolve a user-facing market label to the persisted instrument id."""
+        identity = instruments.get(market)
+        return identity[0] if identity else None
+
+    def _latest_telemetry(self, instrument_id: str | None, market: str) -> dict:
+        for identity in (instrument_id, market):
+            if identity:
+                rows = self.database.get_decision_telemetry(identity, limit=1)
+                if rows:
+                    return rows[0]
+        return {}
+
     def _market(self, market: str, instruments: dict[str, tuple[str, str, str | None]]) -> dict:
         instrument_id, _epic, market_status = instruments.get(market, (None, None, None))
         runtime = next((x for x in self.database.list_runtime_market_states() if x.get("instrument_id") == instrument_id), {}) if instrument_id else {}
         # Phase 8B snapshots identify the analytical market; runtime rows use
         # the provider instrument id. Support both persisted identities.
         direction = (self.database.get_direction_status(instrument_id) if instrument_id else None) or self.database.get_direction_status(market)
-        monitor = self.database.get_monitor_state(market) if market else None
-        telemetry = self.database.get_decision_telemetry(instrument_id, limit=1)[0] if instrument_id and self.database.get_decision_telemetry(instrument_id, limit=1) else {}
+        monitor = (self.database.get_monitor_state(instrument_id) if instrument_id else None) or self.database.get_monitor_state(market)
+        telemetry = self._latest_telemetry(instrument_id, market)
         observation = None
         if instrument_id:
             row = self.database.connection.execute(
@@ -78,7 +91,7 @@ class WebReadModel:
         warning = "WARNING PRESENT" if warning_items else "NO CURRENT WARNING" if monitor else "UNKNOWN"
         reference_time = (direction or {}).get("candle_timestamp") or observation and observation["observed_at"]
         state = runtime.get("monitoring_state")
-        selected_side = "LONG" if telemetry.get("side") == "LONG" or telemetry.get("1H_structure") == "UP" else "SHORT" if telemetry.get("side") == "SHORT" or telemetry.get("1H_structure") == "DOWN" else None
+        selected_side = telemetry.get("evaluated_side") or telemetry.get("side") or None
         entry_score = telemetry.get("entry_quality_score")
         return {
             "market": market,
@@ -89,13 +102,15 @@ class WebReadModel:
             "warning_15m": warning,
             "warning_details": warning_items,
             "regime": _value(telemetry.get("1H_regime")),
-            "market_bias": {"UP": "BULLISH", "DOWN": "BEARISH"}.get((direction or {}).get("direction"), _value(telemetry.get("side"), "UNKNOWN")),
+            "market_bias": _value(telemetry.get("market_bias")),
             "entry_quality": entry_score if entry_score is not None else "NOT AVAILABLE",
+            "entry_quality_state": _value(telemetry.get("entry_quality_qualifier")),
             "entry_quality_is_probability": False,
             "primary_action": _value(telemetry.get("primary_action_state"), "NOT AVAILABLE"),
-            "structure_invalidation": _value((direction or {}).get("reversal_risk", {}).get("category"), "NOT AVAILABLE"),
-            "profit_protection": "NOT AVAILABLE",
-            "runner_state": "NOT AVAILABLE",
+            "structure_invalidation": _value(telemetry.get("structure_invalidation_state"), "NOT AVAILABLE"),
+            "profit_protection": _value(telemetry.get("profit_protection_state"), "NOT AVAILABLE"),
+            "runner_state": _value(telemetry.get("big_wave_qualification_state"), "NOT AVAILABLE"),
+            "evaluated_side": _value(telemetry.get("evaluated_side"), "NOT AVAILABLE"),
             "last_updated": reference_time,
             "freshness": _freshness(state, reference_time),
             "monitoring_state": _value(state),
@@ -106,24 +121,51 @@ class WebReadModel:
 
     def dashboard(self) -> dict:
         instruments = self._instrument_rows()
-        return {"markets": [self._market(market, instruments) for market in MARKETS], "read_only": True, "generated_at": datetime.now(UTC).isoformat()}
+        markets = []
+        for market in MARKETS:
+            public = self._market(market, instruments)
+            public.pop("instrument_id", None)
+            markets.append(public)
+        return {"markets": markets, "read_only": True, "generated_at": datetime.now(UTC).isoformat()}
 
     def alerts(self, *, market: str | None = None, category: str | None = None, state: str = "ALL") -> dict:
         if market and market not in MARKETS:
             raise ValueError("invalid market")
         if category and category not in ALERT_TYPES:
             raise ValueError("invalid alert category")
-        rows = self.database.list_alerts_for_ui(instrument_id=market, alert_type=category, read_state=state, limit=100)
-        return {"alerts": rows, "state": state, "generated_at": datetime.now(UTC).isoformat()}
+        instruments = self._instrument_rows()
+        persisted_identity = self._instrument_id(market, instruments) if market else None
+        if market and persisted_identity is None:
+            raise ValueError("market identity unavailable")
+        rows = self.database.list_alerts_for_ui(instrument_id=persisted_identity, alert_type=category, read_state=state, limit=100)
+        names = {identity[0]: name for name, identity in instruments.items()}
+        public_rows = []
+        for row in rows:
+            public = {
+                key: row.get(key)
+                for key in (
+                    "alert_id", "alert_type", "priority", "created_at", "model_reference_time",
+                    "trigger_time", "current_direction", "current_trend_stage", "current_reversal_risk",
+                    "current_holding_window", "trigger_evidence", "confirmed", "state", "message",
+                    "read_at", "is_read",
+                )
+            }
+            public["market"] = names.get(row.get("instrument"), "UNKNOWN")
+            public_rows.append(public)
+        return {"alerts": public_rows, "state": state, "generated_at": datetime.now(UTC).isoformat()}
 
     def health(self) -> dict:
         runtime = self.database.get_runtime_state("service") or {}
         markets = self.database.list_runtime_market_states()
         schedules = {item["instrument_id"]: item for item in self.database.list_runtime_schedules()}
+        names = {identity[0]: market for market, identity in self._instrument_rows().items()}
         for market in markets:
+            market["market"] = names.get(market.get("instrument_id"), "UNKNOWN")
             market["schedule"] = schedules.get(market.get("instrument_id"), {"mode": "UNKNOWN", "windows": [], "timezone": "UNKNOWN"})
             market["stale_warning"] = market.get("monitoring_state") == "STALE_DATA"
-        return {"service": {"status": _value(runtime.get("status")), "ig_connection": _value(runtime.get("ig_connection")), "last_heartbeat": runtime.get("last_heartbeat_at")}, "markets": markets, "schedules": list(schedules.values()), "generated_at": datetime.now(UTC).isoformat()}
+        public_schedules = [{key: value for key, value in {**schedule, "market": names.get(schedule.get("instrument_id"), "UNKNOWN")}.items() if key != "instrument_id"} for schedule in schedules.values()]
+        public_markets = [{key: value for key, value in market.items() if key != "instrument_id"} for market in markets]
+        return {"service": {"status": _value(runtime.get("status")), "ig_connection": _value(runtime.get("ig_connection")), "last_heartbeat": runtime.get("last_heartbeat_at")}, "markets": public_markets, "schedules": public_schedules, "generated_at": datetime.now(UTC).isoformat()}
 
 
 class WebHandler(BaseHTTPRequestHandler):
@@ -194,7 +236,9 @@ class WebHandler(BaseHTTPRequestHandler):
 
 def serve(database_path: str | Path, host: str = "127.0.0.1", port: int = 8080) -> None:
     database = Database(database_path)
-    server = ThreadingHTTPServer((host, port), WebHandler)
+    # Keep the SQLite connection on its owner thread. A reverse proxy can
+    # provide concurrency while this small first-party viewer stays safe.
+    server = HTTPServer((host, port), WebHandler)
     server.model = WebReadModel(database)  # type: ignore[attr-defined]
     try:
         server.serve_forever()
