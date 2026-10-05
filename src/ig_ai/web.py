@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import os
 import re
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -12,7 +13,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .config import Settings
 from .database import Database
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
@@ -253,8 +253,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--database", default=None)
     args = parser.parse_args(argv)
-    settings = Settings.from_env(require_credentials=False)
-    serve(args.database or settings.database_path, args.host, args.port)
+    database_path = args.database or os.environ.get("IG_DATABASE_PATH", "data/ig_ai.sqlite3")
+    host = args.host if args.host != "127.0.0.1" else os.environ.get("IGAI_WEB_HOST", args.host)
+    port = args.port if args.port != 8080 else int(os.environ.get("IGAI_WEB_PORT", str(args.port)))
+    serve(database_path, host, port)
     return 0
 
 

@@ -1,6 +1,6 @@
 [Unit]
-Description=IG AI read-only market analysis service
-After=network-online.target
+Description=IG AI localhost web/PWA viewer
+After=network-online.target ig-ai.service
 Wants=network-online.target
 
 [Service]
@@ -8,12 +8,12 @@ Type=simple
 User=igai
 Group=igai
 WorkingDirectory=/opt/ig-ai
-EnvironmentFile=/etc/ig-ai/ig-ai.env
-ExecStart=/opt/ig-ai/.venv/bin/ig-ai service
+EnvironmentFile=/etc/ig-ai/ig-ai-web.env
+ExecStart=/opt/ig-ai/.venv/bin/ig-ai-web
 Restart=on-failure
-RestartSec=15
+RestartSec=5
 KillSignal=SIGTERM
-TimeoutStopSec=30
+TimeoutStopSec=15
 StandardOutput=journal
 StandardError=journal
 UMask=0077
