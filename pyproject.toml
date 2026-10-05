@@ -17,6 +17,7 @@ streaming = ["lightstreamer-client-lib>=2.2,<3"]
 [project.scripts]
 ig-ai = "ig_ai.cli:main"
 igai-report = "ig_ai.reporting:main"
+ig-ai-web = "ig_ai.web:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
