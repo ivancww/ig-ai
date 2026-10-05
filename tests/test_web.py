@@ -119,6 +119,9 @@ def test_web_contract_has_no_trading_mutation_and_pwa_offline_safety():
     js = (WEB_DIR / "assets/app.js").read_text()
     sw = (WEB_DIR / "assets/sw.js").read_text()
     manifest = json.loads((WEB_DIR / "manifest.webmanifest").read_text())
+    index = (WEB_DIR / "index.html").read_text()
+    css = (WEB_DIR / "assets/app.css").read_text()
+    icon_contract = (WEB_DIR / "icons/README.md").read_text()
     assert "/api/orders" not in source.lower() and "/api/deals" not in source.lower()
     assert "OFFLINE / DATA UNAVAILABLE" in js
     assert "/api/" in sw and "cached" in sw
@@ -127,6 +130,24 @@ def test_web_contract_has_no_trading_mutation_and_pwa_offline_safety():
     assert {"/icons/maskable-192.png", "/icons/maskable-512.png"} <= {icon["src"] for icon in manifest["icons"]}
     assert all(icon["type"] == "image/png" for icon in manifest["icons"])
     assert all((WEB_DIR / icon["src"].lstrip("/")).is_file() for icon in manifest["icons"])
+    assert '<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">' in index
+    assert '<link rel="icon" href="/icons/favicon.png" type="image/png">' in index
+    assert "/icons/favicon.svg" not in index
+    assert 'class="brand-logo" src="/icons/icon-192.png"' in index
+    assert "↗" not in index and ".brand-logo" in css
+    assert "approved production" in icon_contract.lower()
+    assert "placeholders" not in icon_contract.lower()
+    production_assets = {
+        "icon-192.png": (192, 192), "icon-512.png": (512, 512),
+        "maskable-192.png": (192, 192), "maskable-512.png": (512, 512),
+        "apple-touch-icon.png": (180, 180), "favicon.png": (32, 32),
+    }
+    assert all((WEB_DIR / "icons" / name).is_file() for name in production_assets)
+    for name, size in production_assets.items():
+        png = (WEB_DIR / "icons" / name).read_bytes()
+        assert png.startswith(b"\x89PNG\r\n\x1a\n")
+        assert struct.unpack(">II", png[16:24]) == size
+    assert not any(icon["src"].endswith(".svg") for icon in manifest["icons"])
     for icon in manifest["icons"]:
         png = (WEB_DIR / icon["src"].lstrip("/")).read_bytes()
         assert png.startswith(b"\x89PNG\r\n\x1a\n")
