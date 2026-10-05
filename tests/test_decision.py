@@ -353,6 +353,11 @@ def test_pre_entry_telemetry_selects_short_score_for_bearish_bias():
     assert telemetry["entry_quality_score"] == decision["entry_quality"]["SHORT"]["entry_quality_score"]
     assert telemetry["long_entry_quality_score"] == decision["entry_quality"]["LONG"]["entry_quality_score"]
     assert telemetry["short_entry_quality_score"] == decision["entry_quality"]["SHORT"]["entry_quality_score"]
+    assert telemetry["market_bias"] == decision["market_bias"]
+    assert telemetry["structure_invalidation_state"] == decision["structure_validity"]["invalidation_state"]
+    assert telemetry["profit_protection_state"] == decision["profit_protection"]["state"]
+    assert telemetry["big_wave_qualification_state"] == decision["big_wave"]["qualification_state"]
+    assert telemetry["entry_quality_qualifier"] == decision["entry_quality"]["SHORT"]["action_qualifier"]
 
 
 def test_pre_entry_telemetry_selects_long_score_for_bullish_bias():

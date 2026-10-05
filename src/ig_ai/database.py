@@ -180,6 +180,11 @@ CREATE TABLE IF NOT EXISTS alert_delivery_state (
     error_code TEXT,
     FOREIGN KEY (alert_id) REFERENCES alerts(alert_id)
 );
+CREATE TABLE IF NOT EXISTS alert_ui_state (
+    alert_id TEXT PRIMARY KEY,
+    read_at TEXT,
+    FOREIGN KEY (alert_id) REFERENCES alerts(alert_id)
+);
 CREATE TABLE IF NOT EXISTS research_snapshots (
     snapshot_id TEXT PRIMARY KEY,
     instrument_id TEXT NOT NULL,
@@ -924,6 +929,53 @@ class Database:
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
         return [json.loads(row[0]) for row in self.connection.execute(query, params).fetchall()]
+
+    def list_alerts_for_ui(
+        self,
+        *,
+        instrument_id: str | None = None,
+        alert_type: str | None = None,
+        read_state: str = "ALL",
+        limit: int = 100,
+    ) -> list[dict]:
+        """Return immutable alert payloads with separately persisted UI state."""
+        if read_state not in {"ALL", "UNREAD", "READ"}:
+            raise ValueError("read_state must be ALL, UNREAD, or READ")
+        query = (
+            "SELECT a.payload_json, u.read_at FROM alerts a "
+            "LEFT JOIN alert_ui_state u ON u.alert_id=a.alert_id WHERE 1=1"
+        )
+        params: list[object] = []
+        if instrument_id:
+            query += " AND a.instrument_id=?"
+            params.append(instrument_id)
+        if alert_type:
+            query += " AND a.alert_type=?"
+            params.append(alert_type)
+        if read_state == "UNREAD":
+            query += " AND u.read_at IS NULL"
+        elif read_state == "READ":
+            query += " AND u.read_at IS NOT NULL"
+        query += " ORDER BY a.created_at DESC LIMIT ?"
+        params.append(max(1, min(limit, 500)))
+        return [
+            {**json.loads(payload), "read_at": read_at, "is_read": read_at is not None}
+            for payload, read_at in self.connection.execute(query, params).fetchall()
+        ]
+
+    def set_alert_read(self, alert_id: str, *, read: bool = True) -> bool:
+        """Persist UI-only state; analytical alert rows remain immutable."""
+        exists = self.connection.execute("SELECT 1 FROM alerts WHERE alert_id=?", (alert_id,)).fetchone()
+        if not exists:
+            return False
+        read_at = datetime.now(UTC).isoformat() if read else None
+        self.connection.execute(
+            "INSERT INTO alert_ui_state(alert_id, read_at) VALUES (?, ?) "
+            "ON CONFLICT(alert_id) DO UPDATE SET read_at=excluded.read_at",
+            (alert_id, read_at),
+        )
+        self.connection.commit()
+        return True
 
     def get_monitor_status(self, instrument_id: str | None = None) -> dict:
         if instrument_id:
