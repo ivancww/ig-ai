@@ -33,3 +33,8 @@ ignore = ["E501"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.data-files]
+"share/ig-ai/web" = ["web/index.html", "web/manifest.webmanifest"]
+"share/ig-ai/web/assets" = ["web/assets/*"]
+"share/ig-ai/web/icons" = ["web/icons/*"]

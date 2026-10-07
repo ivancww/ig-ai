@@ -1,6 +1,7 @@
 import json
 import struct
 import threading
+import tomllib
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime, timedelta
@@ -9,7 +10,7 @@ from pathlib import Path
 
 from ig_ai.database import Database
 from ig_ai.direction import DIRECTION_SCHEMA_VERSION
-from ig_ai.web import WEB_DIR, WebHandler, WebReadModel
+from ig_ai.web import WEB_DIR, WebHandler, WebReadModel, _resolve_web_dir
 
 
 def _seed_market(database: Database, *, stale: bool = False) -> None:
@@ -152,6 +153,26 @@ def test_web_contract_has_no_trading_mutation_and_pwa_offline_safety():
         png = (WEB_DIR / icon["src"].lstrip("/")).read_bytes()
         assert png.startswith(b"\x89PNG\r\n\x1a\n")
         assert struct.unpack(">II", png[16:24]) == tuple(int(size) for size in icon["sizes"].split("x"))
+
+
+def test_installed_package_declares_and_resolves_web_assets(tmp_path):
+    pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
+    data_files = pyproject["tool"]["setuptools"]["data-files"]
+    assert data_files["share/ig-ai/web"] == ["web/index.html", "web/manifest.webmanifest"]
+    assert data_files["share/ig-ai/web/assets"] == ["web/assets/*"]
+    assert data_files["share/ig-ai/web/icons"] == ["web/icons/*"]
+
+    prefix = tmp_path / "venv"
+    installed_web = prefix / "share" / "ig-ai" / "web"
+    installed_web.mkdir(parents=True)
+    module_path = tmp_path / "venv" / "lib" / "python3.12" / "site-packages" / "ig_ai" / "web.py"
+    assert _resolve_web_dir(module_path, str(prefix)) == installed_web
+
+
+def test_source_checkout_web_assets_remain_the_fallback(tmp_path):
+    module_path = tmp_path / "checkout" / "src" / "ig_ai" / "web.py"
+    expected = tmp_path / "checkout" / "web"
+    assert _resolve_web_dir(module_path, str(tmp_path / "missing-prefix")) == expected
 
 
 def test_responsive_layout_contract_covers_folded_and_unfolded_viewports():

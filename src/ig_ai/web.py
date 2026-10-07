@@ -7,6 +7,7 @@ import json
 import mimetypes
 import os
 import re
+import sys
 from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -15,8 +16,16 @@ from urllib.parse import parse_qs, urlparse
 
 from .database import Database
 
-PROJECT_DIR = Path(__file__).resolve().parents[2]
-WEB_DIR = PROJECT_DIR / "web"
+
+def _resolve_web_dir(module_path: Path = Path(__file__), prefix: str = sys.prefix) -> Path:
+    """Use installed wheel data, while preserving source-checkout behavior."""
+    installed = Path(prefix) / "share" / "ig-ai" / "web"
+    if installed.is_dir():
+        return installed
+    return module_path.resolve().parents[2] / "web"
+
+
+WEB_DIR = _resolve_web_dir()
 MARKETS = ("US Tech 100", "Japan 225", "Hong Kong HS50")
 ALERT_TYPES = {
     "DIRECTION_SHIFT", "REVERSAL_CONFIRMED", "REVERSAL_WATCH", "REVERSAL_RISK_INCREASE",
