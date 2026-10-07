@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .database import Database
+from .market_identity import CANONICAL_MARKETS, canonical_instrument_rows
 
 
 def _resolve_web_dir(module_path: Path = Path(__file__), prefix: str = sys.prefix) -> Path:
@@ -26,7 +27,7 @@ def _resolve_web_dir(module_path: Path = Path(__file__), prefix: str = sys.prefi
 
 
 WEB_DIR = _resolve_web_dir()
-MARKETS = ("US Tech 100", "Japan 225", "Hong Kong HS50")
+MARKETS = CANONICAL_MARKETS
 ALERT_TYPES = {
     "DIRECTION_SHIFT", "REVERSAL_CONFIRMED", "REVERSAL_WATCH", "REVERSAL_RISK_INCREASE",
     "REVERSAL_RISK_DECREASE", "EARLY_REVERSAL_WARNING", "TIMEFRAME_REALIGNMENT",
@@ -62,9 +63,9 @@ class WebReadModel:
 
     def _instrument_rows(self) -> dict[str, tuple[str, str, str | None]]:
         rows = self.database.connection.execute(
-            "SELECT instrument_id, market_name, market_status, epic FROM instruments"
+            "SELECT instrument_id, market_name, market_status, epic, metadata_json FROM instruments"
         ).fetchall()
-        return {row[1]: (row[0], row[3], row[2]) for row in rows}
+        return canonical_instrument_rows(rows)
 
     def _instrument_id(self, market: str, instruments: dict[str, tuple[str, str, str | None]]) -> str | None:
         """Resolve a user-facing market label to the persisted instrument id."""
@@ -102,6 +103,16 @@ class WebReadModel:
         state = runtime.get("monitoring_state")
         selected_side = telemetry.get("evaluated_side") or telemetry.get("side") or None
         entry_score = telemetry.get("entry_quality_score")
+        market_telemetry = (
+            self.database.latest_market_telemetry(instrument_id)
+            if instrument_id
+            else {
+                "last_closed_15m_at": None,
+                "last_closed_1h_at": None,
+                "last_decision_at": None,
+                "last_alert_at": None,
+            }
+        )
         return {
             "market": market,
             "instrument_id": instrument_id,
@@ -126,6 +137,7 @@ class WebReadModel:
             "market_status": _value(market_status),
             "data_quality": _value((direction or {}).get("coverage", {}).get("state"), "UNKNOWN"),
             "selected_side": selected_side,
+            **market_telemetry,
         }
 
     def dashboard(self) -> dict:

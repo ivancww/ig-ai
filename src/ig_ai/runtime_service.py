@@ -155,7 +155,14 @@ class RuntimeService:
             state = "STALE_DATA"
         else:
             state = "MONITORING"
-        result = {"instrument_id": instrument_id, "monitoring_state": state, "ig_connection": connection, "last_tick": last_data.isoformat() if last_data else None, "last_heartbeat_at": now.isoformat()}
+        result = {
+            "instrument_id": instrument_id,
+            "monitoring_state": state,
+            "ig_connection": connection,
+            "last_tick": last_data.isoformat() if last_data else None,
+            "last_heartbeat_at": now.isoformat(),
+            **self.database.latest_market_telemetry(instrument_id),
+        }
         self.database.save_runtime_market_state(instrument_id, result)
         return result
 
