@@ -4,7 +4,11 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from ig_ai.database import Database
-from ig_ai.market_identity import CANONICAL_MARKETS, canonical_instrument_rows
+from ig_ai.market_identity import (
+    CANONICAL_MARKETS,
+    canonical_instrument_rows,
+    canonical_market_label,
+)
 from ig_ai.models import Candle, Instrument
 from ig_ai.runtime import PersistedStream
 from ig_ai.runtime_service import RuntimeService, Schedule
@@ -64,7 +68,7 @@ def _alert(instrument_id: str, created_at: str) -> dict:
 
 def test_all_configured_market_labels_resolve_to_canonical_ids():
     rows = [
-        ("US-ID", "美國科技股100 現貨 ($1)", "OPEN", "US-EPIC", "{}"),
+        ("US-ID", "美國科技股100指數 現貨 ($1)", "OPEN", "US-EPIC", "{}"),
         ("JP-ID", "日本225 現貨 ($1)", "OPEN", "JP-EPIC", "{}"),
         ("HK-ID", "香港HS50 現貨 ($1)", "OPEN", "HK-EPIC", "{}"),
     ]
@@ -73,6 +77,34 @@ def test_all_configured_market_labels_resolve_to_canonical_ids():
 
     assert tuple(resolved) == CANONICAL_MARKETS
     assert [resolved[label][0] for label in CANONICAL_MARKETS] == ["US-ID", "JP-ID", "HK-ID"]
+
+
+def test_production_market_aliases_are_exact_and_non_fuzzy():
+    assert canonical_market_label("美國科技股100指數") == "US Tech 100"
+    assert canonical_market_label("美國科技股100指數 現貨 ($1)") == "US Tech 100"
+    assert canonical_market_label("美國科技股100") == "US Tech 100"
+    assert canonical_market_label("日本225") == "Japan 225"
+    assert canonical_market_label("香港HS50") == "Hong Kong HS50"
+    assert canonical_market_label("美國科技股1000") is None
+    assert canonical_market_label("美國科技股10") is None
+    assert canonical_market_label("Unknown index") is None
+
+
+def test_production_alias_does_not_collide_with_other_market_identities():
+    rows = [
+        ("US-ID", "美國科技股100指數 現貨 ($1)", "OPEN", "US-EPIC", "{}"),
+        ("JP-ID", "日本225 現貨 ($1)", "OPEN", "JP-EPIC", "{}"),
+        ("HK-ID", "香港HS50 現貨 ($1)", "OPEN", "HK-EPIC", "{}"),
+        ("OTHER-ID", "美國科技股1000 現貨 ($1)", "OPEN", "OTHER-EPIC", "{}"),
+    ]
+
+    resolved = canonical_instrument_rows(rows)
+
+    assert resolved == {
+        "US Tech 100": ("US-ID", "US-EPIC", "OPEN"),
+        "Japan 225": ("JP-ID", "JP-EPIC", "OPEN"),
+        "Hong Kong HS50": ("HK-ID", "HK-EPIC", "OPEN"),
+    }
 
 
 def test_dashboard_exposes_genuine_closed_telemetry_without_cross_market_leakage(tmp_path):
