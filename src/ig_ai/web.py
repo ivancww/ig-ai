@@ -55,6 +55,10 @@ def _freshness(state: str | None, timestamp: str | None) -> str:
     return "LIVE / CURRENT" if age <= 900 else "STALE"
 
 
+def _analysis_freshness(timestamp: str | None) -> str:
+    return _freshness(None, timestamp) if timestamp else "WAITING"
+
+
 class WebReadModel:
     """Translate persisted engine records into a stable, browser-safe contract."""
 
@@ -101,6 +105,7 @@ class WebReadModel:
         warning = "WARNING PRESENT" if warning_items else "NO CURRENT WARNING" if monitor else "UNKNOWN"
         reference_time = (direction or {}).get("candle_timestamp") or observation and observation["observed_at"]
         state = runtime.get("monitoring_state")
+        live_timestamp = (observation or {}).get("observed_at") or runtime.get("last_tick")
         selected_side = telemetry.get("evaluated_side") or telemetry.get("side") or None
         entry_score = telemetry.get("entry_quality_score")
         market_telemetry = (
@@ -132,7 +137,11 @@ class WebReadModel:
             "runner_state": _value(telemetry.get("big_wave_qualification_state"), "NOT AVAILABLE"),
             "evaluated_side": _value(telemetry.get("evaluated_side"), "NOT AVAILABLE"),
             "last_updated": reference_time,
-            "freshness": _freshness(state, reference_time),
+            "live_updated_at": live_timestamp,
+            "analysis_updated_at": reference_time,
+            "freshness": _freshness(state, live_timestamp),
+            "live_freshness": _freshness(state, live_timestamp),
+            "analysis_freshness": _analysis_freshness(reference_time),
             "monitoring_state": _value(state),
             "market_status": _value(market_status),
             "data_quality": _value((direction or {}).get("coverage", {}).get("state"), "UNKNOWN"),
