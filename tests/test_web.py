@@ -79,7 +79,40 @@ def test_stale_market_is_not_reported_as_live(tmp_path):
     _seed_market(database, stale=True)
     market = WebReadModel(database).dashboard()["markets"][0]
     assert market["freshness"] == "STALE"
+    assert market["live_freshness"] == "STALE"
     assert market["monitoring_state"] == "STALE_DATA"
+    database.close()
+
+
+def test_live_and_analysis_freshness_are_independent(tmp_path):
+    database = Database(tmp_path / "freshness.sqlite3")
+    now = datetime.now(UTC)
+    analytical = now - timedelta(hours=2)
+    database.save_instrument("EPIC", "EPIC", "US Tech 100", market_status="OPEN")
+    database.save_observation(
+        __import__("ig_ai.models", fromlist=["MarketObservation"]).MarketObservation(
+            timestamp=now, instrument_id="EPIC", epic="EPIC", market_name="US Tech 100", bid=100, offer=101
+        )
+    )
+    database.save_runtime_market_state(
+        "EPIC", {"instrument_id": "EPIC", "monitoring_state": "MONITORING", "last_tick": now.isoformat()}
+    )
+    database.save_direction_snapshot({
+        "instrument": "US Tech 100", "timeframe": "1H", "candle_timestamp": analytical.isoformat(),
+        "direction": "UP", "coverage": {"ratio": 0.8}, "reversal_risk": {"category": "LOW"},
+        "schema_version": DIRECTION_SCHEMA_VERSION, "candle_state": "CLOSED",
+    })
+
+    market = WebReadModel(database).dashboard()["markets"][0]
+
+    assert market["live_freshness"] == "LIVE / CURRENT"
+    assert market["freshness"] == "LIVE / CURRENT"
+    assert market["analysis_freshness"] == "STALE"
+    assert market["live_updated_at"] == now.isoformat()
+    assert market["analysis_updated_at"] == analytical.isoformat()
+    assert market["last_updated"] == analytical.isoformat()
+    assert market["evaluated_side"] == "NOT AVAILABLE"
+    assert market["primary_action"] == "NOT AVAILABLE"
     database.close()
 
 
