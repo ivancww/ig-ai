@@ -10,7 +10,7 @@ from typing import Any
 CANONICAL_MARKETS = ("US Tech 100", "Japan 225", "Hong Kong HS50")
 
 _ALIASES = {
-    "US Tech 100": ("US Tech 100", "美國科技股100", "美国科技股100", "Nasdaq 100", "NASDAQ"),
+    "US Tech 100": ("US Tech 100", "美國科技股100", "美國科技股100指數", "美国科技股100", "Nasdaq 100", "NASDAQ"),
     "Japan 225": ("Japan 225", "日本225", "日經225", "日経225", "NIKKEI"),
     "Hong Kong HS50": ("Hong Kong HS50", "Hong Kong 50", "香港HS50", "香港50", "HS50", "Hang Seng"),
 }
