@@ -12,6 +12,7 @@ from datetime import datetime
 from .alerts import AlertEngine, monitor_state
 from .candles import CandleAggregator
 from .database import Database
+from .decision import TradingDecisionEngine, normalized_state_from_database
 from .forward import ForwardTestEngine
 from .models import Instrument, as_utc
 from .normalization import normalize_price_update
@@ -264,6 +265,7 @@ class PersistedStream:
                 alerts = self.alert_engine.evaluate(previous, state)
                 self.alerts_emitted += self.database.save_monitor_evaluation(state, alerts)
             if candle.timeframe == "1H" and candle.is_closed:
+                self._persist_live_decision(candle.instrument_id)
                 candle_key = (candle.instrument_id, candle.timeframe, candle.start.isoformat())
                 if candle_key in self._session_candle_starts and candle_key not in self._restored_forming_keys:
                     self.forward_engine.record_snapshot(
@@ -285,6 +287,16 @@ class PersistedStream:
                     instrument_id=candle.instrument_id,
                     candles=self.database.list_candles(candle.instrument_id, "15M"),
                 )
+
+    def _persist_live_decision(self, instrument_id: str) -> None:
+        """Evaluate and persist one genuine live decision reference point."""
+        if self.database.connection.execute(
+            "SELECT 1 FROM instruments WHERE instrument_id=?", (instrument_id,)
+        ).fetchone() is None:
+            return
+        state = normalized_state_from_database(self.database, instrument_id)
+        decision = TradingDecisionEngine().analyze(state)
+        self.database.save_decision_telemetry(decision)
 
     @staticmethod
     def _exit_reason(stream: IGStreamService) -> str | None:

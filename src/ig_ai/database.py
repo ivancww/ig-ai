@@ -1119,6 +1119,31 @@ class Database:
         ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def latest_market_telemetry(self, instrument_id: str) -> dict[str, str | None]:
+        """Return only genuine, persisted telemetry timestamps for one market."""
+        result: dict[str, str | None] = {}
+        for timeframe, key in (("15M", "last_closed_15m_at"), ("1H", "last_closed_1h_at")):
+            row = self.connection.execute(
+                "SELECT MAX(c.start_at) FROM candles c "
+                "JOIN candle_quality q ON q.instrument_id=c.instrument_id "
+                "AND q.timeframe=c.timeframe AND q.start_at=c.start_at "
+                "WHERE c.instrument_id=? AND c.timeframe=? AND c.is_closed=1 "
+                "AND q.eligibility='ELIGIBLE'",
+                (instrument_id, timeframe),
+            ).fetchone()
+            result[key] = row[0] if row else None
+        row = self.connection.execute(
+            "SELECT MAX(reference_time) FROM decision_telemetry WHERE instrument_id=?",
+            (instrument_id,),
+        ).fetchone()
+        result["last_decision_at"] = row[0] if row else None
+        row = self.connection.execute(
+            "SELECT MAX(created_at) FROM alerts WHERE instrument_id=?",
+            (instrument_id,),
+        ).fetchone()
+        result["last_alert_at"] = row[0] if row else None
+        return result
+
     def research_source_identity(self, instrument_id: str) -> str:
         row = self.connection.execute("SELECT epic, market_name, instrument_type, metadata_json FROM instruments WHERE instrument_id=?", (instrument_id,)).fetchone()
         if row:
