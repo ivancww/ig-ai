@@ -197,7 +197,7 @@ def test_web_contract_has_no_trading_mutation_and_pwa_offline_safety():
     css = (WEB_DIR / "assets/app.css").read_text()
     icon_contract = (WEB_DIR / "icons/README.md").read_text()
     assert "/api/orders" not in source.lower() and "/api/deals" not in source.lower()
-    assert "OFFLINE / DATA UNAVAILABLE" in js
+    assert "資料暫時未能讀取" in js
     assert "/api/" in sw and "cached" in sw
     assert manifest["name"] == "IG AI" and manifest["display"] == "standalone"
     assert {"192x192", "512x512"} <= {icon["sizes"] for icon in manifest["icons"]}
@@ -226,6 +226,20 @@ def test_web_contract_has_no_trading_mutation_and_pwa_offline_safety():
         png = (WEB_DIR / icon["src"].lstrip("/")).read_bytes()
         assert png.startswith(b"\x89PNG\r\n\x1a\n")
         assert struct.unpack(">II", png[16:24]) == tuple(int(size) for size in icon["sizes"].split("x"))
+
+
+def test_traditional_chinese_ui_has_human_readable_state_fallbacks():
+    js = (WEB_DIR / "assets/app.js").read_text()
+    index = (WEB_DIR / "index.html").read_text()
+    assert '<html lang="zh-Hant">' in index
+    for phrase in (
+        "看升／偏強", "看跌／偏弱", "正常監察", "IG 市場目前休市",
+        "已排程停止監察", "IG 市場應可交易，但即時報價已過期", "尚未能確認",
+        "建議持有時間延長", "波幅正在擴大", "形態已確認",
+        "IG AI 持續監察：24小時運行", "實際可交易狀態以 IG 該產品當刻狀態為準",
+    ):
+        assert phrase in js
+    assert "return map[raw] ||" in js
 
 
 def test_installed_package_declares_and_resolves_web_assets(tmp_path):

@@ -82,6 +82,30 @@ def test_market_stale_and_scheduled_off_are_distinct(tmp_path):
     database.close()
 
 
+def test_24_7_monitoring_never_infers_ig_instrument_hours(tmp_path):
+    database = Database(tmp_path / "ig-cfd-session.sqlite3")
+    service = RuntimeService(database, stale_seconds=60)
+    service.start(["EPIC"])
+    old = datetime.now(UTC) - timedelta(hours=8)
+    fresh = datetime.now(UTC)
+
+    # A current tick cannot replace missing/ambiguous provider market status.
+    assert service.update_market(
+        "EPIC", schedule=Schedule("24_7"), last_data=fresh, market_status=None
+    )["monitoring_state"] == "UNKNOWN"
+    # IG's own EPIC status governs availability regardless of cash-session timing.
+    assert service.update_market(
+        "EPIC", schedule=Schedule("24_7"), last_data=fresh, market_status="TRADEABLE"
+    )["monitoring_state"] == "MONITORING"
+    assert service.update_market(
+        "EPIC", schedule=Schedule("24_7"), last_data=old, market_status="TRADEABLE"
+    )["monitoring_state"] == "STALE_DATA"
+    assert service.update_market(
+        "EPIC", schedule=Schedule("24_7"), last_data=old, market_status="CLOSED"
+    )["monitoring_state"] == "MARKET_CLOSED"
+    database.close()
+
+
 def test_market_status_provenance_is_persisted_and_exposed(tmp_path):
     database = Database(tmp_path / "market-status.sqlite3")
     service = RuntimeService(database)
