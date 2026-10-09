@@ -112,3 +112,16 @@ def test_connection_loss_degrades_and_reconnect_recovers(tmp_path):
     service.update_connection("CONNECTED")
     assert database.get_runtime_state("service")["status"] == "HEALTHY"
     database.close()
+
+
+def test_self_monitoring_is_persisted_automatically_from_runtime_state(tmp_path):
+    database = Database(tmp_path / "self-monitoring.sqlite3")
+    service = RuntimeService(database, heartbeat_seconds=1)
+    service.start(["EPIC"])
+    service.heartbeat(connection="CONNECTED")
+    service.update_market("EPIC", schedule=Schedule("24_7"), last_data=datetime.now(UTC), connection="CONNECTED", market_status="TRADEABLE", market_status_source="IG_MARKET_DETAILS")
+    snapshot = service.evaluate_self_monitoring(force=True)
+    assert database.get_runtime_state("self_monitoring")["generated_at"] == snapshot["generated_at"]
+    assert snapshot["markets"][0]["monitoring_state"] == "MONITORING"
+    assert snapshot["markets"][0]["provider_status"] == "TRADEABLE"
+    database.close()

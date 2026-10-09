@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .database import Database
 from .market_identity import CANONICAL_MARKETS, canonical_instrument_rows
+from .self_monitoring import evaluate_health
 
 
 def _resolve_web_dir(module_path: Path = Path(__file__), prefix: str = sys.prefix) -> Path:
@@ -188,6 +189,7 @@ class WebReadModel:
     def health(self) -> dict:
         runtime = self.database.get_runtime_state("service") or {}
         markets = self.database.list_runtime_market_states()
+        snapshot = self.database.get_runtime_state("self_monitoring") or evaluate_health(self.database)
         schedules = {item["instrument_id"]: item for item in self.database.list_runtime_schedules()}
         names = {identity[0]: market for market, identity in self._instrument_rows().items()}
         for market in markets:
@@ -196,7 +198,23 @@ class WebReadModel:
             market["stale_warning"] = market.get("monitoring_state") == "STALE_DATA"
         public_schedules = [{key: value for key, value in {**schedule, "market": names.get(schedule.get("instrument_id"), "UNKNOWN")}.items() if key != "instrument_id"} for schedule in schedules.values()]
         public_markets = [{key: value for key, value in market.items() if key != "instrument_id"} for market in markets]
-        return {"service": {"status": _value(runtime.get("status")), "ig_connection": _value(runtime.get("ig_connection")), "last_heartbeat": runtime.get("last_heartbeat_at")}, "markets": public_markets, "schedules": public_schedules, "generated_at": datetime.now(UTC).isoformat()}
+        health_markets = snapshot.get("markets") or public_markets
+        return {
+            "generated_at": snapshot.get("generated_at", datetime.now(UTC).isoformat()),
+            "overall_status": snapshot.get("overall_status", "UNKNOWN"),
+            "service": {
+                "status": _value(runtime.get("status")),
+                "ig_connection": _value(runtime.get("ig_connection")),
+                "last_heartbeat": runtime.get("last_heartbeat_at"),
+                **snapshot.get("service", {}),
+            },
+            "ig": snapshot.get("ig", {"connection_status": _value(runtime.get("ig_connection"))}),
+            "database": snapshot.get("database", {"status": "UNKNOWN"}),
+            "alerts": snapshot.get("alerts", {"status": "UNKNOWN"}),
+            "incidents": snapshot.get("incidents", []),
+            "markets": health_markets,
+            "schedules": public_schedules,
+        }
 
 
 class WebHandler(BaseHTTPRequestHandler):

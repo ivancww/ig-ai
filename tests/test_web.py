@@ -103,6 +103,27 @@ def test_dashboard_prefers_current_runtime_market_status(tmp_path):
     database.close()
 
 
+def test_health_exposes_self_monitoring_domains_without_secrets(tmp_path):
+    database = Database(tmp_path / "self-monitoring-health.sqlite3")
+    database.save_runtime_state("service", {"status": "HEALTHY", "ig_connection": "CONNECTED", "last_heartbeat_at": datetime.now(UTC).isoformat()})
+    database.save_runtime_state("self_monitoring", {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "overall_status": "HEALTHY",
+        "service": {"status": "HEALTHY", "heartbeat": datetime.now(UTC).isoformat()},
+        "ig": {"connection_status": "CONNECTED"},
+        "database": {"status": "HEALTHY"},
+        "alerts": {"status": "UNKNOWN"},
+        "markets": [{"market": "US Tech 100", "provider_status": "TRADEABLE", "monitoring_state": "MONITORING"}],
+        "incidents": [],
+    })
+    result = WebReadModel(database).health()
+    assert result["overall_status"] == "HEALTHY"
+    assert result["database"]["status"] == "HEALTHY"
+    assert result["markets"][0]["provider_status"] == "TRADEABLE"
+    assert "password" not in json.dumps(result).lower()
+    database.close()
+
+
 def test_live_and_analysis_freshness_are_independent(tmp_path):
     database = Database(tmp_path / "freshness.sqlite3")
     now = datetime.now(UTC)

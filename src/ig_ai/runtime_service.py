@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import signal
 import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from datetime import time as clock_time
@@ -103,6 +104,7 @@ class RuntimeService:
         self.last_heartbeat: datetime | None = None
         self.stop_requested = threading.Event()
         self._last_persisted_heartbeat: datetime | None = None
+        self._last_self_monitoring: float | None = None
 
     def start(self, instruments: list[str] | tuple[str, ...] = ()) -> None:
         self.started_at = datetime.now(UTC)
@@ -140,6 +142,21 @@ class RuntimeService:
         current["status"] = "HEALTHY" if state == "CONNECTED" else "DEGRADED"
         self.database.save_runtime_state("service", current)
         log.info("IG connection state changed: %s", state)
+
+    def evaluate_self_monitoring(self, *, force: bool = False) -> dict:
+        """Persist a bounded health snapshot from the current runtime evidence."""
+        now = time.monotonic()
+        if not force and self._last_self_monitoring is not None and now - self._last_self_monitoring < self.heartbeat_seconds:
+            return self.database.get_runtime_state("self_monitoring") or {}
+        from .self_monitoring import evaluate_health, persist_health
+
+        snapshot = evaluate_health(
+            self.database,
+            stale_seconds=self.stale_seconds,
+            heartbeat_seconds=self.heartbeat_seconds,
+        )
+        self._last_self_monitoring = now
+        return persist_health(self.database, snapshot)
 
     def update_market(
         self,
@@ -303,6 +320,7 @@ def run_live_service(settings, markets: str = "US Tech 100,Japan 225,Hong Kong H
                 market_status_source=status["source"],
                 market_status_at=status["refreshed_at"],
             )
+        service.evaluate_self_monitoring()
 
     sink = PersistedStream(database, instruments, settings.market_timezone, session_started_at=datetime.now(UTC), update_filter=lambda update: schedules.get(str(update.get("instrument_id")), Schedule("MARKET_HOURS")).is_active() is True, heartbeat_callback=heartbeat)
     original_term_handler = signal.getsignal(signal.SIGTERM)

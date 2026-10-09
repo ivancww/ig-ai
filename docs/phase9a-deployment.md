@@ -23,3 +23,11 @@ Use `journalctl -u ig-ai -f` for bounded host-managed logs. The process handles 
 Heartbeat writes are interval-bounded. A missing tick is not automatically a failure: market state distinguishes `SCHEDULED_OFF`, `STALE_DATA`, and `UNKNOWN`. Restored partial candles remain audit-only under the existing freshness rules, and no restored partial candle becomes eligible analytical or LIVE_FORWARD evidence. No automatic trading or IG order/position mutation is present.
 
 Real 24/7 uptime validation requires a later supervised host run. Unit tests are deterministic and do not claim production uptime.
+
+## Production self-monitoring
+
+The live runtime evaluates a persisted self-monitoring snapshot on its normal heartbeat cadence; no Cloud Shell command or Health-page visit is required. The snapshot is available at `/api/health` and is also rendered by the private Health page.
+
+The domains are independent: service heartbeat, IG connection, database readability/persistence, market data, analysis evidence, and alert evidence. A market with provider-confirmed `CLOSED` status is normal even when its last tick is old. A provider-open market with an expired tick becomes `ATTENTION`; a missing provider/session status remains `UNKNOWN`. Forming or ineligible 1H candles do not require a decision. Incidents are persisted as state transitions (`OPENED`, `ONGOING`, `RESOLVED`) and are deduplicated without generating synthetic alerts.
+
+Overall states are conservative: `HEALTHY` means no active incident, `ATTENTION` means an actionable non-service condition, `DEGRADED` means service/connection/persistence failure, and `UNKNOWN` means evidence is unavailable. `24_7` monitoring means the runtime remains active; it does not mean every market trades continuously. All provider requests remain read-only and no order or position mutation is enabled.
