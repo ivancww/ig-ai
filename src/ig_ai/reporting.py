@@ -9,12 +9,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
-DEFAULT_STATE_DIR = PROJECT_DIR / ".igai"
+DEFAULT_STATE_DIR = Path(os.environ.get("IGAI_STATE_DIR", str(PROJECT_DIR / ".igai"))).expanduser()
 STATE_DIR = DEFAULT_STATE_DIR
 CODEX_REPORT = STATE_DIR / "codex-report.txt"
 TERMINAL_REPORT = STATE_DIR / "terminal-report.txt"
 RUNTIME_RECORD = STATE_DIR / "stream-runtime.json"
-UNIFIED_REPORT = PROJECT_DIR / "igai-report.txt"
+UNIFIED_REPORT = Path(os.environ.get("IGAI_REPORT_PATH", str(STATE_DIR / "igai-report.txt"))).expanduser()
 
 
 def _state_file(configured: Path, name: str) -> Path:

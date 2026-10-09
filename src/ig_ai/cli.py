@@ -986,26 +986,33 @@ def main() -> int:
         historical_request_issued = historical_request_issued or bool(
             getattr(historical_client, "request_count", 0)
         )
-        update_terminal_report(
-            command=f"ig-ai {args.command}",
-            account_type=os.environ.get("IG_ACCOUNT_TYPE", "DEMO"),
-            authentication="FAIL or not verified",
-            market_discovery="FAIL or not run",
-            checks="command failed",
-            warnings="Runtime error",
-            not_verified="Successful completion was not verified",
-            output=safe_output,
-            details={
-                "stage reached": runtime_stage,
-                "historical request issued": "YES" if historical_request_issued else "NO",
-                "safe failure category": safe_output,
-                "final state": "FAIL",
-            },
-            secrets=(
-                os.environ.get("IG_API_KEY", ""),
-                os.environ.get("IG_USERNAME", ""),
-                os.environ.get("IG_PASSWORD", ""),
-            ),
-        )
+        try:
+            update_terminal_report(
+                command=f"ig-ai {args.command}",
+                account_type=os.environ.get("IG_ACCOUNT_TYPE", "DEMO"),
+                authentication="FAIL or not verified",
+                market_discovery="FAIL or not run",
+                checks="command failed",
+                warnings="Runtime error",
+                not_verified="Successful completion was not verified",
+                output=safe_output,
+                details={
+                    "stage reached": runtime_stage,
+                    "historical request issued": "YES" if historical_request_issued else "NO",
+                    "safe failure category": safe_output,
+                    "final state": "FAIL",
+                },
+                secrets=(
+                    os.environ.get("IG_API_KEY", ""),
+                    os.environ.get("IG_USERNAME", ""),
+                    os.environ.get("IG_PASSWORD", ""),
+                ),
+            )
+        except Exception as report_error:
+            # Diagnostics are best effort.  A filesystem/permission problem in
+            # reporting must never replace the provider/application failure.
+            logging.getLogger(__name__).warning(
+                "runtime failure report unavailable: %s", type(report_error).__name__
+            )
         raise
     return 0

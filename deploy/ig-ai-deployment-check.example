@@ -49,6 +49,28 @@ except ValueError as exc:
     raise SystemExit("FAIL: heartbeat timestamp is invalid") from exc
 if age > 180:
     raise SystemExit("FAIL: heartbeat is stale")
+if payload.get("overall_status") not in {"HEALTHY", "ATTENTION"}:
+    raise SystemExit("FAIL: overall health is not ready")
+critical = [
+    item for item in payload.get("incidents", [])
+    if item.get("status", "ACTIVE") == "ACTIVE"
+    and item.get("severity") in {"DEGRADED", "CRITICAL"}
+]
+if critical:
+    raise SystemExit("FAIL: active service/IG readiness incident")
+generation = service.get("runtime_generation")
+self_monitoring = payload.get("self_monitoring", {})
+if generation and (self_monitoring.get("runtime_generation") != generation or not self_monitoring.get("ready")):
+    raise SystemExit("FAIL: self-monitor snapshot is not from the current runtime generation")
+if generation and not service.get("service_started_at"):
+    raise SystemExit("FAIL: current service generation is missing its start marker")
+if generation and self_monitoring.get("generated_at"):
+    try:
+        generated = datetime.fromisoformat(self_monitoring["generated_at"]).astimezone(UTC)
+    except ValueError as exc:
+        raise SystemExit("FAIL: self-monitor timestamp is invalid") from exc
+    if generated < datetime.fromisoformat(service["service_started_at"]).astimezone(UTC):
+        raise SystemExit("FAIL: self-monitor snapshot predates the current generation")
 print("backend status: " + str(service.get("status", "UNKNOWN")))
 print("IG connection: " + str(service.get("ig_connection", "UNKNOWN")))
 print("monitored markets visible: " + str(len(markets)))

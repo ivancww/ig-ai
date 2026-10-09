@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from datetime import time as clock_time
+from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .database import Database
@@ -101,6 +102,7 @@ class RuntimeService:
         self.heartbeat_seconds = heartbeat_seconds
         self.stale_seconds = stale_seconds
         self.started_at: datetime | None = None
+        self.runtime_generation: str | None = None
         self.last_heartbeat: datetime | None = None
         self.stop_requested = threading.Event()
         self._last_persisted_heartbeat: datetime | None = None
@@ -108,12 +110,32 @@ class RuntimeService:
 
     def start(self, instruments: list[str] | tuple[str, ...] = ()) -> None:
         self.started_at = datetime.now(UTC)
+        self.runtime_generation = uuid4().hex
         self.stop_requested.clear()
-        self.database.save_runtime_state("service", {"status": "STARTING", "service_started_at": self.started_at.isoformat()})
+        self.database.save_runtime_state("service", {
+            "status": "STARTING",
+            "service_started_at": self.started_at.isoformat(),
+            "runtime_generation": self.runtime_generation,
+            "last_heartbeat_at": None,
+            "last_market_data_at": None,
+            "ig_connection": "UNKNOWN",
+            "startup_failure": None,
+        })
+        self.database.save_runtime_state("self_monitoring", {
+            "runtime_generation": self.runtime_generation,
+            "generated_at": self.started_at.isoformat(),
+            "overall_status": "UNKNOWN",
+            "generation_status": "STARTING",
+            "incidents": [],
+        })
+        self.register_instruments(instruments)
+        log.info("service startup requested generation=%s", self.runtime_generation)
+
+    def register_instruments(self, instruments: list[str] | tuple[str, ...] = ()) -> None:
+        """Register discovered instruments without changing the process generation."""
         for instrument_id in instruments:
             existing = next((state for state in self.database.list_runtime_market_states() if state.get("instrument_id") == instrument_id), None)
             self.database.save_runtime_market_state(instrument_id, existing or {"instrument_id": instrument_id, "monitoring_state": "UNKNOWN"})
-        log.info("service startup requested")
 
     def request_shutdown(self, *_args) -> None:
         self.stop_requested.set()
@@ -130,7 +152,7 @@ class RuntimeService:
             return
         market_data = market_data or {}
         service = self.database.get_runtime_state("service") or {}
-        service.update({"status": "HEALTHY" if connection == "CONNECTED" else "DEGRADED", "service_started_at": (self.started_at or now).isoformat(), "last_heartbeat_at": now.isoformat(), "ig_connection": connection, "last_market_data_at": max(market_data.values(), default=None).isoformat() if market_data else service.get("last_market_data_at")})
+        service.update({"status": "HEALTHY" if connection == "CONNECTED" else "DEGRADED", "service_started_at": (self.started_at or now).isoformat(), "runtime_generation": self.runtime_generation, "last_heartbeat_at": now.isoformat(), "ig_connection": connection, "last_market_data_at": max(market_data.values(), default=None).isoformat() if market_data else service.get("last_market_data_at")})
         self.database.save_runtime_state("service", service)
         self._last_persisted_heartbeat = now
 
@@ -140,6 +162,7 @@ class RuntimeService:
         current = self.database.get_runtime_state("service") or {}
         current["ig_connection"] = state
         current["status"] = "HEALTHY" if state == "CONNECTED" else "DEGRADED"
+        current["runtime_generation"] = self.runtime_generation
         self.database.save_runtime_state("service", current)
         log.info("IG connection state changed: %s", state)
 
@@ -154,6 +177,7 @@ class RuntimeService:
             self.database,
             stale_seconds=self.stale_seconds,
             heartbeat_seconds=self.heartbeat_seconds,
+            expected_generation=self.runtime_generation,
         )
         self._last_self_monitoring = now
         return persist_health(self.database, snapshot)
@@ -206,9 +230,28 @@ class RuntimeService:
     def stop(self) -> None:
         now = datetime.now(UTC)
         current = self.database.get_runtime_state("service") or {}
-        current.update({"status": "STOPPING", "last_heartbeat_at": now.isoformat()})
+        current.update({"status": "STOPPING", "runtime_generation": self.runtime_generation, "last_heartbeat_at": now.isoformat()})
         self.database.save_runtime_state("service", current)
         log.info("service stopping")
+
+    def record_startup_failure(self, error: Exception) -> None:
+        """Persist a safe startup failure without masking the original error."""
+        from .exceptions import IGHTTPError
+
+        if isinstance(error, IGHTTPError):
+            category = f"IG_HTTP_{error.status}" if error.status else "IG_NETWORK_FAILURE"
+            diagnostic = error.safe_diagnostic()
+        else:
+            category = type(error).__name__.upper()
+            diagnostic = f"startup failure category={category}"
+        current = self.database.get_runtime_state("service") or {}
+        current.update({
+            "status": "DEGRADED",
+            "runtime_generation": self.runtime_generation,
+            "startup_failure": {"category": category, "diagnostic": diagnostic},
+        })
+        self.database.save_runtime_state("service", current)
+        self.evaluate_self_monitoring(force=True)
 
     def status(self) -> dict:
         service = self.database.get_runtime_state("service") or {}
@@ -251,93 +294,98 @@ def run_live_service(settings, markets: str = "US Tech 100,Japan 225,Hong Kong H
         lightstreamer_password,
     )
 
-    client = IGRestClient(settings)
-    groups = discover_market_groups(client)
-    requested = {name.strip() for name in markets.split(",") if name.strip()}
-    selected = [candidate for candidate in select_stream_instruments(groups) if candidate.requested_market in requested]
-    missing = sorted(requested - {candidate.requested_market for candidate in selected})
-    if missing:
-        raise RuntimeError("No provider-verified weekday cash instrument for: " + ", ".join(missing))
-    session = client.ensure_session()
-    if not session.lightstreamer_endpoint or not session.account_id:
-        raise RuntimeError("IG authentication did not provide a Lightstreamer endpoint/account")
     database = Database(settings.database_path)
     service = RuntimeService(database, heartbeat_seconds=settings.service_heartbeat_seconds, stale_seconds=settings.stale_data_seconds)
-    instruments = {candidate.epic: Instrument(candidate.epic, candidate.epic, candidate.market_name, candidate.instrument_type, candidate.market_status, candidate.metadata) for candidate in selected}
-    for instrument in instruments.values():
-        database.save_instrument_model(instrument)
-        database.save_runtime_schedule(instrument.instrument_id, Schedule(settings.monitoring_mode, settings.custom_windows, settings.runtime_timezone).as_dict())
-    schedules = {instrument_id: Schedule(settings.monitoring_mode, settings.custom_windows, settings.runtime_timezone) for instrument_id in instruments}
-    status_refresh_seconds = settings.market_status_refresh_seconds
-    status_cache = {
-        instrument_id: {
-            "status": instrument.market_status,
-            "source": "DISCOVERY",
-            "refreshed_at": datetime.now(UTC),
-        }
-        for instrument_id, instrument in instruments.items()
-    }
-    last_status_refresh = time.monotonic()
-
-    def refresh_market_statuses() -> None:
-        nonlocal last_status_refresh
-        now_monotonic = time.monotonic()
-        if now_monotonic - last_status_refresh < status_refresh_seconds:
-            return
-        last_status_refresh = now_monotonic
-        refreshed_at = datetime.now(UTC)
-        for instrument_id, instrument in instruments.items():
-            try:
-                status = refresh_market_status(client, instrument.epic)
-                status_cache[instrument_id] = {
-                    "status": status,
-                    "source": "IG_MARKET_DETAILS" if status else "IG_MARKET_DETAILS_UNAVAILABLE",
-                    "refreshed_at": refreshed_at,
-                }
-            except Exception as exc:  # provider status is advisory; stream remains read-only
-                status_cache[instrument_id] = {
-                    "status": None,
-                    "source": f"IG_MARKET_DETAILS_ERROR:{type(exc).__name__}",
-                    "refreshed_at": refreshed_at,
-                }
-                log.warning("market status refresh unavailable for %s: %s", instrument.epic, type(exc).__name__)
-
-    stream = IGStreamService(session.lightstreamer_endpoint, session.account_id, lightstreamer_password(session.cst, session.security_token), OfficialLightstreamerTransport(), reconnect_seconds=settings.stream_reconnect_seconds)
-    for instrument in instruments.values():
-        stream.add_subscription(Subscription(instrument.instrument_id, f"PRICE:{session.account_id}:{instrument.epic}"))
-    service.start(list(instruments))
-    def heartbeat(last_data: dict[str, datetime]) -> None:
-        refresh_market_statuses()
-        connection = stream.stats.connection_state if stream.stats.connection_state in CONNECTION_STATES else "UNKNOWN"
-        service.heartbeat(connection=connection, market_data=last_data)
-        for instrument_id, schedule in schedules.items():
-            status = status_cache[instrument_id]
-            service.update_market(
-                instrument_id,
-                schedule=schedule,
-                last_data=last_data.get(instrument_id),
-                connection=connection,
-                market_status=status["status"],
-                market_status_source=status["source"],
-                market_status_at=status["refreshed_at"],
-            )
-        service.evaluate_self_monitoring()
-
-    sink = PersistedStream(database, instruments, settings.market_timezone, session_started_at=datetime.now(UTC), update_filter=lambda update: schedules.get(str(update.get("instrument_id")), Schedule("MARKET_HOURS")).is_active() is True, heartbeat_callback=heartbeat)
-    original_term_handler = signal.getsignal(signal.SIGTERM)
-    original_int_handler = signal.getsignal(signal.SIGINT)
-    def shutdown(_signum, _frame):
-        service.request_shutdown()
-        stream.stop(reason="shutdown")
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
+    service.start()
     try:
+        client = IGRestClient(settings)
+        groups = discover_market_groups(client)
+        requested = {name.strip() for name in markets.split(",") if name.strip()}
+        selected = [candidate for candidate in select_stream_instruments(groups) if candidate.requested_market in requested]
+        missing = sorted(requested - {candidate.requested_market for candidate in selected})
+        if missing:
+            raise RuntimeError("No provider-verified weekday cash instrument for: " + ", ".join(missing))
+        session = client.ensure_session()
+        if not session.lightstreamer_endpoint or not session.account_id:
+            raise RuntimeError("IG authentication did not provide a Lightstreamer endpoint/account")
+        instruments = {candidate.epic: Instrument(candidate.epic, candidate.epic, candidate.market_name, candidate.instrument_type, candidate.market_status, candidate.metadata) for candidate in selected}
+        service.register_instruments(list(instruments))
+        for instrument in instruments.values():
+            database.save_instrument_model(instrument)
+            database.save_runtime_schedule(instrument.instrument_id, Schedule(settings.monitoring_mode, settings.custom_windows, settings.runtime_timezone).as_dict())
+        schedules = {instrument_id: Schedule(settings.monitoring_mode, settings.custom_windows, settings.runtime_timezone) for instrument_id in instruments}
+        status_refresh_seconds = settings.market_status_refresh_seconds
+        status_cache = {
+            instrument_id: {
+                "status": instrument.market_status,
+                "source": "DISCOVERY",
+                "refreshed_at": datetime.now(UTC),
+            }
+            for instrument_id, instrument in instruments.items()
+        }
+        last_status_refresh = time.monotonic()
+
+        def refresh_market_statuses() -> None:
+            nonlocal last_status_refresh
+            now_monotonic = time.monotonic()
+            if now_monotonic - last_status_refresh < status_refresh_seconds:
+                return
+            last_status_refresh = now_monotonic
+            refreshed_at = datetime.now(UTC)
+            for instrument_id, instrument in instruments.items():
+                try:
+                    status = refresh_market_status(client, instrument.epic)
+                    status_cache[instrument_id] = {
+                        "status": status,
+                        "source": "IG_MARKET_DETAILS" if status else "IG_MARKET_DETAILS_UNAVAILABLE",
+                        "refreshed_at": refreshed_at,
+                    }
+                except Exception as exc:  # provider status is advisory; stream remains read-only
+                    status_cache[instrument_id] = {
+                        "status": None,
+                        "source": f"IG_MARKET_DETAILS_ERROR:{type(exc).__name__}",
+                        "refreshed_at": refreshed_at,
+                    }
+                    log.warning("market status refresh unavailable for %s: %s", instrument.epic, type(exc).__name__)
+
+        stream = IGStreamService(session.lightstreamer_endpoint, session.account_id, lightstreamer_password(session.cst, session.security_token), OfficialLightstreamerTransport(), reconnect_seconds=settings.stream_reconnect_seconds)
+        for instrument in instruments.values():
+            stream.add_subscription(Subscription(instrument.instrument_id, f"PRICE:{session.account_id}:{instrument.epic}"))
+
+        def heartbeat(last_data: dict[str, datetime]) -> None:
+            refresh_market_statuses()
+            connection = stream.stats.connection_state if stream.stats.connection_state in CONNECTION_STATES else "UNKNOWN"
+            service.heartbeat(connection=connection, market_data=last_data)
+            for instrument_id, schedule in schedules.items():
+                status = status_cache[instrument_id]
+                service.update_market(
+                    instrument_id,
+                    schedule=schedule,
+                    last_data=last_data.get(instrument_id),
+                    connection=connection,
+                    market_status=status["status"],
+                    market_status_source=status["source"],
+                    market_status_at=status["refreshed_at"],
+                )
+            service.evaluate_self_monitoring()
+
+        sink = PersistedStream(database, instruments, settings.market_timezone, session_started_at=datetime.now(UTC), update_filter=lambda update: schedules.get(str(update.get("instrument_id")), Schedule("MARKET_HOURS")).is_active() is True, heartbeat_callback=heartbeat, stop_requested=service.stop_requested)
+        original_term_handler = signal.getsignal(signal.SIGTERM)
+        original_int_handler = signal.getsignal(signal.SIGINT)
+        def shutdown(_signum, _frame):
+            service.request_shutdown()
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
         service.update_connection("RECONNECTING")
         sink.run_for(stream, 10 * 365 * 24 * 60 * 60)
         service.update_connection(stream.stats.connection_state if stream.stats.connection_state in CONNECTION_STATES else "UNKNOWN")
         return 0
+    except Exception as error:
+        service.record_startup_failure(error)
+        raise
     finally:
         service.stop()
         database.close()
-        signal.signal(signal.SIGTERM, original_term_handler)
-        signal.signal(signal.SIGINT, original_int_handler)
+        if "original_term_handler" in locals():
+            signal.signal(signal.SIGTERM, original_term_handler)
+            signal.signal(signal.SIGINT, original_int_handler)

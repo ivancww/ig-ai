@@ -51,6 +51,7 @@ class PersistedStream:
     session_started_at: datetime | None = None
     update_filter: Callable[[dict], bool] | None = None
     heartbeat_callback: Callable[[dict[str, datetime]], None] | None = None
+    stop_requested: threading.Event | None = None
 
     def __post_init__(self) -> None:
         if self.session_started_at is not None:
@@ -318,7 +319,13 @@ class PersistedStream:
         started = time.monotonic()
         deadline = started + duration
         worker.start()
+        shutdown_requested = False
         while time.monotonic() < deadline or not updates.empty():
+            if self.stop_requested is not None and self.stop_requested.is_set():
+                shutdown_requested = True
+                if self._exit_reason(stream) is None:
+                    stream.stop(reason="shutdown")
+                break
             if self.heartbeat_callback is not None:
                 self.heartbeat_callback(self.last_update)
             remaining = deadline - time.monotonic()
@@ -335,7 +342,9 @@ class PersistedStream:
             except queue.Empty:
                 continue
             self._process_update_safely(update)
-            if self._exit_reason(stream) in {"USER_INTERRUPT", "CONNECTION_TERMINATED", "SDK_FATAL_ERROR", "RUNTIME_FAILURE"}:
+            if self._exit_reason(stream) in {
+                "USER_INTERRUPT", "SHUTDOWN", "CONNECTION_TERMINATED", "SDK_FATAL_ERROR", "RUNTIME_FAILURE",
+            }:
                 break
         if self._exit_reason(stream) is None:
             diagnostics = getattr(getattr(stream, "stats", None), "diagnostics", None)
@@ -346,6 +355,20 @@ class PersistedStream:
                     stream.mark_duration_expired()
                 stream.stop(reason="duration" if time.monotonic() >= deadline else "runtime")
         worker.join(timeout=5)
+        if worker.is_alive():
+            # A transport implementation must honour close().  Retry once so
+            # shutdown remains bounded, then fail closed instead of closing
+            # SQLite while a non-owner worker is still active.
+            stream.stop(reason="shutdown" if shutdown_requested else "runtime")
+            worker.join(timeout=5)
+        if worker.is_alive():
+            diagnostics = getattr(getattr(stream, "stats", None), "diagnostics", None)
+            if diagnostics is not None:
+                diagnostics.exit_reason = "RUNTIME_FAILURE"
+                warnings = getattr(diagnostics, "warnings", None)
+                if warnings is not None:
+                    warnings.append("stream worker did not stop within bounded shutdown deadline")
+            raise RuntimeError("stream worker did not stop within bounded shutdown deadline")
         while True:
             try:
                 self._process_update_safely(updates.get_nowait())
@@ -375,4 +398,5 @@ class PersistedStream:
                 getattr(getattr(stream, "stats", None), "last_update", {}).values(), default=None
             ),
             "last_persistence_success": max(self.last_update.values(), default=None),
+            "worker_stopped": not worker.is_alive(),
         }

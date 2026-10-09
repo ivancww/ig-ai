@@ -62,6 +62,7 @@ def evaluate_health(
     now: datetime | None = None,
     stale_seconds: float = 900.0,
     heartbeat_seconds: float = 30.0,
+    expected_generation: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate persisted runtime evidence without contacting IG or mutating analytics."""
     now = (now or datetime.now(UTC)).astimezone(UTC)
@@ -76,6 +77,12 @@ def evaluate_health(
             "SELECT state_value_json, updated_at FROM runtime_state WHERE state_key='service'"
         ).fetchone()
         service = database.get_runtime_state("service") or {}
+        runtime_generation = service.get("runtime_generation")
+        if expected_generation and runtime_generation != expected_generation:
+            incidents.append(_incident(
+                "service-generation", DEGRADED,
+                "runtime state belongs to a different process generation", "SERVICE",
+            ))
         persistence_timestamp = service_row[1] if service_row else None
         schedule_rows = database.list_runtime_schedules()
         schedules = {row["instrument_id"]: row for row in schedule_rows}
@@ -175,6 +182,11 @@ def evaluate_health(
             incidents.append(_incident("service-heartbeat", DEGRADED, "runtime heartbeat is unavailable", "SERVICE"))
         elif heartbeat_age > heartbeat_seconds * 3:
             incidents.append(_incident("service-heartbeat", DEGRADED, "runtime heartbeat is not advancing", "SERVICE"))
+        if service.get("startup_failure"):
+            incidents.append(_incident(
+                "startup-failure", DEGRADED,
+                "backend startup did not reach IG readiness", "SERVICE",
+            ))
         connection = service.get("ig_connection") or UNKNOWN
         ig_status = HEALTHY if connection == "CONNECTED" and service_status == HEALTHY else (
             DEGRADED if connection in {"DISCONNECTED", "RECONNECTING"} else UNKNOWN
@@ -203,22 +215,33 @@ def evaluate_health(
             "health": HEALTHY if service.get("status") == "HEALTHY" else UNKNOWN,
             "heartbeat": service.get("last_heartbeat_at"),
             "heartbeat_age_seconds": _age(service.get("last_heartbeat_at"), now),
+            "runtime_generation": service.get("runtime_generation"),
+            "service_started_at": service.get("service_started_at"),
         },
         "ig": {
             "connection_status": service.get("ig_connection", UNKNOWN),
             "heartbeat": service.get("last_heartbeat_at"),
+            "runtime_generation": service.get("runtime_generation"),
         },
         "database": database_health,
         "alerts": alerts,
         "markets": markets,
         "incidents": incidents,
         "schedules": list(schedules.values()),
+        "runtime_generation": service.get("runtime_generation"),
+        "service_started_at": service.get("service_started_at"),
+        "generation_status": (
+            "CURRENT" if not expected_generation or service.get("runtime_generation") == expected_generation
+            else "MISMATCH"
+        ),
     }
 
 
 def persist_health(database, snapshot: dict[str, Any]) -> dict[str, Any]:
     """Persist a snapshot and transition incidents without emitting duplicates."""
     previous = database.get_runtime_state("self_monitoring") or {}
+    if previous.get("runtime_generation") != snapshot.get("runtime_generation"):
+        previous = {}
     previous_by_id = {item.get("id"): item for item in previous.get("incidents", [])}
     active = []
     for item in snapshot["incidents"]:
