@@ -13,11 +13,13 @@ def test_systemd_templates_supervise_backend_and_localhost_web_only():
     assert "EnvironmentFile=/etc/ig-ai/ig-ai.env" in backend
     assert "ExecStart=/opt/ig-ai/.venv/bin/ig-ai service" in backend
     assert "Restart=on-failure" in backend and "KillSignal=SIGTERM" in backend
-    assert "User=igai" in backend and "NoNewPrivileges=true" in backend
+    assert "User=igai" in backend and "Group=igai" in backend and "NoNewPrivileges=true" in backend
     assert "EnvironmentFile=/etc/ig-ai/ig-ai-web.env" in web
     assert "ExecStart=/opt/ig-ai/.venv/bin/ig-ai-web" in web
     assert "Restart=on-failure" in web and "KillSignal=SIGTERM" in web
-    assert "User=igai" in web and "NoNewPrivileges=true" in web
+    assert "User=igai" in web and "Group=igai" in web and "NoNewPrivileges=true" in web
+    assert "Requires=ig-ai.service" in web
+    assert "TimeoutStopSec=30" in backend and "TimeoutStopSec=15" in web
 
 
 def test_deployment_environment_and_check_preserve_secrets_and_loopback_boundary():
@@ -50,3 +52,30 @@ def test_phase9c_documentation_separates_readiness_from_live_validation():
     assert "HTTPS VALIDATED: NO" in document
     assert "REAL HONOR DEVICE VALIDATED: NO" in document
     assert "Browser/PWA → HTTPS reverse proxy" in document
+
+
+def test_repaired_transaction_has_explicit_prerequisites_readiness_backup_and_fail_closed_rollback():
+    remote = (ROOT / "deploy" / "ig-ai-remote-deploy.sh").read_text()
+    wrapper = (ROOT / "ig-ai-production-deploy.sh").read_text()
+    for dependency in ("rsync", "curl", "ss", "tailscale", "systemctl", "python3", "getent", "runuser", "dirname", "mktemp"):
+        assert dependency in remote
+    assert 'require_cmd "$command_name"' in remote
+    assert "runtime_generation" in remote
+    assert "source.backup(destination)" in remote
+    assert "web.rglob" in remote
+    assert "HEARTBEAT_MAX_AGE" in remote
+    assert "critical" in remote
+    assert "IGAI_STATE_DIR" in remote and "IGAI_REPORT_PATH" in remote
+    assert "forward_snapshot_status" in remote and '"rows"' in remote
+    assert "ROLLBACK FAILED" in remote
+    assert "package.before.json" in remote and "package.rollback.json" in remote
+    assert "ig-ai-remote-deploy.sh" in wrapper
+    assert "gcloud compute ssh" in wrapper
+
+
+def test_runtime_state_path_is_explicitly_writable_by_service_identity():
+    env = (DEPLOY / "ig-ai.env.example").read_text()
+    unit = (DEPLOY / "ig-ai.service.example").read_text()
+    assert "IGAI_STATE_DIR=/var/lib/ig-ai/state" in env
+    assert "IGAI_REPORT_PATH=/var/lib/ig-ai/state/igai-report.txt" in env
+    assert "ReadWritePaths=/var/lib/ig-ai" in unit

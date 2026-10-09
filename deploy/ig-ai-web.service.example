@@ -2,6 +2,7 @@
 Description=IG AI localhost web/PWA viewer
 After=network-online.target ig-ai.service
 Wants=network-online.target
+Requires=ig-ai.service
 
 [Service]
 Type=simple

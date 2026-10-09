@@ -311,7 +311,7 @@ class IGStreamService:
 
     def stop(self, *, reason: str = "requested") -> None:
         self._stop.set()
-        self.stats.diagnostics.intentional_shutdown = reason in {"duration", "signal", "requested", "runtime"}
+        self.stats.diagnostics.intentional_shutdown = reason in {"duration", "signal", "requested", "shutdown", "runtime"}
         self.stats.diagnostics.exit_reason = {
             "duration": "DURATION_COMPLETE",
             "signal": "USER_INTERRUPT",

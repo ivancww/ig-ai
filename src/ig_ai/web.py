@@ -63,8 +63,18 @@ def _analysis_freshness(timestamp: str | None) -> str:
 class WebReadModel:
     """Translate persisted engine records into a stable, browser-safe contract."""
 
-    def __init__(self, database: Database):
+    def __init__(self, database: Database, *, heartbeat_seconds: float = 30.0):
         self.database = database
+        self.heartbeat_seconds = heartbeat_seconds
+
+    @staticmethod
+    def _timestamp(value: object) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            return datetime.fromisoformat(value).astimezone(UTC)
+        except ValueError:
+            return None
 
     def _instrument_rows(self) -> dict[str, tuple[str, str, str | None]]:
         rows = self.database.connection.execute(
@@ -189,7 +199,73 @@ class WebReadModel:
     def health(self) -> dict:
         runtime = self.database.get_runtime_state("service") or {}
         markets = self.database.list_runtime_market_states()
-        snapshot = self.database.get_runtime_state("self_monitoring") or evaluate_health(self.database)
+        persisted_snapshot = self.database.get_runtime_state("self_monitoring")
+        current_generation = runtime.get("runtime_generation")
+        started_at = runtime.get("service_started_at")
+        snapshot_is_current = bool(persisted_snapshot)
+        if current_generation:
+            now = datetime.now(UTC)
+            snapshot_time = self._timestamp(persisted_snapshot.get("generated_at")) if persisted_snapshot else None
+            heartbeat_time = self._timestamp(persisted_snapshot.get("service", {}).get("heartbeat")) if persisted_snapshot else None
+            started_time = self._timestamp(started_at)
+            snapshot_is_current = bool(
+                persisted_snapshot
+                and persisted_snapshot.get("runtime_generation") == current_generation
+                and snapshot_time
+                and persisted_snapshot.get("generation_status") == "CURRENT"
+                and started_time
+                and snapshot_time >= started_time
+                and (now - snapshot_time).total_seconds() <= self.heartbeat_seconds * 3
+                and heartbeat_time
+                and (now - heartbeat_time).total_seconds() <= self.heartbeat_seconds * 3
+            )
+        snapshot = persisted_snapshot if snapshot_is_current else evaluate_health(
+            self.database, expected_generation=current_generation
+        )
+        if current_generation and not snapshot_is_current:
+            snapshot = dict(snapshot)
+            snapshot["self_monitoring_ready"] = False
+            incidents = list(snapshot.get("incidents", []))
+            if not any(item.get("id") == "self-monitor-generation" for item in incidents):
+                incidents.append({
+                    "id": "self-monitor-generation",
+                    "severity": "DEGRADED",
+                    "domain": "SERVICE",
+                    "reason": "current runtime self-monitor snapshot is not persisted yet",
+                    "status": "ACTIVE",
+                })
+            snapshot["incidents"] = incidents
+            snapshot["overall_status"] = "DEGRADED"
+        else:
+            heartbeat = snapshot.get("service", {}).get("heartbeat")
+            heartbeat_time = self._timestamp(heartbeat)
+            started_time = self._timestamp(started_at)
+            heartbeat_current = bool(
+                heartbeat_time
+                and (datetime.now(UTC) - heartbeat_time).total_seconds() <= self.heartbeat_seconds * 3
+            )
+            snapshot = {
+                **snapshot,
+                "self_monitoring_ready": bool(
+                    heartbeat_current
+                    and runtime.get("status") == "HEALTHY"
+                    and runtime.get("ig_connection") == "CONNECTED"
+                    and (not current_generation or (heartbeat_time and started_time and heartbeat_time >= started_time))
+                ),
+            }
+        if runtime.get("status") != "HEALTHY" or runtime.get("ig_connection") != "CONNECTED":
+            snapshot = dict(snapshot)
+            incidents = list(snapshot.get("incidents", []))
+            if not any(item.get("id") == "runtime-readiness" for item in incidents):
+                incidents.append({
+                    "id": "runtime-readiness",
+                    "severity": "DEGRADED",
+                    "domain": "SERVICE",
+                    "reason": "current backend runtime is not healthy and IG-connected",
+                    "status": "ACTIVE",
+                })
+            snapshot["incidents"] = incidents
+            snapshot["overall_status"] = "DEGRADED"
         schedules = {item["instrument_id"]: item for item in self.database.list_runtime_schedules()}
         names = {identity[0]: market for market, identity in self._instrument_rows().items()}
         for market in markets:
@@ -199,16 +275,26 @@ class WebReadModel:
         public_schedules = [{key: value for key, value in {**schedule, "market": names.get(schedule.get("instrument_id"), "UNKNOWN")}.items() if key != "instrument_id"} for schedule in schedules.values()]
         public_markets = [{key: value for key, value in market.items() if key != "instrument_id"} for market in markets]
         health_markets = snapshot.get("markets") or public_markets
+        service_payload = {
+            **snapshot.get("service", {}),
+            "status": _value(runtime.get("status")),
+            "ig_connection": _value(runtime.get("ig_connection")),
+            "last_heartbeat": runtime.get("last_heartbeat_at"),
+        }
+        ig_payload = {
+            **snapshot.get("ig", {}),
+            "connection_status": _value(runtime.get("ig_connection")),
+        }
         return {
             "generated_at": snapshot.get("generated_at", datetime.now(UTC).isoformat()),
             "overall_status": snapshot.get("overall_status", "UNKNOWN"),
-            "service": {
-                "status": _value(runtime.get("status")),
-                "ig_connection": _value(runtime.get("ig_connection")),
-                "last_heartbeat": runtime.get("last_heartbeat_at"),
-                **snapshot.get("service", {}),
+            "service": service_payload,
+            "self_monitoring": {
+                "ready": snapshot.get("self_monitoring_ready", False),
+                "runtime_generation": snapshot.get("runtime_generation"),
+                "generated_at": snapshot.get("generated_at"),
             },
-            "ig": snapshot.get("ig", {"connection_status": _value(runtime.get("ig_connection"))}),
+            "ig": ig_payload,
             "database": snapshot.get("database", {"status": "UNKNOWN"}),
             "alerts": snapshot.get("alerts", {"status": "UNKNOWN"}),
             "incidents": snapshot.get("incidents", []),
@@ -288,7 +374,8 @@ def serve(database_path: str | Path, host: str = "127.0.0.1", port: int = 8080) 
     # Keep the SQLite connection on its owner thread. A reverse proxy can
     # provide concurrency while this small first-party viewer stays safe.
     server = HTTPServer((host, port), WebHandler)
-    server.model = WebReadModel(database)  # type: ignore[attr-defined]
+    heartbeat_seconds = float(os.environ.get("IGAI_SERVICE_HEARTBEAT_SECONDS", "30"))
+    server.model = WebReadModel(database, heartbeat_seconds=heartbeat_seconds)  # type: ignore[attr-defined]
     try:
         server.serve_forever()
     finally:
