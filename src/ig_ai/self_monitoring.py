@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 
@@ -111,7 +112,20 @@ def evaluate_health(
             else:
                 tick_health = UNKNOWN
 
-            direction = database.get_direction_status(instrument_id) or database.get_direction_status(market)
+            try:
+                direction_row = database.connection.execute(
+                    "SELECT snapshot_json FROM direction_snapshots "
+                    "WHERE instrument_id=? AND timeframe='1H' AND is_closed=1 "
+                    "ORDER BY candle_start DESC LIMIT 1",
+                    (instrument_id,),
+                ).fetchone()
+            except Exception:
+                direction_row = None
+            direction = (
+                json.loads(direction_row[0])
+                if direction_row
+                else database.get_direction_status(instrument_id) or database.get_direction_status(market)
+            )
             latest_analysis = None
             if direction and direction.get("candle_state") == "CLOSED":
                 latest_analysis = direction.get("candle_timestamp")
