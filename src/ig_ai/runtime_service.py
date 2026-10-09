@@ -18,6 +18,8 @@ SERVICE_STATES = {"STARTING", "HEALTHY", "DEGRADED", "STOPPING"}
 CONNECTION_STATES = {"CONNECTED", "RECONNECTING", "DISCONNECTED", "UNKNOWN"}
 MARKET_STATES = {"MONITORING", "MARKET_CLOSED", "SCHEDULED_OFF", "STALE_DATA", "UNKNOWN"}
 SCHEDULE_MODES = {"24_7", "MARKET_HOURS", "CUSTOM"}
+PROVIDER_CLOSED_STATUSES = {"CLOSED", "CLOSED_NO_TRADING", "EDITS_ONLY", "OFFLINE"}
+PROVIDER_OPEN_STATUSES = {"OPEN", "TRADEABLE"}
 
 
 def parse_custom_windows(raw: str) -> tuple[str, ...]:
@@ -139,28 +141,45 @@ class RuntimeService:
         self.database.save_runtime_state("service", current)
         log.info("IG connection state changed: %s", state)
 
-    def update_market(self, instrument_id: str, *, schedule: Schedule, last_data: datetime | None = None, connection: str = "UNKNOWN", market_status: str | None = None) -> dict:
+    def update_market(
+        self,
+        instrument_id: str,
+        *,
+        schedule: Schedule,
+        last_data: datetime | None = None,
+        connection: str = "UNKNOWN",
+        market_status: str | None = None,
+        market_status_source: str | None = None,
+        market_status_at: datetime | None = None,
+    ) -> dict:
         now = datetime.now(UTC)
         active = schedule.is_active(now)
         normalized_status = (market_status or "").upper()
-        if normalized_status in {"CLOSED", "CLOSED_NO_TRADING"}:
-            state = "MARKET_CLOSED"
-        elif active is False:
+        if active is False:
             state = "SCHEDULED_OFF"
+        elif normalized_status in PROVIDER_CLOSED_STATUSES:
+            state = "MARKET_CLOSED"
         elif active is None:
             state = "UNKNOWN"
         elif last_data is None:
             state = "UNKNOWN"
-        elif (now - last_data).total_seconds() > self.stale_seconds:
-            state = "STALE_DATA"
-        else:
+        elif (now - last_data).total_seconds() <= self.stale_seconds:
             state = "MONITORING"
+        elif normalized_status not in PROVIDER_OPEN_STATUSES:
+            # 24_7 means keep monitoring; it does not prove that the
+            # provider market is currently open.
+            state = "UNKNOWN"
+        else:
+            state = "STALE_DATA"
         result = {
             "instrument_id": instrument_id,
             "monitoring_state": state,
             "ig_connection": connection,
             "last_tick": last_data.isoformat() if last_data else None,
             "last_heartbeat_at": now.isoformat(),
+            "market_status": market_status,
+            "market_status_source": market_status_source,
+            "market_status_at": market_status_at.isoformat() if market_status_at else None,
             **self.database.latest_market_telemetry(instrument_id),
         }
         self.database.save_runtime_market_state(instrument_id, result)
@@ -200,9 +219,10 @@ def format_service_status(read_model: dict) -> str:
 
 def run_live_service(settings, markets: str = "US Tech 100,Japan 225,Hong Kong HS50") -> int:
     """Start the existing discovery/Lightstreamer/PersistedStream stack indefinitely."""
+    import time
     from datetime import datetime
 
-    from .discovery import discover_market_groups, select_stream_instruments
+    from .discovery import discover_market_groups, refresh_market_status, select_stream_instruments
     from .models import Instrument
     from .rest import IGRestClient
     from .runtime import PersistedStream
@@ -230,15 +250,59 @@ def run_live_service(settings, markets: str = "US Tech 100,Japan 225,Hong Kong H
         database.save_instrument_model(instrument)
         database.save_runtime_schedule(instrument.instrument_id, Schedule(settings.monitoring_mode, settings.custom_windows, settings.runtime_timezone).as_dict())
     schedules = {instrument_id: Schedule(settings.monitoring_mode, settings.custom_windows, settings.runtime_timezone) for instrument_id in instruments}
+    status_refresh_seconds = settings.market_status_refresh_seconds
+    status_cache = {
+        instrument_id: {
+            "status": instrument.market_status,
+            "source": "DISCOVERY",
+            "refreshed_at": datetime.now(UTC),
+        }
+        for instrument_id, instrument in instruments.items()
+    }
+    last_status_refresh = time.monotonic()
+
+    def refresh_market_statuses() -> None:
+        nonlocal last_status_refresh
+        now_monotonic = time.monotonic()
+        if now_monotonic - last_status_refresh < status_refresh_seconds:
+            return
+        last_status_refresh = now_monotonic
+        refreshed_at = datetime.now(UTC)
+        for instrument_id, instrument in instruments.items():
+            try:
+                status = refresh_market_status(client, instrument.epic)
+                status_cache[instrument_id] = {
+                    "status": status,
+                    "source": "IG_MARKET_DETAILS" if status else "IG_MARKET_DETAILS_UNAVAILABLE",
+                    "refreshed_at": refreshed_at,
+                }
+            except Exception as exc:  # provider status is advisory; stream remains read-only
+                status_cache[instrument_id] = {
+                    "status": None,
+                    "source": f"IG_MARKET_DETAILS_ERROR:{type(exc).__name__}",
+                    "refreshed_at": refreshed_at,
+                }
+                log.warning("market status refresh unavailable for %s: %s", instrument.epic, type(exc).__name__)
+
     stream = IGStreamService(session.lightstreamer_endpoint, session.account_id, lightstreamer_password(session.cst, session.security_token), OfficialLightstreamerTransport(), reconnect_seconds=settings.stream_reconnect_seconds)
     for instrument in instruments.values():
         stream.add_subscription(Subscription(instrument.instrument_id, f"PRICE:{session.account_id}:{instrument.epic}"))
     service.start(list(instruments))
     def heartbeat(last_data: dict[str, datetime]) -> None:
+        refresh_market_statuses()
         connection = stream.stats.connection_state if stream.stats.connection_state in CONNECTION_STATES else "UNKNOWN"
         service.heartbeat(connection=connection, market_data=last_data)
         for instrument_id, schedule in schedules.items():
-            service.update_market(instrument_id, schedule=schedule, last_data=last_data.get(instrument_id), connection=connection, market_status=instruments[instrument_id].market_status)
+            status = status_cache[instrument_id]
+            service.update_market(
+                instrument_id,
+                schedule=schedule,
+                last_data=last_data.get(instrument_id),
+                connection=connection,
+                market_status=status["status"],
+                market_status_source=status["source"],
+                market_status_at=status["refreshed_at"],
+            )
 
     sink = PersistedStream(database, instruments, settings.market_timezone, session_started_at=datetime.now(UTC), update_filter=lambda update: schedules.get(str(update.get("instrument_id")), Schedule("MARKET_HOURS")).is_active() is True, heartbeat_callback=heartbeat)
     original_term_handler = signal.getsignal(signal.SIGTERM)

@@ -73,10 +73,33 @@ def test_market_stale_and_scheduled_off_are_distinct(tmp_path):
     service = RuntimeService(database, stale_seconds=60)
     service.start(["EPIC"])
     old = datetime.now(UTC) - timedelta(minutes=5)
-    assert service.update_market("EPIC", schedule=Schedule("24_7"), last_data=old)["monitoring_state"] == "STALE_DATA"
+    assert service.update_market("EPIC", schedule=Schedule("24_7"), last_data=old, market_status="TRADEABLE")["monitoring_state"] == "STALE_DATA"
+    assert service.update_market("EPIC", schedule=Schedule("24_7"), last_data=old)["monitoring_state"] == "UNKNOWN"
     assert service.update_market("EPIC", schedule=Schedule("24_7"), last_data=datetime.now(UTC), market_status="CLOSED")["monitoring_state"] == "MARKET_CLOSED"
     assert service.update_market("EPIC", schedule=Schedule("CUSTOM", ("1,2,3,4,5 00:00-00:01",)), last_data=datetime.now(UTC))["monitoring_state"] == "SCHEDULED_OFF"
     assert service.update_market("EPIC", schedule=Schedule("MARKET_HOURS"), last_data=datetime.now(UTC))["monitoring_state"] == "UNKNOWN"
+    assert service.update_market("EPIC", schedule=Schedule("24_7"), last_data=datetime.now(UTC), market_status="TRADEABLE")["monitoring_state"] == "MONITORING"
+    database.close()
+
+
+def test_market_status_provenance_is_persisted_and_exposed(tmp_path):
+    database = Database(tmp_path / "market-status.sqlite3")
+    service = RuntimeService(database)
+    service.start(["EPIC"])
+    refreshed_at = datetime.now(UTC)
+    state = service.update_market(
+        "EPIC",
+        schedule=Schedule("24_7"),
+        last_data=datetime.now(UTC),
+        connection="CONNECTED",
+        market_status="CLOSED",
+        market_status_source="IG_MARKET_DETAILS",
+        market_status_at=refreshed_at,
+    )
+    assert state["market_status"] == "CLOSED"
+    assert state["market_status_source"] == "IG_MARKET_DETAILS"
+    assert state["market_status_at"] == refreshed_at.isoformat()
+    assert database.list_runtime_market_states()[0]["monitoring_state"] == "MARKET_CLOSED"
     database.close()
 
 
