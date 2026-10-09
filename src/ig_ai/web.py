@@ -87,6 +87,7 @@ class WebReadModel:
     def _market(self, market: str, instruments: dict[str, tuple[str, str, str | None]]) -> dict:
         instrument_id, _epic, market_status = instruments.get(market, (None, None, None))
         runtime = next((x for x in self.database.list_runtime_market_states() if x.get("instrument_id") == instrument_id), {}) if instrument_id else {}
+        market_status = runtime.get("market_status", market_status)
         # Phase 8B snapshots identify the analytical market; runtime rows use
         # the provider instrument id. Support both persisted identities.
         direction = (self.database.get_direction_status(instrument_id) if instrument_id else None) or self.database.get_direction_status(market)

@@ -84,6 +84,25 @@ def test_stale_market_is_not_reported_as_live(tmp_path):
     database.close()
 
 
+def test_dashboard_prefers_current_runtime_market_status(tmp_path):
+    database = Database(tmp_path / "market-status-web.sqlite3")
+    _seed_market(database)
+    database.save_runtime_market_state(
+        "EPIC",
+        {
+            "instrument_id": "EPIC",
+            "monitoring_state": "MARKET_CLOSED",
+            "market_status": "CLOSED",
+            "market_status_source": "IG_MARKET_DETAILS",
+            "last_tick": (datetime.now(UTC) - timedelta(hours=2)).isoformat(),
+        },
+    )
+    market = WebReadModel(database).dashboard()["markets"][0]
+    assert market["market_status"] == "CLOSED"
+    assert market["monitoring_state"] == "MARKET_CLOSED"
+    database.close()
+
+
 def test_live_and_analysis_freshness_are_independent(tmp_path):
     database = Database(tmp_path / "freshness.sqlite3")
     now = datetime.now(UTC)

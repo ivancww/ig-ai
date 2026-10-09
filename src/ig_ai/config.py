@@ -25,6 +25,7 @@ class Settings:
     monitoring_mode: str = "24_7"
     runtime_timezone: str = "UTC"
     stale_data_seconds: float = 900.0
+    market_status_refresh_seconds: float = 300.0
     custom_windows: tuple[str, ...] = ()
 
     @classmethod
@@ -58,6 +59,7 @@ class Settings:
             stale_seconds = float(env.get("IGAI_STALE_DATA_SECONDS", "900"))
             runtime_timezone = env.get("IGAI_TIMEZONE", "UTC")
             ZoneInfo(runtime_timezone)
+            market_status_refresh = float(env.get("IGAI_MARKET_STATUS_REFRESH_SECONDS", "300"))
         except (ValueError, TypeError) as exc:
             raise ConfigurationError("IG numeric settings or market timezone are invalid") from exc
         monitoring_mode = env.get("IGAI_MONITORING_MODE", "24_7").strip().upper()
@@ -70,7 +72,7 @@ class Settings:
             raise ConfigurationError(str(exc)) from exc
         if monitoring_mode == "CUSTOM" and not custom_windows:
             raise ConfigurationError("IGAI_CUSTOM_WINDOWS is required when IGAI_MONITORING_MODE=CUSTOM")
-        if timeout <= 0 or discovery_detail_budget <= 0 or reconnect < 0 or heartbeat <= 0 or stale_seconds <= 0:
+        if timeout <= 0 or discovery_detail_budget <= 0 or reconnect < 0 or heartbeat <= 0 or stale_seconds <= 0 or market_status_refresh <= 0:
             raise ConfigurationError(
                 "IG timeout must be positive, discovery detail budget must be positive, "
                 "and reconnect delay non-negative"
@@ -93,5 +95,6 @@ class Settings:
             monitoring_mode=monitoring_mode,
             runtime_timezone=runtime_timezone,
             stale_data_seconds=stale_seconds,
+            market_status_refresh_seconds=market_status_refresh,
             custom_windows=custom_windows,
         )

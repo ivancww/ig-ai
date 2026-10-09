@@ -1,4 +1,10 @@
-from ig_ai.discovery import classify_instrument, discover_market_groups, select_stream_instruments
+from ig_ai.discovery import (
+    classify_instrument,
+    discover_market_groups,
+    extract_market_status,
+    refresh_market_status,
+    select_stream_instruments,
+)
 from ig_ai.exceptions import IGHTTPError
 
 
@@ -23,6 +29,19 @@ def test_classification_distinguishes_rolling_futures_and_other_types():
     assert classify_instrument({"instrumentType": "INDICES", "expiry": "DEC-26"}) == "FUTURES/FORWARD"
     assert classify_instrument({"instrumentType": "SHARES", "expiry": "-"}) == "OTHER"
     assert classify_instrument({"instrumentType": "INDICES"}) == "UNKNOWN"
+
+
+def test_extract_market_status_reads_provider_market_detail_shapes():
+    assert extract_market_status({"instrument": {"marketStatus": "tradeable"}}) == "TRADEABLE"
+    assert extract_market_status({"snapshot": {"marketStatus": "closed"}}) == "CLOSED"
+    assert extract_market_status({"marketStatus": "EDITS_ONLY"}) == "EDITS_ONLY"
+    assert extract_market_status({"instrument": {"name": "US Tech 100"}}) is None
+
+
+def test_refresh_market_status_uses_read_only_market_details():
+    client = FakeClient({}, {"EPIC": {"snapshot": {"marketStatus": "TRADEABLE"}}})
+    assert refresh_market_status(client, "EPIC") == "TRADEABLE"
+    assert client.detail_epics == ["EPIC"]
 
 
 def test_filters_options_and_shares_and_requires_detail_verification():

@@ -69,6 +69,22 @@ def _value(data: dict[str, Any], *keys: str) -> Any:
     return None
 
 
+def extract_market_status(data: dict[str, Any]) -> str | None:
+    """Extract the provider's current market status from a market response."""
+    if not isinstance(data, dict):
+        return None
+    instrument = data.get("instrument") if isinstance(data.get("instrument"), dict) else {}
+    snapshot = data.get("snapshot") if isinstance(data.get("snapshot"), dict) else {}
+    merged = {**data, **instrument, **snapshot}
+    status = _value(merged, "marketStatus", "status")
+    return str(status).upper() if status not in (None, "") else None
+
+
+def refresh_market_status(client: IGRestClient, epic: str) -> str | None:
+    """Read the current provider status through the existing market-details GET."""
+    return extract_market_status(client.market_details(epic))
+
+
 def classify_instrument(data: dict[str, Any]) -> str:
     """Classify only from provider fields; UNKNOWN is safer than an assumption."""
     instrument_type = str(_value(data, "instrumentType", "type") or "").upper()
@@ -195,7 +211,7 @@ def _candidate(
     merged = {**search_item, **instrument, **details, **snapshot}
     epic = str(_value(merged, "epic") or "").strip()
     classification = classify_instrument(merged)
-    status = _value(merged, "marketStatus")
+    status = extract_market_status(merged)
     eligible = _eligible(merged, classification, requested_market)
     verified = bool(epic and details and eligible)
     safe_metadata = {
