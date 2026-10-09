@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from .market_identity import canonical_market_label
+
 HEALTHY = "HEALTHY"
 DEGRADED = "DEGRADED"
 ATTENTION = "ATTENTION"
@@ -77,7 +79,7 @@ def evaluate_health(
         schedule_rows = database.list_runtime_schedules()
         schedules = {row["instrument_id"]: row for row in schedule_rows}
         names = {
-            row[0]: row[2]
+            row[0]: canonical_market_label(row[2]) or canonical_market_label(row[1]) or row[2]
             for row in database.connection.execute("SELECT instrument_id, epic, market_name FROM instruments")
         }
         runtime_rows = {
@@ -109,7 +111,7 @@ def evaluate_health(
             else:
                 tick_health = UNKNOWN
 
-            direction = database.get_direction_status(instrument_id)
+            direction = database.get_direction_status(instrument_id) or database.get_direction_status(market)
             latest_analysis = None
             if direction and direction.get("candle_state") == "CLOSED":
                 latest_analysis = direction.get("candle_timestamp")
