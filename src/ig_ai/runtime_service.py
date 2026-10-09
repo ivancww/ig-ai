@@ -178,14 +178,15 @@ class RuntimeService:
             state = "MARKET_CLOSED"
         elif active is None:
             state = "UNKNOWN"
+        elif normalized_status not in PROVIDER_OPEN_STATUSES:
+            # A recent tick is evidence of recent data, not authoritative
+            # proof of current IG dealing availability. 24_7 is a monitor
+            # schedule and never supplies market-session hours.
+            state = "UNKNOWN"
         elif last_data is None:
             state = "UNKNOWN"
         elif (now - last_data).total_seconds() <= self.stale_seconds:
             state = "MONITORING"
-        elif normalized_status not in PROVIDER_OPEN_STATUSES:
-            # 24_7 means keep monitoring; it does not prove that the
-            # provider market is currently open.
-            state = "UNKNOWN"
         else:
             state = "STALE_DATA"
         result = {
