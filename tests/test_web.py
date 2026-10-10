@@ -84,6 +84,14 @@ def test_stale_market_is_not_reported_as_live(tmp_path):
     database.close()
 
 
+def test_web_uses_configured_stale_data_contract(tmp_path):
+    database = Database(tmp_path / "custom-stale.sqlite3")
+    _seed_market(database)
+    market = WebReadModel(database, stale_seconds=5).dashboard()["markets"][0]
+    assert market["live_freshness"] == "STALE"
+    database.close()
+
+
 def test_dashboard_prefers_current_runtime_market_status(tmp_path):
     database = Database(tmp_path / "market-status-web.sqlite3")
     _seed_market(database)

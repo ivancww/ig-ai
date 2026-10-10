@@ -13,6 +13,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .database import Database
+from .health_contract import HealthContract
 
 log = logging.getLogger(__name__)
 
@@ -96,11 +97,13 @@ class RuntimeService:
     """Owns service state; the existing PersistedStream owns market analysis."""
 
     def __init__(self, database: Database, *, heartbeat_seconds: float = 30.0, stale_seconds: float = 900.0):
-        if heartbeat_seconds <= 0 or stale_seconds <= 0:
-            raise ValueError("heartbeat and stale intervals must be positive")
         self.database = database
-        self.heartbeat_seconds = heartbeat_seconds
-        self.stale_seconds = stale_seconds
+        self.health_contract = HealthContract(
+            heartbeat_seconds=heartbeat_seconds,
+            stale_data_seconds=stale_seconds,
+        )
+        self.heartbeat_seconds = self.health_contract.heartbeat_seconds
+        self.stale_seconds = self.health_contract.stale_data_seconds
         self.started_at: datetime | None = None
         self.runtime_generation: str | None = None
         self.last_heartbeat: datetime | None = None
@@ -126,6 +129,7 @@ class RuntimeService:
             "generated_at": self.started_at.isoformat(),
             "overall_status": "UNKNOWN",
             "generation_status": "STARTING",
+            "health_contract": self.health_contract.as_dict(),
             "incidents": [],
         })
         self.register_instruments(instruments)

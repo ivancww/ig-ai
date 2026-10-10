@@ -8,6 +8,8 @@ web_service_name="${IGAI_WEB_SERVICE_NAME:-ig-ai-web}"
 web_host="${IGAI_WEB_HOST:-127.0.0.1}"
 web_port="${IGAI_WEB_PORT:-8080}"
 database_path="${IG_DATABASE_PATH:-/var/lib/ig-ai/data/ig_ai.sqlite3}"
+heartbeat_seconds="${IGAI_SERVICE_HEARTBEAT_SECONDS:-30}"
+stale_data_seconds="${IGAI_STALE_DATA_SECONDS:-900}"
 web_url="http://${web_host}:${web_port}"
 
 case "$web_host" in
@@ -32,11 +34,13 @@ PY
 
 health="$(curl --fail --silent --show-error --max-time 5 "$web_url/api/health")"
 curl --fail --silent --show-error --max-time 5 "$web_url/api/dashboard" >/dev/null
-printf '%s' "$health" | python3 -c '
+printf '%s\n' "$heartbeat_seconds" "$stale_data_seconds" | python3 -c '
 import json
 import sys
 from datetime import UTC, datetime
 
+heartbeat_seconds = float(sys.stdin.readline())
+stale_data_seconds = float(sys.stdin.readline())
 payload = json.load(sys.stdin)
 service = payload.get("service", {})
 markets = payload.get("markets", [])
@@ -47,8 +51,13 @@ try:
     age = (datetime.now(UTC) - datetime.fromisoformat(heartbeat).astimezone(UTC)).total_seconds()
 except ValueError as exc:
     raise SystemExit("FAIL: heartbeat timestamp is invalid") from exc
-if age > 180:
+if age > heartbeat_seconds * 3:
     raise SystemExit("FAIL: heartbeat is stale")
+contract = payload.get("health_contract", {})
+if contract.get("heartbeat_max_age_seconds") != heartbeat_seconds * 3:
+    raise SystemExit("FAIL: health contract heartbeat threshold mismatch")
+if contract.get("stale_data_seconds") != stale_data_seconds:
+    raise SystemExit("FAIL: health contract stale-data threshold mismatch")
 if payload.get("overall_status") not in {"HEALTHY", "ATTENTION"}:
     raise SystemExit("FAIL: overall health is not ready")
 critical = [
@@ -64,6 +73,8 @@ if generation and (self_monitoring.get("runtime_generation") != generation or no
     raise SystemExit("FAIL: self-monitor snapshot is not from the current runtime generation")
 if generation and not service.get("service_started_at"):
     raise SystemExit("FAIL: current service generation is missing its start marker")
+if len(markets) < 3:
+    raise SystemExit("FAIL: fewer than three monitored markets are visible")
 if generation and self_monitoring.get("generated_at"):
     try:
         generated = datetime.fromisoformat(self_monitoring["generated_at"]).astimezone(UTC)

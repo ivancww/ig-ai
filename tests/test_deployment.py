@@ -28,6 +28,8 @@ def test_deployment_environment_and_check_preserve_secrets_and_loopback_boundary
     assert "IGAI_WEB_HOST=127.0.0.1" in env
     assert "IGAI_WEB_PORT=8080" in env
     assert "IG_DATABASE_PATH=/var/lib/ig-ai/data/ig_ai.sqlite3" in env
+    assert "IGAI_SERVICE_HEARTBEAT_SECONDS=30" in env
+    assert "IGAI_STALE_DATA_SECONDS=900" in env
     assert "case \"$web_host\"" in check
     assert "systemctl is-active" in check
     assert "mode=ro" in check
@@ -66,6 +68,8 @@ def test_repaired_transaction_has_explicit_prerequisites_readiness_backup_and_fa
     assert "HEARTBEAT_MAX_AGE" in remote
     assert "critical" in remote
     assert "IGAI_STATE_DIR" in remote and "IGAI_REPORT_PATH" in remote
+    assert "RELEASE-MANIFEST.json" in remote
+    assert "verify_backup" in remote
     assert "forward_snapshot_status" in remote and '"rows"' in remote
     assert "ROLLBACK FAILED" in remote
     assert "package.before.json" in remote and "package.rollback.json" in remote
@@ -79,3 +83,10 @@ def test_runtime_state_path_is_explicitly_writable_by_service_identity():
     assert "IGAI_STATE_DIR=/var/lib/ig-ai/state" in env
     assert "IGAI_REPORT_PATH=/var/lib/ig-ai/state/igai-report.txt" in env
     assert "ReadWritePaths=/var/lib/ig-ai" in unit
+
+
+def test_deployment_source_identity_is_external_and_manifest_is_required():
+    wrapper = (ROOT / "ig-ai-production-deploy.sh").read_text()
+    assert 'IGAI_APPROVED_SHA' in wrapper
+    assert "EXPECTED_SHA=e74a092" not in wrapper
+    assert "source_sha" in wrapper and "lightstreamer_version" in wrapper

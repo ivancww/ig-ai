@@ -1,5 +1,6 @@
 """Disposable deployment transaction tests; no systemd, credentials, or IG network are used."""
 
+import hashlib
 import json
 import os
 import shutil
@@ -13,11 +14,35 @@ from ig_ai.database import Database
 
 ROOT = Path(__file__).parents[1]
 REMOTE = ROOT / "deploy" / "ig-ai-remote-deploy.sh"
+APPROVED_SHA = "a" * 40
 
 
 def _write_executable(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
     path.chmod(0o755)
+
+
+def _write_release_manifest(root: Path, source_sha: str) -> None:
+    web = root / "web"
+    web_files = {
+        str(path.relative_to(web)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(web.rglob("*"))
+        if path.is_file()
+    }
+    (root / "RELEASE-MANIFEST.json").write_text(
+        json.dumps(
+            {
+                "manifest_version": 1,
+                "source_sha": source_sha,
+                "package_version": "0.1.0",
+                "lightstreamer_version": "2.2.3",
+                "cache_version": "test-cache",
+                "web_files": web_files,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _prepare_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Path, Database]:
@@ -27,12 +52,14 @@ def _prepare_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Pa
         source = ROOT / name
         destination = app / name
         shutil.copytree(source, destination) if source.is_dir() else shutil.copy2(source, destination)
+    _write_release_manifest(app, "previous")
     bundle_root = tmp_path / "bundle"
     shutil.copytree(app, bundle_root)
     (bundle_root / "web" / "assets" / "app.js").open("a").write("\n// VERSION_B\n")
+    _write_release_manifest(bundle_root, APPROVED_SHA)
     bundle = tmp_path / "application.tar.gz"
     with tarfile.open(bundle, "w:gz") as archive:
-        for name in ("src", "web", "bin", "pyproject.toml", "uv.lock"):
+        for name in ("src", "web", "bin", "pyproject.toml", "uv.lock", "RELEASE-MANIFEST.json"):
             archive.add(bundle_root / name, arcname=name)
 
     venv = tmp_path / "venv"
@@ -75,10 +102,13 @@ def _prepare_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Pa
     state_dir.mkdir(parents=True)
     state_dir.chmod(0o750)
     (env_dir / "ig-ai.env").write_text(
-        f"IG_DATABASE_PATH={database_path}\nIGAI_STATE_DIR={state_dir}\nIGAI_REPORT_PATH={state_dir / 'igai-report.txt'}\n",
+        f"IG_DATABASE_PATH={database_path}\nIGAI_STATE_DIR={state_dir}\nIGAI_REPORT_PATH={state_dir / 'igai-report.txt'}\nIGAI_SERVICE_HEARTBEAT_SECONDS=30\nIGAI_STALE_DATA_SECONDS=900\n",
         encoding="utf-8",
     )
-    (env_dir / "ig-ai-web.env").write_text(f"IG_DATABASE_PATH={database_path}\nIGAI_WEB_HOST=127.0.0.1\nIGAI_WEB_PORT=8080\n", encoding="utf-8")
+    (env_dir / "ig-ai-web.env").write_text(
+        f"IG_DATABASE_PATH={database_path}\nIGAI_SERVICE_HEARTBEAT_SECONDS=30\nIGAI_STALE_DATA_SECONDS=900\nIGAI_WEB_HOST=127.0.0.1\nIGAI_WEB_PORT=8080\n",
+        encoding="utf-8",
+    )
 
     fakebin = tmp_path / "fakebin"
     fakebin.mkdir()
@@ -91,6 +121,23 @@ def _prepare_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Pa
         """import json, os, sqlite3, sys\nfrom datetime import UTC, datetime\ndb, health, log = sys.argv[1:]\nnow = datetime.now(UTC).isoformat(); generation = 'fake-' + str(int(datetime.now(UTC).timestamp() * 1000000))\nheartbeat = '2020-01-01T00:00:00+00:00' if os.path.exists(os.environ.get('STALE_HEARTBEAT_MARKER', '')) else now\nmissing_self_monitor = os.path.exists(os.environ.get('MISSING_SELF_MONITOR_MARKER', ''))\nfor marker in (os.environ.get('STALE_HEARTBEAT_MARKER', ''), os.environ.get('MISSING_SELF_MONITOR_MARKER', '')):\n    if marker and os.path.exists(marker): os.unlink(marker)\nlegacy = os.environ.get('LEGACY_ROLLBACK') == '1' and os.path.exists(os.environ['UV_COUNT']) and int(open(os.environ['UV_COUNT']).read()) >= 2\nc = sqlite3.connect(db)\nvalue = {'status':'HEALTHY','service_started_at':now,'last_heartbeat_at':heartbeat,'ig_connection':'CONNECTED'}\nif not legacy: value['runtime_generation'] = generation\nc.execute(\"INSERT INTO runtime_state VALUES ('service', ?, ?) ON CONFLICT(state_key) DO UPDATE SET state_value_json=excluded.state_value_json, updated_at=excluded.updated_at\", (json.dumps(value), now))\nc.commit(); c.close()\nmarkets = [{'market':'US Tech 100','market_status':'TRADEABLE','monitoring_state':'MONITORING','latest_tick':now,'tick_age_seconds':0},{'market':'Japan 225','market_status':'TRADEABLE','monitoring_state':'MONITORING','latest_tick':now,'tick_age_seconds':0},{'market':'Hong Kong HS50','market_status':'CLOSED','monitoring_state':'MARKET_CLOSED','latest_tick':None,'tick_age_seconds':None}]\npayload = {'overall_status':'HEALTHY','service':{**value,'last_heartbeat':heartbeat},'ig':{'connection_status':'CONNECTED'},'markets':markets}\nif not legacy and not missing_self_monitor: payload['self_monitoring'] = {'ready':True,'runtime_generation':generation,'generated_at':now}\nopen(health,'w',encoding='utf-8').write(json.dumps(payload))\nopen(log,'a',encoding='utf-8').write('POST /session\\nGET /markets\\nGET /prices\\n')\n""",
         encoding="utf-8",
     )
+    helper_source = helper.read_text(encoding="utf-8")
+    helper_source = helper_source.replace(
+        "payload = {'overall_status':'HEALTHY',",
+        "payload = {'overall_status':'HEALTHY','health_contract':{'version':'ig-ai-health-v1','heartbeat_seconds':30.0,'heartbeat_max_age_seconds':90.0,'stale_data_seconds':900.0},'build':{'status':'VERIFIED','source_sha':'"
+        + APPROVED_SHA
+        + "'},",
+    )
+    helper_source = helper_source.replace(
+        "'source_sha':'" + APPROVED_SHA + "'",
+        "'source_sha':build_sha",
+    )
+    helper_source = helper_source.replace(
+        "payload = ",
+        "build_sha = json.load(open(os.path.join(os.environ['IGAI_ROOT'], 'RELEASE-MANIFEST.json'), encoding='utf-8'))['source_sha']\npayload = ",
+        1,
+    )
+    helper.write_text(helper_source, encoding="utf-8")
     _write_executable(fakebin / "systemctl", f"""#!/bin/sh
 state={state_file}
 db={database_path}; health={health_file}; log={provider_log}; helper={helper}
@@ -151,6 +198,17 @@ args=(); skip=0
 for arg in "$@"; do if test "$skip" = 1; then skip=0; continue; fi; case "$arg" in -o|-g|-m) skip=1;; *) args+=("$arg");; esac; done
 exec /usr/bin/install "${args[@]}"
 """)
+    isolated_bin = tmp_path / "isolated-bin"
+    isolated_bin.mkdir()
+    for name in (
+        "awk", "bash", "cat", "chmod", "cmp", "cp", "curl", "date", "dirname",
+        "find", "getent", "grep", "id", "install", "mkdir", "mktemp", "python3",
+        "rm", "runuser", "sed", "seq", "sha256sum", "sleep", "sort", "ss", "stat",
+        "systemctl", "tail", "tar", "tr",
+    ):
+        source = shutil.which(name)
+        if source:
+            (isolated_bin / name).symlink_to(source)
     env = os.environ.copy()
     env.update({
         "PATH": f"{fakebin}:/usr/local/bin:/usr/bin:/bin",
@@ -158,7 +216,7 @@ exec /usr/bin/install "${args[@]}"
         "IGAI_STATE_DIR": str(state_dir), "IGAI_BACKUP_ROOT": str(tmp_path / "backups"),
         "IGAI_UNIT_DIR": str(unit_dir), "IGAI_ENV_DIR": str(env_dir), "RUN_ID": "integration-run",
         "IGAI_STAGE": str(tmp_path / "stage"), "REMOTE_BUNDLE": str(bundle), "ROLLBACK_PATH": "",
-        "IGAI_READINESS_TIMEOUT": "10", "IGAI_HEARTBEAT_MAX_AGE": "120", "EXPECTED_SHA": "test",
+        "IGAI_READINESS_TIMEOUT": "10", "IGAI_HEARTBEAT_MAX_AGE": "90", "EXPECTED_SHA": APPROVED_SHA,
         "STALE_HEARTBEAT_MARKER": str(tmp_path / "stale-heartbeat"),
         "MISSING_SELF_MONITOR_MARKER": str(tmp_path / "missing-self-monitor"),
     })
@@ -172,6 +230,8 @@ def _run_transaction(tmp_path: Path, *, failure: str | tuple[str, ...] | None = 
         (tmp_path / marker).write_text("1", encoding="utf-8")
     if "missing-rsync" in failures:
         (tmp_path / "fakebin" / "rsync").unlink()
+        isolated_bin = tmp_path / "isolated-bin"
+        env["PATH"] = f"{tmp_path / 'fakebin'}:{isolated_bin}"
     if "legacy-rollback" in failures:
         env["LEGACY_ROLLBACK"] = "1"
         env["UV_COUNT"] = str(tmp_path / "uv.count")

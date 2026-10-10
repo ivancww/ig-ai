@@ -6,6 +6,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .exceptions import ConfigurationError
+from .health_contract import HealthContract
 from .runtime_service import parse_custom_windows
 
 
@@ -27,6 +28,13 @@ class Settings:
     stale_data_seconds: float = 900.0
     market_status_refresh_seconds: float = 300.0
     custom_windows: tuple[str, ...] = ()
+
+    @property
+    def health_contract(self) -> HealthContract:
+        return HealthContract(
+            heartbeat_seconds=self.service_heartbeat_seconds,
+            stale_data_seconds=self.stale_data_seconds,
+        )
 
     @classmethod
     def from_env(

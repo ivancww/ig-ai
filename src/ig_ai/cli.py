@@ -807,7 +807,15 @@ def main() -> int:
             audit = sink.runtime_audit
             write_runtime_record({"status": "COMPLETED", **audit})
             instrument_ids = [instrument.instrument_id for instrument in instruments.values()]
-            validation_passed = stream.stats.live_validation_passed(instrument_ids)
+            per_market_pipeline_passed = all(
+                sink.observations_persisted.get(instrument_id, 0) > 0
+                and sink.persistence_failures.get(instrument_id, 0) == 0
+                for instrument_id in instrument_ids
+            )
+            validation_passed = (
+                stream.stats.live_validation_passed(instrument_ids)
+                and per_market_pipeline_passed
+            )
             reconnect_outcome = stream.reconnect_status
             validation_lines = []
             for candidate in selected:
@@ -851,7 +859,7 @@ def main() -> int:
             warning_lines = [*stream.stats.warnings]
             if runtime_failures:
                 warning_lines.append(runtime_failures)
-            persistence_passed = sum(sink.persistence_failures.values()) == 0 and sum(sink.observations_persisted.values()) > 0
+            persistence_passed = per_market_pipeline_passed
             candle_pipeline_passed = all(
                 sink.candle_upserts_by_instrument[instrument.instrument_id][timeframe] > 0
                 for instrument in instruments.values()
