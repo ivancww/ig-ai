@@ -4,7 +4,7 @@ set -Eeuo pipefail
 PROJECT=ig-ai-20261005-15120
 VM=ig-ai-prod
 ZONE=us-central1-a
-EXPECTED_SHA=4969c49ea5a607005a84b1787ffe4b174f87fe47
+EXPECTED_SHA=e74a092c759acaf2471f80e32878c1896b7371ce
 REPO=https://github.com/ivancww/ig-ai.git
 REMOTE_SCRIPT="$(cd "$(dirname "$0")" && pwd)/deploy/ig-ai-remote-deploy.sh"
 
