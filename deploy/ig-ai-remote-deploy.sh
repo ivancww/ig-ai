@@ -365,7 +365,7 @@ if sys.argv[6]:
     assert build.get("status") == "VERIFIED"
     assert build.get("source_sha") == sys.argv[6]
 else:
-    assert build.get("status") in (None, "UNVERIFIED", "VERIFIED")
+    assert build.get("status") in (None, "UNVERIFIED")
 if sys.argv[2]:
     assert s.get("runtime_generation") == sys.argv[2] == m.get("runtime_generation")
     assert m.get("ready")
