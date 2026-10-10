@@ -1,5 +1,6 @@
 """Disposable deployment transaction tests; no systemd, credentials, or IG network are used."""
 
+import hashlib
 import json
 import os
 import shutil
@@ -30,9 +31,23 @@ def _prepare_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Pa
     bundle_root = tmp_path / "bundle"
     shutil.copytree(app, bundle_root)
     (bundle_root / "web" / "assets" / "app.js").open("a").write("\n// VERSION_B\n")
+    release_files = {}
+    for name in ("src", "web", "bin", "pyproject.toml", "uv.lock"):
+        path = bundle_root / name
+        paths = [path] if path.is_file() else sorted(path.rglob("*"))
+        for child in paths:
+            if child.is_file():
+                release_files[child.relative_to(bundle_root).as_posix()] = hashlib.sha256(
+                    child.read_bytes()
+                ).hexdigest()
+    (bundle_root / "RELEASE-MANIFEST.json").write_text(
+        json.dumps({"schema": 1, "source_sha": "a" * 40, "files": release_files}, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
     bundle = tmp_path / "application.tar.gz"
     with tarfile.open(bundle, "w:gz") as archive:
-        for name in ("src", "web", "bin", "pyproject.toml", "uv.lock"):
+        for name in ("RELEASE-MANIFEST.json", "src", "web", "bin", "pyproject.toml", "uv.lock"):
             archive.add(bundle_root / name, arcname=name)
 
     venv = tmp_path / "venv"
@@ -158,7 +173,8 @@ exec /usr/bin/install "${args[@]}"
         "IGAI_STATE_DIR": str(state_dir), "IGAI_BACKUP_ROOT": str(tmp_path / "backups"),
         "IGAI_UNIT_DIR": str(unit_dir), "IGAI_ENV_DIR": str(env_dir), "RUN_ID": "integration-run",
         "IGAI_STAGE": str(tmp_path / "stage"), "REMOTE_BUNDLE": str(bundle), "ROLLBACK_PATH": "",
-        "IGAI_READINESS_TIMEOUT": "10", "IGAI_HEARTBEAT_MAX_AGE": "120", "EXPECTED_SHA": "test",
+        "IGAI_READINESS_TIMEOUT": "10", "IGAI_HEARTBEAT_MAX_AGE": "120", "EXPECTED_SHA": "a" * 40,
+        "BUNDLE_SHA256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
         "STALE_HEARTBEAT_MARKER": str(tmp_path / "stale-heartbeat"),
         "MISSING_SELF_MONITOR_MARKER": str(tmp_path / "missing-self-monitor"),
     })
@@ -186,7 +202,9 @@ def test_disposable_deployment_package_start_readiness_and_wal_backup(tmp_path):
     result, app, database, provider_log = _run_transaction(tmp_path)
     assert result.returncode == 0, result.stderr
     assert "VERSION_B" in (app / "web" / "assets" / "app.js").read_text()
+    assert json.loads((app / "RELEASE-MANIFEST.json").read_text())["source_sha"] == "a" * 40
     assert (tmp_path / "backups" / "integration-run" / "database.sqlite3.step8.json").exists()
+    assert json.loads((tmp_path / "backups" / "integration-run" / "release-before.json").read_text())["manifest_present"] is False
     assert json.loads((tmp_path / "backups" / "integration-run" / "step8.after.json").read_text())["counts"]["forward_snapshots"] == 1
     assert "POST /session" in provider_log.read_text()
     assert "POST /orders" not in provider_log.read_text()
@@ -198,6 +216,7 @@ def test_disposable_package_failure_rolls_back_source_package_and_step8(tmp_path
     assert result.returncode != 0
     assert "ROLLBACK VERIFIED" in result.stderr
     assert "VERSION_B" not in (app / "web" / "assets" / "app.js").read_text()
+    assert not (app / "RELEASE-MANIFEST.json").exists()
     reopened = Database(database)
     assert "step8-original" in reopened.connection.execute("SELECT snapshot_id FROM forward_snapshots").fetchone()[0]
     reopened.close()
@@ -292,3 +311,4 @@ def test_explicit_rollback_reuses_saved_predeployment_artifacts(tmp_path):
     assert rolled_back.returncode == 0, rolled_back.stderr
     assert "ROLLBACK VERIFIED" in rolled_back.stderr
     assert "VERSION_B" not in (app / "web" / "assets" / "app.js").read_text()
+    assert not (app / "RELEASE-MANIFEST.json").exists()

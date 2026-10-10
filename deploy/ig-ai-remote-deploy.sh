@@ -19,6 +19,8 @@ B="$BACKUP_ROOT/$RUN_ID"
 S="$IGAI_STAGE"
 REMOTE_BUNDLE="$REMOTE_BUNDLE"
 ROLLBACK_PATH="$ROLLBACK_PATH"
+EXPECTED_SHA="${EXPECTED_SHA-}"
+BUNDLE_SHA256="${BUNDLE_SHA256-}"
 READINESS_TIMEOUT="$IGAI_READINESS_TIMEOUT"
 HEARTBEAT_MAX_AGE="${IGAI_HEARTBEAT_MAX_AGE:-120}"
 if test -n "$ROLLBACK_PATH"; then B="$ROLLBACK_PATH"; fi
@@ -31,6 +33,10 @@ die() {
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing deployment dependency: $1"; }
 test "$(id -u)" = 0 || die "remote deployment must run as root"
 for command_name in rsync curl ss tailscale awk tail grep find install systemctl python3 seq cp sort cmp id stat sha256sum tar getent runuser dirname date mkdir rm sleep mktemp; do require_cmd "$command_name"; done
+[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || die "EXPECTED_SHA must be a full lowercase Git SHA"
+if test -z "$ROLLBACK_PATH"; then
+  [[ "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "BUNDLE_SHA256 must be supplied for a deployment"
+fi
 id igai >/dev/null 2>&1 || die "missing runtime user: igai"
 getent group igai >/dev/null 2>&1 || die "missing runtime group: igai"
 test -x "$VENV/bin/python" && test -x "$VENV/bin/ig-ai" && test -x "$VENV/bin/ig-ai-web" || die "virtual environment is incomplete"
@@ -63,6 +69,110 @@ verify_runtime_identity() {
   runuser -u igai -- test -w "$STATE_DIR" || die "igai cannot write runtime state"
 }
 read_env_value() { awk -F= -v key="$2" '$1 == key { value=$2 } END { print value }' "$1"; }
+verify_release_manifest() {
+  local root="$1" expected_sha="${2-}"
+  "$VENV/bin/python" - "$root" "$expected_sha" <<'PY'
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+expected_sha = sys.argv[2]
+manifest_path = root / "RELEASE-MANIFEST.json"
+if not manifest_path.is_file() or manifest_path.is_symlink():
+    raise SystemExit("release manifest is missing or not a regular file")
+data = json.loads(manifest_path.read_text(encoding="utf-8"))
+if data.get("schema") != 1 or not re.fullmatch(r"[0-9a-f]{40}", data.get("source_sha", "")):
+    raise SystemExit("release manifest schema or source SHA is invalid")
+if expected_sha and data["source_sha"] != expected_sha:
+    raise SystemExit("release manifest source SHA does not match the approved target")
+files = data.get("files")
+if not isinstance(files, dict) or not files:
+    raise SystemExit("release manifest has no file digests")
+for name, digest in files.items():
+    path = Path(name)
+    if path.is_absolute() or ".." in path.parts:
+        raise SystemExit(f"unsafe release manifest path: {name}")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(digest)):
+        raise SystemExit(f"invalid release digest: {name}")
+    target = root / path
+    if not target.is_file() or target.is_symlink():
+        raise SystemExit(f"release file is missing or not regular: {name}")
+    if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+        raise SystemExit(f"release file digest mismatch: {name}")
+PY
+}
+verify_release_bundle() {
+  "$VENV/bin/python" - "$1" "$EXPECTED_SHA" <<'PY'
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+root, expected_sha = Path(sys.argv[1]), sys.argv[2]
+manifest_path = root / "RELEASE-MANIFEST.json"
+data = json.loads(manifest_path.read_text(encoding="utf-8"))
+if data.get("schema") != 1 or data.get("source_sha") != expected_sha:
+    raise SystemExit("bundle release manifest does not match EXPECTED_SHA")
+files = data.get("files")
+if not isinstance(files, dict) or not files:
+    raise SystemExit("bundle release manifest has no file digests")
+expected_files = set(files) | {"RELEASE-MANIFEST.json"}
+actual_files = set()
+for path in root.rglob("*"):
+    if path.is_symlink():
+        raise SystemExit(f"bundle contains a symlink: {path.relative_to(root)}")
+    if path.is_file():
+        actual_files.add(path.relative_to(root).as_posix())
+if actual_files != expected_files:
+    raise SystemExit("bundle file inventory does not match RELEASE-MANIFEST.json")
+for name, digest in files.items():
+    path = Path(name)
+    if path.is_absolute() or ".." in path.parts or not re.fullmatch(r"[0-9a-f]{64}", str(digest)):
+        raise SystemExit(f"invalid bundle release entry: {name}")
+    if hashlib.sha256((root / path).read_bytes()).hexdigest() != digest:
+        raise SystemExit(f"bundle file digest mismatch: {name}")
+PY
+}
+verify_previous_release_manifest() {
+  if test -f "$B/release-before.json"; then
+    "$VENV/bin/python" - "$ROOT" "$B/release-before.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+record = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+present = (root / "RELEASE-MANIFEST.json").is_file()
+if present != record.get("manifest_present"):
+    raise SystemExit("restored release-manifest presence differs from pre-deployment state")
+if present:
+    current = json.loads((root / "RELEASE-MANIFEST.json").read_text(encoding="utf-8"))
+    if current.get("source_sha") != record.get("source_sha"):
+        raise SystemExit("restored release-manifest identity differs from pre-deployment state")
+PY
+    verify_release_manifest "$ROOT" ""
+  elif test -f "$ROOT/RELEASE-MANIFEST.json"; then
+    # Backups made before this metadata was introduced are still restorable;
+    # validate a manifest if the archived release happened to contain one.
+    verify_release_manifest "$ROOT" ""
+  fi
+}
+current_release_manifest_present=0
+current_release_source_sha=""
+if test -e "$ROOT/RELEASE-MANIFEST.json"; then
+  test -f "$ROOT/RELEASE-MANIFEST.json" || die "existing release manifest is not a regular file"
+  verify_release_manifest "$ROOT" "" || die "existing release manifest is invalid"
+  current_release_manifest_present=1
+  current_release_source_sha="$($VENV/bin/python - "$ROOT/RELEASE-MANIFEST.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["source_sha"])
+PY
+)"
+fi
 test "$(read_env_value "$WEB_ENV" IGAI_WEB_HOST)" = 127.0.0.1 || die "web is not loopback"
 test "$(read_env_value "$WEB_ENV" IGAI_WEB_PORT)" = 8080 || die "unexpected web port"
 test "$(read_env_value "$ENV" IG_DATABASE_PATH)" = "$DB" || die "backend database path changed"
@@ -300,8 +410,16 @@ rollback() {
   rollback_in_progress=1
   if ! stop_all; then return 1; fi
   rollback_dir="$(mktemp -d /tmp/ig-ai-rollback.XXXXXX)"
+  if test -f "$B/application.tgz.sha256" && ! (cd "$B" && sha256sum -c application.tgz.sha256 >/dev/null); then
+    die "rollback application archive failed SHA verification"
+    return 1
+  fi
   if ! tar -xzf "$B/application.tgz" -C "$rollback_dir"; then return 1; fi
   if ! rsync -a --delete --exclude=.venv --exclude=.env --exclude=data --exclude=.igai --exclude=igai-report.txt "$rollback_dir/" "$ROOT/"; then return 1; fi
+  if ! verify_previous_release_manifest; then
+    die "rollback release identity/presence does not match the saved pre-deployment state"
+    return 1
+  fi
   if ! cp --preserve=all "$B/ig-ai.service" "$UNIT"; then return 1; fi
   if ! cp --preserve=all "$B/ig-ai-web.service" "$WEB_UNIT"; then return 1; fi
   if ! cp --preserve=all "$B/ig-ai.env" "$ENV"; then return 1; fi
@@ -347,16 +465,43 @@ fi
 
 test -n "$REMOTE_BUNDLE" || die "REMOTE_BUNDLE is required"
 rm -rf "$S"; mkdir -p "$S"
+bundle_sha256="$(sha256sum "$REMOTE_BUNDLE" | awk '{print $1}')"
+test "$bundle_sha256" = "$BUNDLE_SHA256" || die "uploaded bundle failed SHA verification"
+while IFS= read -r archive_path; do
+  case "$archive_path" in
+    /*|../*|*/../*|*/..|.. ) die "bundle contains an unsafe archive path: $archive_path" ;;
+  esac
+done < <(tar -tzf "$REMOTE_BUNDLE")
 tar -xzf "$REMOTE_BUNDLE" -C "$S"
-for item in src web bin pyproject.toml uv.lock; do test -e "$S/$item" || die "bundle missing $item"; done
+for item in RELEASE-MANIFEST.json src web bin pyproject.toml uv.lock; do test -e "$S/$item" || die "bundle missing $item"; done
 if find "$S" -name igai-report.txt -print -quit | grep -F . >/dev/null; then die "report artifact in bundle"; fi
+verify_release_bundle "$S" || die "bundle release manifest verification failed"
 tar --exclude=.venv --exclude=.git --exclude=.env --exclude=data --exclude=.igai --exclude=igai-report.txt -C "$ROOT" -czf "$B/application.tgz" .
+printf '%s  application.tgz\n' "$(sha256sum "$B/application.tgz" | awk '{print $1}')" > "$B/application.tgz.sha256"
 cp --preserve=all "$UNIT" "$WEB_UNIT" "$ENV" "$WEB_ENV" "$B/"
 printf '%s\n' "$(sha256sum "$UNIT" "$WEB_UNIT")" > "$B/unit-sha.txt"
 printf '%s\n' "$(sha256sum "$ENV" "$WEB_ENV")" > "$B/env-sha.txt"
 manifest "$B/package.before.json"
 record_db "$B/database.before.tsv"
-printf 'source_sha=%s\nrun_id=%s\n' "$EXPECTED_SHA" "$RUN_ID" > "$B/metadata.txt"
+"$VENV/bin/python" - "$B/release-before.json" "$current_release_manifest_present" "$current_release_source_sha" "$B/application.tgz.sha256" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+output = Path(sys.argv[1])
+present = sys.argv[2]
+source_sha = sys.argv[3]
+archive_sha_path = Path(sys.argv[4])
+record = {
+    "schema": 1,
+    "manifest_present": bool(int(present)),
+    "application_archive_sha256": archive_sha_path.read_text(encoding="utf-8").split()[0],
+}
+if record["manifest_present"]:
+    record["source_sha"] = source_sha
+output.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+PY
+printf 'target_source_sha=%s\nprevious_release_manifest=%s\nrun_id=%s\n' "$EXPECTED_SHA" "$current_release_manifest_present" "$RUN_ID" > "$B/metadata.txt"
 sqlite_backup "$B/database.sqlite3"
 step8 "$DB" "$B/step8.before.json"
 compare_step8 "$B/step8.before.json" "$B/database.sqlite3.step8.json"
@@ -369,8 +514,10 @@ rsync -a --delete "$S/web/" "$ROOT/web/"
 rsync -a --delete "$S/bin/" "$ROOT/bin/"
 install -m 0644 "$S/pyproject.toml" "$ROOT/pyproject.toml"
 install -m 0644 "$S/uv.lock" "$ROOT/uv.lock"
+install -m 0644 "$S/RELEASE-MANIFEST.json" "$ROOT/RELEASE-MANIFEST.json"
 install_project "$ROOT"
 verify_installation "$ROOT" "$B/package.after.json"
+verify_release_manifest "$ROOT" "$EXPECTED_SHA" || die "installed release manifest verification failed"
 start_previous
 step8 "$DB" "$B/step8.after.json"
 compare_step8 "$B/step8.before.json" "$B/step8.after.json"
