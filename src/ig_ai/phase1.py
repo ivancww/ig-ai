@@ -88,7 +88,7 @@ def run_phase1_check(project_dir: Path) -> tuple[int, str]:
     results.append(("PERSISTENCE", True, "SQLite WAL and primary identities inspected"))
     results.append(("CANDLE ENGINE", True, "15M, 1H, 4H, and 1D forming/finalized/upsert paths covered"))
     restart_ok = _restart_check()
-    results.append(("RESTART / RECOVERY", restart_ok, "forming candles restored and upserted without duplicate identity"))
+    results.append(("RESTART / RECOVERY", restart_ok, "partial candles preserved open/audit-only; no duplicate identity or eligible forward reference"))
     results.append(("RECONNECT STATUS", True, "NOT OBSERVED; deterministic SDK recovery is test-only evidence"))
     tracked = subprocess.run(["git", "ls-files"], cwd=project_dir, text=True, capture_output=True, check=False).stdout
     security_ok = not any(re.search(pattern, tracked, re.IGNORECASE) for pattern in (r"\.env$", "CST", "X-SECURITY-TOKEN", "token", r"\.sqlite", r"\.db$"))

@@ -6,6 +6,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from .health_contract import HealthContract
 from .market_identity import canonical_market_label
 
 HEALTHY = "HEALTHY"
@@ -65,6 +66,10 @@ def evaluate_health(
     expected_generation: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate persisted runtime evidence without contacting IG or mutating analytics."""
+    contract = HealthContract(
+        heartbeat_seconds=heartbeat_seconds,
+        stale_data_seconds=stale_seconds,
+    )
     now = (now or datetime.now(UTC)).astimezone(UTC)
     incidents: list[dict[str, Any]] = []
     service: dict[str, Any] = {}
@@ -142,7 +147,7 @@ def evaluate_health(
                 analysis_status = HEALTHY
             elif latest_closed_1h:
                 analysis_status = UNKNOWN
-                if (_age(latest_closed_1h, now) or 0) > max(heartbeat_seconds * 3, 300):
+                if (_age(latest_closed_1h, now) or 0) > contract.heartbeat_max_age_seconds:
                     analysis_status = ATTENTION
                     incidents.append(_incident(
                         f"analysis-behind:{instrument_id}", ATTENTION,
@@ -176,11 +181,11 @@ def evaluate_health(
 
         heartbeat = service.get("last_heartbeat_at")
         heartbeat_age = _age(heartbeat, now)
-        service_status = HEALTHY if heartbeat_age is not None and heartbeat_age <= heartbeat_seconds * 3 else DEGRADED
+        service_status = HEALTHY if heartbeat_age is not None and heartbeat_age <= contract.heartbeat_max_age_seconds else DEGRADED
         if heartbeat_age is None:
             service_status = UNKNOWN
             incidents.append(_incident("service-heartbeat", DEGRADED, "runtime heartbeat is unavailable", "SERVICE"))
-        elif heartbeat_age > heartbeat_seconds * 3:
+        elif heartbeat_age > contract.heartbeat_max_age_seconds:
             incidents.append(_incident("service-heartbeat", DEGRADED, "runtime heartbeat is not advancing", "SERVICE"))
         if service.get("startup_failure"):
             incidents.append(_incident(
@@ -209,6 +214,7 @@ def evaluate_health(
 
     return {
         "generated_at": now.isoformat(),
+        "health_contract": contract.as_dict(),
         "overall_status": _status_from_incidents(incidents),
         "service": {
             "status": service.get("status", UNKNOWN),

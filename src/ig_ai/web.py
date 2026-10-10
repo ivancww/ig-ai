@@ -14,7 +14,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .build_identity import load_build_identity
 from .database import Database
+from .health_contract import HealthContract
 from .market_identity import CANONICAL_MARKETS, canonical_instrument_rows
 from .self_monitoring import evaluate_health
 
@@ -44,7 +46,7 @@ def _value(value: object, fallback: str = "UNKNOWN") -> object:
     return fallback if value in (None, "", []) else value
 
 
-def _freshness(state: str | None, timestamp: str | None) -> str:
+def _freshness(state: str | None, timestamp: str | None, stale_seconds: float = 900.0) -> str:
     if state in {"MARKET_CLOSED", "SCHEDULED_OFF", "STALE_DATA"}:
         return {"MARKET_CLOSED": "MARKET CLOSED", "SCHEDULED_OFF": "SCHEDULED OFF", "STALE_DATA": "STALE"}[state]
     if not timestamp:
@@ -53,19 +55,53 @@ def _freshness(state: str | None, timestamp: str | None) -> str:
         age = (datetime.now(UTC) - datetime.fromisoformat(timestamp).astimezone(UTC)).total_seconds()
     except (TypeError, ValueError):
         return "UNKNOWN"
-    return "LIVE / CURRENT" if age <= 900 else "STALE"
+    return "LIVE / CURRENT" if age <= stale_seconds else "STALE"
 
 
-def _analysis_freshness(timestamp: str | None) -> str:
-    return _freshness(None, timestamp) if timestamp else "WAITING"
+def _analysis_freshness(timestamp: str | None, stale_seconds: float = 900.0) -> str:
+    return _freshness(None, timestamp, stale_seconds) if timestamp else "WAITING"
 
 
 class WebReadModel:
     """Translate persisted engine records into a stable, browser-safe contract."""
 
-    def __init__(self, database: Database, *, heartbeat_seconds: float = 30.0):
+    def __init__(
+        self,
+        database: Database,
+        *,
+        heartbeat_seconds: float | None = None,
+        stale_seconds: float | None = None,
+    ):
         self.database = database
-        self.heartbeat_seconds = heartbeat_seconds
+        persisted_contract = (database.get_runtime_state("self_monitoring") or {}).get(
+            "health_contract", {}
+        )
+        heartbeat_seconds = (
+            heartbeat_seconds
+            if heartbeat_seconds is not None
+            else float(
+                os.environ.get(
+                    "IGAI_SERVICE_HEARTBEAT_SECONDS",
+                    persisted_contract.get("heartbeat_seconds", "30"),
+                )
+            )
+        )
+        stale_seconds = (
+            stale_seconds
+            if stale_seconds is not None
+            else float(
+                os.environ.get(
+                    "IGAI_STALE_DATA_SECONDS",
+                    persisted_contract.get("stale_data_seconds", "900"),
+                )
+            )
+        )
+        self.health_contract = HealthContract(
+            heartbeat_seconds=heartbeat_seconds,
+            stale_data_seconds=stale_seconds,
+        )
+        self.heartbeat_seconds = self.health_contract.heartbeat_seconds
+        self.stale_seconds = self.health_contract.stale_data_seconds
 
     @staticmethod
     def _timestamp(value: object) -> datetime | None:
@@ -151,9 +187,9 @@ class WebReadModel:
             "last_updated": reference_time,
             "live_updated_at": live_timestamp,
             "analysis_updated_at": reference_time,
-            "freshness": _freshness(state, live_timestamp),
-            "live_freshness": _freshness(state, live_timestamp),
-            "analysis_freshness": _analysis_freshness(reference_time),
+            "freshness": _freshness(state, live_timestamp, self.stale_seconds),
+            "live_freshness": _freshness(state, live_timestamp, self.stale_seconds),
+            "analysis_freshness": _analysis_freshness(reference_time, self.stale_seconds),
             "monitoring_state": _value(state),
             "market_status": _value(market_status),
             "data_quality": _value((direction or {}).get("coverage", {}).get("state"), "UNKNOWN"),
@@ -215,12 +251,15 @@ class WebReadModel:
                 and persisted_snapshot.get("generation_status") == "CURRENT"
                 and started_time
                 and snapshot_time >= started_time
-                and (now - snapshot_time).total_seconds() <= self.heartbeat_seconds * 3
+                and (now - snapshot_time).total_seconds() <= self.health_contract.heartbeat_max_age_seconds
                 and heartbeat_time
-                and (now - heartbeat_time).total_seconds() <= self.heartbeat_seconds * 3
+                and (now - heartbeat_time).total_seconds() <= self.health_contract.heartbeat_max_age_seconds
             )
         snapshot = persisted_snapshot if snapshot_is_current else evaluate_health(
-            self.database, expected_generation=current_generation
+            self.database,
+            stale_seconds=self.stale_seconds,
+            heartbeat_seconds=self.heartbeat_seconds,
+            expected_generation=current_generation,
         )
         if current_generation and not snapshot_is_current:
             snapshot = dict(snapshot)
@@ -242,7 +281,7 @@ class WebReadModel:
             started_time = self._timestamp(started_at)
             heartbeat_current = bool(
                 heartbeat_time
-                and (datetime.now(UTC) - heartbeat_time).total_seconds() <= self.heartbeat_seconds * 3
+                and (datetime.now(UTC) - heartbeat_time).total_seconds() <= self.health_contract.heartbeat_max_age_seconds
             )
             snapshot = {
                 **snapshot,
@@ -296,6 +335,8 @@ class WebReadModel:
             },
             "ig": ig_payload,
             "database": snapshot.get("database", {"status": "UNKNOWN"}),
+            "health_contract": self.health_contract.as_dict(),
+            "build": load_build_identity(),
             "alerts": snapshot.get("alerts", {"status": "UNKNOWN"}),
             "incidents": snapshot.get("incidents", []),
             "markets": health_markets,
@@ -375,7 +416,12 @@ def serve(database_path: str | Path, host: str = "127.0.0.1", port: int = 8080) 
     # provide concurrency while this small first-party viewer stays safe.
     server = HTTPServer((host, port), WebHandler)
     heartbeat_seconds = float(os.environ.get("IGAI_SERVICE_HEARTBEAT_SECONDS", "30"))
-    server.model = WebReadModel(database, heartbeat_seconds=heartbeat_seconds)  # type: ignore[attr-defined]
+    stale_seconds = float(os.environ.get("IGAI_STALE_DATA_SECONDS", "900"))
+    server.model = WebReadModel(  # type: ignore[attr-defined]
+        database,
+        heartbeat_seconds=heartbeat_seconds,
+        stale_seconds=stale_seconds,
+    )
     try:
         server.serve_forever()
     finally:

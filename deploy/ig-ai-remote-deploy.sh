@@ -20,7 +20,7 @@ S="$IGAI_STAGE"
 REMOTE_BUNDLE="$REMOTE_BUNDLE"
 ROLLBACK_PATH="$ROLLBACK_PATH"
 READINESS_TIMEOUT="$IGAI_READINESS_TIMEOUT"
-HEARTBEAT_MAX_AGE="${IGAI_HEARTBEAT_MAX_AGE:-120}"
+HEARTBEAT_MAX_AGE="${IGAI_HEARTBEAT_MAX_AGE:-}"
 if test -n "$ROLLBACK_PATH"; then B="$ROLLBACK_PATH"; fi
 
 die() {
@@ -30,6 +30,9 @@ die() {
 }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing deployment dependency: $1"; }
 test "$(id -u)" = 0 || die "remote deployment must run as root"
+test -n "${EXPECTED_SHA:-}" || die "approved source SHA is required"
+test "${EXPECTED_SHA}" = "${EXPECTED_SHA//[^0-9a-f]/}" || die "approved source SHA is invalid"
+test "${#EXPECTED_SHA}" = 40 || die "approved source SHA must be a full commit SHA"
 for command_name in rsync curl ss tailscale awk tail grep find install systemctl python3 seq cp sort cmp id stat sha256sum tar getent runuser dirname date mkdir rm sleep mktemp; do require_cmd "$command_name"; done
 id igai >/dev/null 2>&1 || die "missing runtime user: igai"
 getent group igai >/dev/null 2>&1 || die "missing runtime group: igai"
@@ -69,6 +72,23 @@ test "$(read_env_value "$ENV" IG_DATABASE_PATH)" = "$DB" || die "backend databas
 test "$(read_env_value "$WEB_ENV" IG_DATABASE_PATH)" = "$DB" || die "web database path changed"
 test "$(read_env_value "$ENV" IGAI_STATE_DIR)" = "$STATE_DIR" || die "backend runtime state path changed"
 test "$(read_env_value "$ENV" IGAI_REPORT_PATH)" = "$STATE_DIR/igai-report.txt" || die "backend report path changed"
+backend_heartbeat_seconds="$(read_env_value "$ENV" IGAI_SERVICE_HEARTBEAT_SECONDS)"
+web_heartbeat_seconds="$(read_env_value "$WEB_ENV" IGAI_SERVICE_HEARTBEAT_SECONDS)"
+backend_stale_seconds="$(read_env_value "$ENV" IGAI_STALE_DATA_SECONDS)"
+web_stale_seconds="$(read_env_value "$WEB_ENV" IGAI_STALE_DATA_SECONDS)"
+test -n "$backend_heartbeat_seconds" && test "$backend_heartbeat_seconds" = "$web_heartbeat_seconds" || die "heartbeat contract differs between services"
+test -n "$backend_stale_seconds" && test "$backend_stale_seconds" = "$web_stale_seconds" || die "stale-data contract differs between services"
+if test -z "$HEARTBEAT_MAX_AGE"; then
+  HEARTBEAT_MAX_AGE="$("$VENV/bin/python" - "$backend_heartbeat_seconds" <<'PY'
+import sys
+print(float(sys.argv[1]) * 3)
+PY
+)"
+fi
+"$VENV/bin/python" - "$HEARTBEAT_MAX_AGE" <<'PY' || die "heartbeat contract is invalid"
+import sys
+assert float(sys.argv[1]) > 0
+PY
 if test -z "$ROLLBACK_PATH"; then
   systemctl is-active --quiet ig-ai.service || die "backend was not active before deployment"
   systemctl is-active --quiet ig-ai-web.service || die "web was not active before deployment"
@@ -141,10 +161,10 @@ PY
 }
 verify_installation() {
   manifest "$2"
-  "$VENV/bin/python" - "$1" "$2" <<'PY'
+  "$VENV/bin/python" - "$1" "$2" "${3-}" "${4-}" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
-source, manifest = map(Path, sys.argv[1:])
+source, manifest = map(Path, sys.argv[1:3])
 data = json.loads(manifest.read_text())
 assert Path(data["ig_ai_module"]).is_relative_to((source / "src").resolve())
 assert data["lightstreamer_version"] == "2.2.3"
@@ -157,6 +177,14 @@ assert set(data["web_files"]) == source_files
 for name, digest in data["web_files"].items():
     assert hashlib.sha256((Path(data["web_dir"]) / name).read_bytes()).hexdigest() == digest
     assert hashlib.sha256((source / "web" / name).read_bytes()).hexdigest() == digest
+expected_path = Path(sys.argv[3]) if sys.argv[3] else None
+if expected_path:
+    expected = json.loads(expected_path.read_text())
+    assert expected["package_version"] == data["ig_ai_version"]
+    assert expected["lightstreamer_version"] == data["lightstreamer_version"]
+    assert expected["web_files"] == data["web_files"]
+    if sys.argv[4]:
+        assert expected["source_sha"] == sys.argv[4]
 PY
 }
 step8() {
@@ -196,6 +224,33 @@ try: source.backup(destination)
 finally: destination.close(); source.close()
 PY
   step8 "$1" "$1.step8.json"
+  sha256sum "$1" | awk '{print $1}' > "$1.sha256"
+  "$VENV/bin/python" - "$1" "$1.sha256" <<'PY'
+import sqlite3, sys
+from pathlib import Path
+
+database, digest = sys.argv[1:]
+connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+assert connection.execute("pragma integrity_check").fetchone()[0] == "ok"
+connection.close()
+assert len(Path(digest).read_text(encoding="utf-8").strip()) == 64
+PY
+}
+verify_backup() {
+  test -s "$1" && test -s "$1.sha256" && test -s "$1.step8.json" || die "SQLite backup artifacts are incomplete"
+  "$VENV/bin/python" - "$1" "$1.sha256" "$1.step8.json" "$B/step8.before.json" <<'PY'
+import hashlib, json, sqlite3, sys
+from pathlib import Path
+
+database, digest, backup_step8, before_step8 = sys.argv[1:]
+expected_digest = Path(digest).read_text(encoding="utf-8").strip()
+actual_digest = hashlib.sha256(Path(database).read_bytes()).hexdigest()
+assert actual_digest == expected_digest
+connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+assert connection.execute("pragma integrity_check").fetchone()[0] == "ok"
+connection.close()
+assert json.loads(Path(backup_step8).read_text()) == json.loads(Path(before_step8).read_text())
+PY
 }
 record_db() {
   : > "$1"
@@ -240,16 +295,22 @@ PY
   die "backend readiness deadline exceeded"
 }
 wait_web() {
-  local generation="${1-}" deadline=$((SECONDS + READINESS_TIMEOUT)) health="$B/health.json"
+  local generation="${1-}" expected_source_sha="${2:-$EXPECTED_SHA}" deadline=$((SECONDS + READINESS_TIMEOUT)) health="$B/health.json"
   while (( SECONDS < deadline )); do
     if systemctl is-active --quiet ig-ai-web.service && curl --fail --silent --show-error --max-time 3 http://127.0.0.1:8080/api/health > "$health"; then
-      if "$VENV/bin/python" - "$health" "$generation" "$marker" "$HEARTBEAT_MAX_AGE" <<'PY'
+      if "$VENV/bin/python" - "$health" "$generation" "$marker" "$HEARTBEAT_MAX_AGE" "$backend_stale_seconds" "$expected_source_sha" <<'PY'
 import json, sys
 from datetime import UTC, datetime
 p = json.load(open(sys.argv[1], encoding="utf-8"))
 s, m = p.get("service", {}), p.get("self_monitoring", {})
 heartbeat = datetime.fromisoformat(s["last_heartbeat"]).astimezone(UTC)
 assert (datetime.now(UTC) - heartbeat).total_seconds() <= float(sys.argv[4])
+contract = p.get("health_contract", {})
+assert contract.get("heartbeat_max_age_seconds") == float(sys.argv[4])
+assert contract.get("stale_data_seconds") == float(sys.argv[5])
+build = p.get("build", {})
+assert build.get("status") == "VERIFIED"
+assert build.get("source_sha") == sys.argv[6]
 if sys.argv[2]:
     assert s.get("runtime_generation") == sys.argv[2] == m.get("runtime_generation")
     assert m.get("ready")
@@ -266,7 +327,7 @@ for market in markets:
     status = market.get("market_status") or market.get("provider_status")
     assert status not in (None, "UNKNOWN")
     if market.get("monitoring_state") == "MONITORING":
-        assert market.get("latest_tick") and market.get("tick_age_seconds") is not None and market["tick_age_seconds"] <= 900
+        assert market.get("latest_tick") and market.get("tick_age_seconds") is not None and market["tick_age_seconds"] <= float(sys.argv[5])
         live += 1
     elif status in ("OPEN", "TRADEABLE"):
         raise AssertionError("tradeable market is not monitoring")
@@ -279,7 +340,7 @@ PY
   die "web readiness deadline exceeded"
 }
 start_previous() {
-  local generation="" require_generation="${1:-1}"
+  local generation="" require_generation="${1:-1}" expected_source_sha="${2:-$EXPECTED_SHA}"
   if grep -Fx ig-ai.service <<<"$restore_services" >/dev/null; then
     if ! systemctl start ig-ai.service; then return 1; fi
     if ! wait_backend "$require_generation"; then return 1; fi
@@ -287,7 +348,7 @@ start_previous() {
   if grep -Fx ig-ai-web.service <<<"$restore_services" >/dev/null; then
     if ! systemctl start ig-ai-web.service; then return 1; fi
     if test "$require_generation" = 1; then generation="$(cat "$B/backend-generation.txt")"; fi
-    if ! wait_web "$generation"; then return 1; fi
+    if ! wait_web "$generation" "$expected_source_sha"; then return 1; fi
   fi
   for unit in $restore_services; do
     if test "$unit" != ig-ai.service && test "$unit" != ig-ai-web.service; then if ! systemctl start "$unit"; then return 1; fi; fi
@@ -298,6 +359,7 @@ rollback_ready=0
 rollback_in_progress=0
 rollback() {
   rollback_in_progress=1
+  if ! verify_backup "$B/database.sqlite3"; then return 1; fi
   if ! stop_all; then return 1; fi
   rollback_dir="$(mktemp -d /tmp/ig-ai-rollback.XXXXXX)"
   if ! tar -xzf "$B/application.tgz" -C "$rollback_dir"; then return 1; fi
@@ -308,11 +370,16 @@ rollback() {
   if ! cp --preserve=all "$B/ig-ai-web.env" "$WEB_ENV"; then return 1; fi
   if ! systemctl daemon-reload; then return 1; fi
   if ! install_project "$ROOT"; then return 1; fi
-  if ! verify_installation "$ROOT" "$B/package.rollback.json"; then return 1; fi
+  if ! verify_installation "$ROOT" "$B/package.rollback.json" "$ROOT/RELEASE-MANIFEST.json"; then return 1; fi
   if ! cmp -s "$B/package.before.json" "$B/package.rollback.json"; then die "rollback package mismatch"; return 1; fi
   if ! cmp -s "$B/unit-sha.txt" <(sha256sum "$UNIT" "$WEB_UNIT"); then die "rollback changed systemd units"; return 1; fi
   if ! cmp -s "$B/env-sha.txt" <(sha256sum "$ENV" "$WEB_ENV"); then die "rollback changed environment files"; return 1; fi
-  if ! start_previous 0; then return 1; fi
+  previous_source_sha="$("$VENV/bin/python" - "$ROOT/RELEASE-MANIFEST.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["source_sha"])
+PY
+)" || return 1
+  if ! start_previous 0 "$previous_source_sha"; then return 1; fi
   if ! step8 "$DB" "$B/step8.rollback.json"; then return 1; fi
   if ! compare_step8 "$B/step8.before.json" "$B/step8.rollback.json"; then return 1; fi
   write_unit_manifest "$B/systemd-rollback.tsv"
@@ -348,13 +415,15 @@ fi
 test -n "$REMOTE_BUNDLE" || die "REMOTE_BUNDLE is required"
 rm -rf "$S"; mkdir -p "$S"
 tar -xzf "$REMOTE_BUNDLE" -C "$S"
-for item in src web bin pyproject.toml uv.lock; do test -e "$S/$item" || die "bundle missing $item"; done
+for item in src web bin pyproject.toml uv.lock RELEASE-MANIFEST.json; do test -e "$S/$item" || die "bundle missing $item"; done
 if find "$S" -name igai-report.txt -print -quit | grep -F . >/dev/null; then die "report artifact in bundle"; fi
 tar --exclude=.venv --exclude=.git --exclude=.env --exclude=data --exclude=.igai --exclude=igai-report.txt -C "$ROOT" -czf "$B/application.tgz" .
 cp --preserve=all "$UNIT" "$WEB_UNIT" "$ENV" "$WEB_ENV" "$B/"
 printf '%s\n' "$(sha256sum "$UNIT" "$WEB_UNIT")" > "$B/unit-sha.txt"
 printf '%s\n' "$(sha256sum "$ENV" "$WEB_ENV")" > "$B/env-sha.txt"
 manifest "$B/package.before.json"
+test -r "$ROOT/RELEASE-MANIFEST.json" || die "active release manifest is missing"
+verify_installation "$ROOT" "$B/package.before.json" "$ROOT/RELEASE-MANIFEST.json"
 record_db "$B/database.before.tsv"
 printf 'source_sha=%s\nrun_id=%s\n' "$EXPECTED_SHA" "$RUN_ID" > "$B/metadata.txt"
 sqlite_backup "$B/database.sqlite3"
@@ -369,8 +438,9 @@ rsync -a --delete "$S/web/" "$ROOT/web/"
 rsync -a --delete "$S/bin/" "$ROOT/bin/"
 install -m 0644 "$S/pyproject.toml" "$ROOT/pyproject.toml"
 install -m 0644 "$S/uv.lock" "$ROOT/uv.lock"
+install -m 0644 "$S/RELEASE-MANIFEST.json" "$ROOT/RELEASE-MANIFEST.json"
 install_project "$ROOT"
-verify_installation "$ROOT" "$B/package.after.json"
+verify_installation "$ROOT" "$B/package.after.json" "$ROOT/RELEASE-MANIFEST.json" "$EXPECTED_SHA"
 start_previous
 step8 "$DB" "$B/step8.after.json"
 compare_step8 "$B/step8.before.json" "$B/step8.after.json"

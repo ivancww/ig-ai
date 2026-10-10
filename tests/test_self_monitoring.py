@@ -61,6 +61,21 @@ def test_healthy_runtime_and_fresh_market_is_healthy():
     assert snapshot["markets"][0]["analysis_health"] == HEALTHY
 
 
+def test_health_contract_exposes_one_shared_heartbeat_and_stale_window():
+    snapshot = evaluate_health(
+        HealthDatabase(),
+        now=NOW,
+        heartbeat_seconds=10,
+        stale_seconds=45,
+    )
+    assert snapshot["health_contract"] == {
+        "version": "ig-ai-health-v1",
+        "heartbeat_seconds": 10,
+        "heartbeat_max_age_seconds": 30,
+        "stale_data_seconds": 45,
+    }
+
+
 def test_disconnected_ig_is_degraded_but_market_health_is_separate():
     snapshot = evaluate_health(HealthDatabase(connection="DISCONNECTED"), now=NOW)
     assert snapshot["overall_status"] == DEGRADED
