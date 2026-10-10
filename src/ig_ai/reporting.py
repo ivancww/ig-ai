@@ -136,6 +136,7 @@ def render_report() -> str:
         + terminal
         + "\n"
     )
+    UNIFIED_REPORT.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     UNIFIED_REPORT.write_text(report, encoding="utf-8")
     return report
 

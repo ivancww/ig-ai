@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,10 @@ def _write_release_manifest(root: Path, source_sha: str) -> None:
         for path in sorted(web.rglob("*"))
         if path.is_file()
     }
+    cache_version = re.search(
+        r'''CACHE\s*=\s*['"]([^'"]+)''',
+        (web / "assets" / "sw.js").read_text(encoding="utf-8"),
+    ).group(1)
     (root / "RELEASE-MANIFEST.json").write_text(
         json.dumps(
             {
@@ -36,7 +41,7 @@ def _write_release_manifest(root: Path, source_sha: str) -> None:
                 "source_sha": source_sha,
                 "package_version": "0.1.0",
                 "lightstreamer_version": "2.2.3",
-                "cache_version": "test-cache",
+                "cache_version": cache_version,
                 "web_files": web_files,
             },
             sort_keys=True,
@@ -45,7 +50,9 @@ def _write_release_manifest(root: Path, source_sha: str) -> None:
     )
 
 
-def _prepare_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Path, Database]:
+def _prepare_environment(
+    tmp_path: Path, *, legacy_installation: bool = False
+) -> tuple[dict[str, str], Path, Path, Path, Database]:
     app = tmp_path / "opt" / "ig-ai"
     app.mkdir(parents=True)
     for name in ("src", "web", "bin", "pyproject.toml", "uv.lock"):
@@ -53,6 +60,8 @@ def _prepare_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Pa
         destination = app / name
         shutil.copytree(source, destination) if source.is_dir() else shutil.copy2(source, destination)
     _write_release_manifest(app, "previous")
+    if legacy_installation:
+        (app / "RELEASE-MANIFEST.json").unlink()
     bundle_root = tmp_path / "bundle"
     shutil.copytree(app, bundle_root)
     (bundle_root / "web" / "assets" / "app.js").open("a").write("\n// VERSION_B\n")
@@ -124,18 +133,7 @@ def _prepare_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Pa
     helper_source = helper.read_text(encoding="utf-8")
     helper_source = helper_source.replace(
         "payload = {'overall_status':'HEALTHY',",
-        "payload = {'overall_status':'HEALTHY','health_contract':{'version':'ig-ai-health-v1','heartbeat_seconds':30.0,'heartbeat_max_age_seconds':90.0,'stale_data_seconds':900.0},'build':{'status':'VERIFIED','source_sha':'"
-        + APPROVED_SHA
-        + "'},",
-    )
-    helper_source = helper_source.replace(
-        "'source_sha':'" + APPROVED_SHA + "'",
-        "'source_sha':build_sha",
-    )
-    helper_source = helper_source.replace(
-        "payload = ",
-        "build_sha = json.load(open(os.path.join(os.environ['IGAI_ROOT'], 'RELEASE-MANIFEST.json'), encoding='utf-8'))['source_sha']\npayload = ",
-        1,
+        "manifest_path = os.path.join(os.environ['IGAI_ROOT'], 'RELEASE-MANIFEST.json')\nbuild = {'status':'UNVERIFIED','source_sha':None}\nif os.path.isfile(manifest_path): build = {'status':'VERIFIED','source_sha':json.load(open(manifest_path, encoding='utf-8'))['source_sha']}\npayload = {'overall_status':'HEALTHY','health_contract':{'version':'ig-ai-health-v1','heartbeat_seconds':30.0,'heartbeat_max_age_seconds':90.0,'stale_data_seconds':900.0},'build':build,",
     )
     helper.write_text(helper_source, encoding="utf-8")
     _write_executable(fakebin / "systemctl", f"""#!/bin/sh
@@ -217,6 +215,7 @@ exec /usr/bin/install "${args[@]}"
         "IGAI_UNIT_DIR": str(unit_dir), "IGAI_ENV_DIR": str(env_dir), "RUN_ID": "integration-run",
         "IGAI_STAGE": str(tmp_path / "stage"), "REMOTE_BUNDLE": str(bundle), "ROLLBACK_PATH": "",
         "IGAI_READINESS_TIMEOUT": "10", "IGAI_HEARTBEAT_MAX_AGE": "90", "EXPECTED_SHA": APPROVED_SHA,
+        "BUNDLE_SHA256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
         "STALE_HEARTBEAT_MARKER": str(tmp_path / "stale-heartbeat"),
         "MISSING_SELF_MONITOR_MARKER": str(tmp_path / "missing-self-monitor"),
     })
@@ -224,8 +223,10 @@ exec /usr/bin/install "${args[@]}"
 
 
 def _run_transaction(tmp_path: Path, *, failure: str | tuple[str, ...] | None = None) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path]:
-    env, app, database, provider_log, wal_holder = _prepare_environment(tmp_path)
     failures = [failure] if isinstance(failure, str) else list(failure or ())
+    env, app, database, provider_log, wal_holder = _prepare_environment(
+        tmp_path, legacy_installation="legacy-installation" in failures
+    )
     for marker in failures:
         (tmp_path / marker).write_text("1", encoding="utf-8")
     if "missing-rsync" in failures:
@@ -246,6 +247,7 @@ def test_disposable_deployment_package_start_readiness_and_wal_backup(tmp_path):
     result, app, database, provider_log = _run_transaction(tmp_path)
     assert result.returncode == 0, result.stderr
     assert "VERSION_B" in (app / "web" / "assets" / "app.js").read_text()
+    assert json.loads((app / "RELEASE-MANIFEST.json").read_text())["source_sha"] == APPROVED_SHA
     assert (tmp_path / "backups" / "integration-run" / "database.sqlite3.step8.json").exists()
     assert json.loads((tmp_path / "backups" / "integration-run" / "step8.after.json").read_text())["counts"]["forward_snapshots"] == 1
     assert "POST /session" in provider_log.read_text()
@@ -328,11 +330,12 @@ def test_service_stop_failure_rolls_back_after_backup_is_ready(tmp_path):
 
 def test_rollback_readiness_accepts_compatible_legacy_previous_generation(tmp_path):
     result, app, _database, _provider_log = _run_transaction(
-        tmp_path, failure=("fail-once", "legacy-rollback")
+        tmp_path, failure=("fail-once", "legacy-installation", "legacy-rollback")
     )
     assert result.returncode != 0
     assert "ROLLBACK VERIFIED" in result.stderr
     assert "VERSION_B" not in (app / "web" / "assets" / "app.js").read_text()
+    assert not (app / "RELEASE-MANIFEST.json").exists()
 
 
 def test_explicit_rollback_reuses_saved_predeployment_artifacts(tmp_path):

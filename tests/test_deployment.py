@@ -71,10 +71,13 @@ def test_repaired_transaction_has_explicit_prerequisites_readiness_backup_and_fa
     assert "RELEASE-MANIFEST.json" in remote
     assert "verify_backup" in remote
     assert "forward_snapshot_status" in remote and '"rows"' in remote
+    assert "release-before.json" in remote and "verify_release_bundle" in remote
+    assert "BUNDLE_SHA256" in remote
     assert "ROLLBACK FAILED" in remote
     assert "package.before.json" in remote and "package.rollback.json" in remote
     assert "ig-ai-remote-deploy.sh" in wrapper
     assert "gcloud compute ssh" in wrapper
+    assert "BUNDLE_SHA256" in wrapper
 
 
 def test_runtime_state_path_is_explicitly_writable_by_service_identity():

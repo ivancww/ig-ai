@@ -22,16 +22,16 @@ if test -n "$REPO_ROOT"; then
 fi
 
 run_remote() {
-  local run_id="$1" remote_bundle="$2" rollback_path="$3"
+  local run_id="$1" remote_bundle="$2" rollback_path="$3" bundle_sha256="$4"
   gcloud compute ssh "$VM" --project="$PROJECT" --zone="$ZONE" --tunnel-through-iap \
-    --command="sudo env EXPECTED_SHA='$EXPECTED_SHA' RUN_ID='$run_id' REMOTE_BUNDLE='$remote_bundle' ROLLBACK_PATH='$rollback_path' IGAI_ROOT=/opt/ig-ai IGAI_VENV=/opt/ig-ai/.venv IGAI_DB=/var/lib/ig-ai/data/ig_ai.sqlite3 IGAI_STATE_DIR=/var/lib/ig-ai/state IGAI_BACKUP_ROOT=/var/backups/ig-ai IGAI_UNIT_DIR=/etc/systemd/system IGAI_ENV_DIR=/etc/ig-ai IGAI_STAGE=/tmp/ig-ai-stage-$run_id IGAI_READINESS_TIMEOUT=120 bash -s" < "$REMOTE_SCRIPT"
+    --command="sudo env EXPECTED_SHA='$EXPECTED_SHA' BUNDLE_SHA256='$bundle_sha256' RUN_ID='$run_id' REMOTE_BUNDLE='$remote_bundle' ROLLBACK_PATH='$rollback_path' IGAI_ROOT=/opt/ig-ai IGAI_VENV=/opt/ig-ai/.venv IGAI_DB=/var/lib/ig-ai/data/ig_ai.sqlite3 IGAI_STATE_DIR=/var/lib/ig-ai/state IGAI_BACKUP_ROOT=/var/backups/ig-ai IGAI_UNIT_DIR=/etc/systemd/system IGAI_ENV_DIR=/etc/ig-ai IGAI_STAGE=/tmp/ig-ai-stage-$run_id IGAI_READINESS_TIMEOUT=120 bash -s" < "$REMOTE_SCRIPT"
 }
 
 if [[ $# -gt 0 && "$1" == "--rollback" ]]; then
   [[ $# == 2 ]] || die "usage: $0 --rollback /var/backups/ig-ai/<run-id>"
   case "$2" in /var/backups/ig-ai/*) ;; *) die "rollback path must be under /var/backups/ig-ai" ;; esac
   run_id="$(basename "$2")"
-  run_remote "$run_id" "" "$2"
+  run_remote "$run_id" "" "$2" ""
   exit 0
 fi
 [[ $# == 0 ]] || die "usage: $0 [--rollback /var/backups/ig-ai/<run-id>]"
@@ -98,9 +98,10 @@ tar -tzf "$BUNDLE" | grep -F 'src/ig_ai/' >/dev/null || die "source missing from
 tar -tzf "$BUNDLE" | grep -F 'web/index.html' >/dev/null || die "Web missing from bundle"
 tar -tzf "$BUNDLE" | grep -Fx 'RELEASE-MANIFEST.json' >/dev/null || die "release manifest missing from bundle"
 if tar -tzf "$BUNDLE" | grep -F 'igai-report.txt' >/dev/null; then die "runtime report included in bundle"; fi
+BUNDLE_SHA256="$(sha256sum "$BUNDLE" | awk '{print $1}')"
 
 echo "== Upload approved bundle =="
 gcloud compute scp "$BUNDLE" "$VM:$REMOTE_BUNDLE" --project="$PROJECT" --zone="$ZONE" --tunnel-through-iap >/dev/null
 echo "== Execute remote transaction =="
-run_remote "$RUN_ID" "$REMOTE_BUNDLE" ""
+run_remote "$RUN_ID" "$REMOTE_BUNDLE" "" "$BUNDLE_SHA256"
 echo "READY: deployment completed and post-deployment checks passed"

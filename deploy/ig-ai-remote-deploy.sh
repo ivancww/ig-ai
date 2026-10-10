@@ -19,6 +19,7 @@ B="$BACKUP_ROOT/$RUN_ID"
 S="$IGAI_STAGE"
 REMOTE_BUNDLE="$REMOTE_BUNDLE"
 ROLLBACK_PATH="$ROLLBACK_PATH"
+BUNDLE_SHA256="${BUNDLE_SHA256:-}"
 READINESS_TIMEOUT="$IGAI_READINESS_TIMEOUT"
 HEARTBEAT_MAX_AGE="${IGAI_HEARTBEAT_MAX_AGE:-}"
 if test -n "$ROLLBACK_PATH"; then B="$ROLLBACK_PATH"; fi
@@ -34,6 +35,11 @@ test -n "${EXPECTED_SHA:-}" || die "approved source SHA is required"
 test "${EXPECTED_SHA}" = "${EXPECTED_SHA//[^0-9a-f]/}" || die "approved source SHA is invalid"
 test "${#EXPECTED_SHA}" = 40 || die "approved source SHA must be a full commit SHA"
 for command_name in rsync curl ss tailscale awk tail grep find install systemctl python3 seq cp sort cmp id stat sha256sum tar getent runuser dirname date mkdir rm sleep mktemp; do require_cmd "$command_name"; done
+if test -z "$ROLLBACK_PATH"; then
+  test -n "$BUNDLE_SHA256" || die "bundle SHA is required"
+  test "$BUNDLE_SHA256" = "${BUNDLE_SHA256//[^0-9a-f]/}" || die "bundle SHA is invalid"
+  test "${#BUNDLE_SHA256}" = 64 || die "bundle SHA must be a full SHA-256 digest"
+fi
 id igai >/dev/null 2>&1 || die "missing runtime user: igai"
 getent group igai >/dev/null 2>&1 || die "missing runtime group: igai"
 test -x "$VENV/bin/python" && test -x "$VENV/bin/ig-ai" && test -x "$VENV/bin/ig-ai-web" || die "virtual environment is incomplete"
@@ -187,6 +193,52 @@ if expected_path:
         assert expected["source_sha"] == sys.argv[4]
 PY
 }
+verify_release_bundle() {
+  "$VENV/bin/python" - "$1" "$EXPECTED_SHA" <<'PY'
+import hashlib, json, re, sys, tomllib
+from pathlib import Path
+
+root, expected_sha = Path(sys.argv[1]), sys.argv[2]
+manifest = json.loads((root / "RELEASE-MANIFEST.json").read_text(encoding="utf-8"))
+assert manifest.get("manifest_version") == 1, "manifest_version"
+assert manifest.get("source_sha") == expected_sha, "source_sha"
+web = root / "web"
+web_files = {
+    str(path.relative_to(web)): hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in sorted(web.rglob("*"))
+    if path.is_file()
+}
+assert web_files == manifest.get("web_files"), "web_files"
+project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+lock = tomllib.loads((root / "uv.lock").read_text(encoding="utf-8"))
+streaming_version = next(
+    package["version"]
+    for package in lock.get("package", [])
+    if package.get("name") == "lightstreamer-client-lib"
+)
+assert manifest.get("package_version") == project["project"]["version"], "package_version"
+assert manifest.get("lightstreamer_version") == streaming_version, "lightstreamer_version"
+service_worker = (web / "assets" / "sw.js").read_text(encoding="utf-8")
+match = re.search(r'''CACHE\s*=\s*['"]([^'"]+)''', service_worker)
+assert match and manifest.get("cache_version") == match.group(1), "cache_version"
+PY
+}
+verify_previous_release() {
+  local restore_root="${1:-$ROOT}"
+  "$VENV/bin/python" - "$restore_root" "$B/release-before.json" <<'PY'
+import json, sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+record = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+manifest = root / "RELEASE-MANIFEST.json"
+if record["manifest_present"]:
+    assert manifest.is_file()
+    assert json.loads(manifest.read_text(encoding="utf-8")) == record["manifest"]
+else:
+    assert not manifest.exists()
+PY
+}
 step8() {
   "$VENV/bin/python" - "$1" "$2" <<'PY'
 import json, sqlite3, sys
@@ -295,7 +347,7 @@ PY
   die "backend readiness deadline exceeded"
 }
 wait_web() {
-  local generation="${1-}" expected_source_sha="${2:-$EXPECTED_SHA}" deadline=$((SECONDS + READINESS_TIMEOUT)) health="$B/health.json"
+  local generation="${1-}" expected_source_sha="${2-$EXPECTED_SHA}" deadline=$((SECONDS + READINESS_TIMEOUT)) health="$B/health.json"
   while (( SECONDS < deadline )); do
     if systemctl is-active --quiet ig-ai-web.service && curl --fail --silent --show-error --max-time 3 http://127.0.0.1:8080/api/health > "$health"; then
       if "$VENV/bin/python" - "$health" "$generation" "$marker" "$HEARTBEAT_MAX_AGE" "$backend_stale_seconds" "$expected_source_sha" <<'PY'
@@ -309,8 +361,11 @@ contract = p.get("health_contract", {})
 assert contract.get("heartbeat_max_age_seconds") == float(sys.argv[4])
 assert contract.get("stale_data_seconds") == float(sys.argv[5])
 build = p.get("build", {})
-assert build.get("status") == "VERIFIED"
-assert build.get("source_sha") == sys.argv[6]
+if sys.argv[6]:
+    assert build.get("status") == "VERIFIED"
+    assert build.get("source_sha") == sys.argv[6]
+else:
+    assert build.get("status") in (None, "UNVERIFIED", "VERIFIED")
 if sys.argv[2]:
     assert s.get("runtime_generation") == sys.argv[2] == m.get("runtime_generation")
     assert m.get("ready")
@@ -340,7 +395,7 @@ PY
   die "web readiness deadline exceeded"
 }
 start_previous() {
-  local generation="" require_generation="${1:-1}" expected_source_sha="${2:-$EXPECTED_SHA}"
+  local generation="" require_generation="${1:-1}" expected_source_sha="${2-$EXPECTED_SHA}"
   if grep -Fx ig-ai.service <<<"$restore_services" >/dev/null; then
     if ! systemctl start ig-ai.service; then return 1; fi
     if ! wait_backend "$require_generation"; then return 1; fi
@@ -360,9 +415,14 @@ rollback_in_progress=0
 rollback() {
   rollback_in_progress=1
   if ! verify_backup "$B/database.sqlite3"; then return 1; fi
-  if ! stop_all; then return 1; fi
   rollback_dir="$(mktemp -d /tmp/ig-ai-rollback.XXXXXX)"
+  if test -f "$B/application.tgz.sha256" && ! test "$(sha256sum "$B/application.tgz" | awk '{print $1}')" = "$(cat "$B/application.tgz.sha256")"; then
+    die "rollback application archive failed SHA verification"
+    return 1
+  fi
   if ! tar -xzf "$B/application.tgz" -C "$rollback_dir"; then return 1; fi
+  if ! verify_previous_release "$rollback_dir"; then return 1; fi
+  if ! stop_all; then return 1; fi
   if ! rsync -a --delete --exclude=.venv --exclude=.env --exclude=data --exclude=.igai --exclude=igai-report.txt "$rollback_dir/" "$ROOT/"; then return 1; fi
   if ! cp --preserve=all "$B/ig-ai.service" "$UNIT"; then return 1; fi
   if ! cp --preserve=all "$B/ig-ai-web.service" "$WEB_UNIT"; then return 1; fi
@@ -370,15 +430,20 @@ rollback() {
   if ! cp --preserve=all "$B/ig-ai-web.env" "$WEB_ENV"; then return 1; fi
   if ! systemctl daemon-reload; then return 1; fi
   if ! install_project "$ROOT"; then return 1; fi
-  if ! verify_installation "$ROOT" "$B/package.rollback.json" "$ROOT/RELEASE-MANIFEST.json"; then return 1; fi
+  if ! verify_previous_release; then return 1; fi
+  if test -f "$ROOT/RELEASE-MANIFEST.json"; then
+    if ! verify_installation "$ROOT" "$B/package.rollback.json" "$ROOT/RELEASE-MANIFEST.json"; then return 1; fi
+  else
+    if ! verify_installation "$ROOT" "$B/package.rollback.json"; then return 1; fi
+  fi
   if ! cmp -s "$B/package.before.json" "$B/package.rollback.json"; then die "rollback package mismatch"; return 1; fi
   if ! cmp -s "$B/unit-sha.txt" <(sha256sum "$UNIT" "$WEB_UNIT"); then die "rollback changed systemd units"; return 1; fi
   if ! cmp -s "$B/env-sha.txt" <(sha256sum "$ENV" "$WEB_ENV"); then die "rollback changed environment files"; return 1; fi
-  previous_source_sha="$("$VENV/bin/python" - "$ROOT/RELEASE-MANIFEST.json" <<'PY'
+  previous_source_sha="$(if test -f "$ROOT/RELEASE-MANIFEST.json"; then "$VENV/bin/python" - "$ROOT/RELEASE-MANIFEST.json" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["source_sha"])
 PY
-)" || return 1
+  else printf ''; fi)" || return 1
   if ! start_previous 0 "$previous_source_sha"; then return 1; fi
   if ! step8 "$DB" "$B/step8.rollback.json"; then return 1; fi
   if ! compare_step8 "$B/step8.before.json" "$B/step8.rollback.json"; then return 1; fi
@@ -414,18 +479,40 @@ fi
 
 test -n "$REMOTE_BUNDLE" || die "REMOTE_BUNDLE is required"
 rm -rf "$S"; mkdir -p "$S"
+test "$(sha256sum "$REMOTE_BUNDLE" | awk '{print $1}')" = "$BUNDLE_SHA256" || die "uploaded bundle failed SHA verification"
+while IFS= read -r archive_path; do
+  case "$archive_path" in
+    /*|../*|*/../*|*/..|.. ) die "bundle contains an unsafe archive path: $archive_path" ;;
+  esac
+done < <(tar -tzf "$REMOTE_BUNDLE")
 tar -xzf "$REMOTE_BUNDLE" -C "$S"
 for item in src web bin pyproject.toml uv.lock RELEASE-MANIFEST.json; do test -e "$S/$item" || die "bundle missing $item"; done
 if find "$S" -name igai-report.txt -print -quit | grep -F . >/dev/null; then die "report artifact in bundle"; fi
+verify_release_bundle "$S" || die "bundle release manifest verification failed"
 tar --exclude=.venv --exclude=.git --exclude=.env --exclude=data --exclude=.igai --exclude=igai-report.txt -C "$ROOT" -czf "$B/application.tgz" .
+sha256sum "$B/application.tgz" | awk '{print $1}' > "$B/application.tgz.sha256"
 cp --preserve=all "$UNIT" "$WEB_UNIT" "$ENV" "$WEB_ENV" "$B/"
 printf '%s\n' "$(sha256sum "$UNIT" "$WEB_UNIT")" > "$B/unit-sha.txt"
 printf '%s\n' "$(sha256sum "$ENV" "$WEB_ENV")" > "$B/env-sha.txt"
 manifest "$B/package.before.json"
-test -r "$ROOT/RELEASE-MANIFEST.json" || die "active release manifest is missing"
-verify_installation "$ROOT" "$B/package.before.json" "$ROOT/RELEASE-MANIFEST.json"
+previous_release_manifest=0
+if test -e "$ROOT/RELEASE-MANIFEST.json"; then
+  test -f "$ROOT/RELEASE-MANIFEST.json" || die "active release manifest is not a regular file"
+  verify_installation "$ROOT" "$B/package.before.json" "$ROOT/RELEASE-MANIFEST.json"
+  previous_release_manifest=1
+  "$VENV/bin/python" - "$ROOT/RELEASE-MANIFEST.json" "$B/release-before.json" <<'PY'
+import json, sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+Path(sys.argv[2]).write_text(json.dumps({"manifest_present": True, "manifest": manifest}, sort_keys=True) + "\n", encoding="utf-8")
+PY
+else
+  test ! -L "$ROOT/RELEASE-MANIFEST.json" || die "active release manifest is a broken symlink"
+  printf '%s\n' '{"manifest_present": false}' > "$B/release-before.json"
+fi
 record_db "$B/database.before.tsv"
-printf 'source_sha=%s\nrun_id=%s\n' "$EXPECTED_SHA" "$RUN_ID" > "$B/metadata.txt"
+printf 'target_source_sha=%s\nprevious_release_manifest=%s\nrun_id=%s\n' "$EXPECTED_SHA" "$previous_release_manifest" "$RUN_ID" > "$B/metadata.txt"
 sqlite_backup "$B/database.sqlite3"
 step8 "$DB" "$B/step8.before.json"
 compare_step8 "$B/step8.before.json" "$B/database.sqlite3.step8.json"

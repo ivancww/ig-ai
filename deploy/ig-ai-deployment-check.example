@@ -34,14 +34,17 @@ PY
 
 health="$(curl --fail --silent --show-error --max-time 5 "$web_url/api/health")"
 curl --fail --silent --show-error --max-time 5 "$web_url/api/dashboard" >/dev/null
-printf '%s\n' "$heartbeat_seconds" "$stale_data_seconds" | python3 -c '
+health_file="$(mktemp)"
+trap 'rm -f "$health_file"' EXIT
+printf '%s' "$health" > "$health_file"
+python3 - "$heartbeat_seconds" "$stale_data_seconds" "$health_file" <<'PY'
 import json
 import sys
 from datetime import UTC, datetime
 
-heartbeat_seconds = float(sys.stdin.readline())
-stale_data_seconds = float(sys.stdin.readline())
-payload = json.load(sys.stdin)
+heartbeat_seconds = float(sys.argv[1])
+stale_data_seconds = float(sys.argv[2])
+payload = json.load(open(sys.argv[3], encoding="utf-8"))
 service = payload.get("service", {})
 markets = payload.get("markets", [])
 heartbeat = service.get("last_heartbeat")
@@ -86,4 +89,4 @@ print("backend status: " + str(service.get("status", "UNKNOWN")))
 print("IG connection: " + str(service.get("ig_connection", "UNKNOWN")))
 print("monitored markets visible: " + str(len(markets)))
 print("dashboard API: reachable on loopback")
-'
+PY
